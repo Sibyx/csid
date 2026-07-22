@@ -94,7 +94,7 @@ Each record payload is a flat sequence of fields:
 | `0x09` | `SRC_MAC` | 6 B | |
 | `0x0A` | `CHANNEL` | `u32` — 802.11 channel number | |
 | `0x0B` | `WIDTH` | `u16` — width code (below) | |
-| `0x0C` | `RSSI` | `i16[]` — one per RX chain, dB | |
+| `0x0C` | `RSSI` | `i16[]` — one per RX chain, **dBm** (negative); `0` = no measurement | |
 | `0x0D` | `SEQ` | `u8` — 802.11 sequence byte | |
 | `0x10` | `CSI_MATRIX` | `i16[]` — interleaved I/Q | |
 | `0x20`–`0x2F` | *reserved* | 802.11be / EHT (RU allocation, per-RU tone maps) | |
@@ -144,6 +144,15 @@ Reshaped, this is `[ntone, nrx*ntx]` complex.
 **Amplitude is AGC-normalised.** `|H|` carries the channel's *shape* only; the
 correlation between `|H|²` and RSSI is ≈ 0.01 on the reference hardware. Any
 absolute scale must come from the `RSSI` field.
+
+**RSSI is dBm, and the sign is applied at parse time.** The driver header
+carries RSSI as a *positive magnitude* — Intel's convention for the `__le32`
+RSSI fields in `fw/api/stats.h`. Measured on the reference node across 20 000
+consecutive records: range 47…89, no negative and no zero value, monotone with
+distance. Both reference readers negate it, so a `CsiRecord` always carries
+ordinary negative dBm and no consumer has to know the driver's convention. A
+`0` is passed through unchanged and means *this chain reported nothing* — not
+0 dBm.
 
 **Phase is usable, with alignment.** Raw phase is dominated by carrier frequency
 offset. The inter-chain conjugate product is concentrated (circular σ ≈ 2.2°)
@@ -210,6 +219,29 @@ record's payload.
 - A reader encountering a `version` it does not implement **must** refuse the
   file rather than guess.
 
+### Corrigendum: RSSI sign (2026-07-22, pre-release)
+
+The `RSSI` type code originally said only "dB" and did not state a sign
+convention, so writers emitted the driver's positive magnitude verbatim. It now
+specifies **dBm**, and both reference readers negate at parse time.
+
+This is a *specification defect being closed*, not a change of meaning, so it
+does not bump the version — the field never had a defined sign to change. The
+decision rests on v1 being pre-release: the only affected files are on the
+reference node.
+
+**Any `.csiq` written before this change carries positive magnitudes.** They
+are not silently wrong-but-plausible — a `+53` RSSI is physically impossible —
+so they are easy to spot. Re-derive them from the lossless source:
+
+```console
+$ csid export /var/lib/csid/<session>      # rewrites capture.csiq from capture.raw
+```
+
+This is exactly the property the two-layer data model exists for: `capture.raw`
+is never rewritten, so a parser defect can be corrected after the fact without
+the archive having lost anything.
+
 ## Reference implementations
 
 | Language | Location | Notes |
@@ -238,8 +270,8 @@ reference hardware, with little-endian fields at these offsets:
 | 46 | `nrx` | `u8` |
 | 47 | `ntx` | `u8` |
 | 52 | `ntone` | `u16` |
-| 60 | `rssi_a` | `i32` |
-| 64 | `rssi_b` | `i32` |
+| 60 | `rssi_a` | `i32` — positive magnitude; readers negate into dBm |
+| 64 | `rssi_b` | `i32` — positive magnitude; readers negate into dBm |
 | 68 | `src_mac` | 6 B |
 | 76 | `seq` | `u8` |
 | 88 | `us` | `u32` |

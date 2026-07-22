@@ -1,6 +1,11 @@
 [Unit]
 Description=Prune synced CSI raw captures past the grace window
 Documentation=https://github.com/Sibyx/csid
+# Config management writes /etc/csid/sync.env only where object-storage
+# credentials exist. Without it there is nothing to ship, so skip cleanly
+# rather than failing: a node with no S3 config still runs captures, and
+# pruning is simply inert.
+ConditionPathExists=/etc/csid/sync.env
 
 [Service]
 Type=oneshot

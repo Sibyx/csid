@@ -34,6 +34,9 @@ FTM = 123_456
 US = 555
 UNIX_TS_NS = 1_700_000_000_000_000_000
 RNF = 0x0442  # modulation type 4 (HE), mcs 2, nss 1
+# The firmware reports RSSI as a positive magnitude; readers negate it into dBm.
+RSSI_A = 43
+RSSI_B = 44
 CHANNEL = 36
 SRC_MAC = bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01])
 SEQ = 7
@@ -47,8 +50,8 @@ def synthesise_raw(path: Path) -> None:
     hdr[46] = NRX
     hdr[47] = NTX
     struct.pack_into("<H", hdr, 52, NTONE)
-    struct.pack_into("<i", hdr, 60, -43)
-    struct.pack_into("<i", hdr, 64, -44)
+    struct.pack_into("<i", hdr, 60, RSSI_A)
+    struct.pack_into("<i", hdr, 64, RSSI_B)
     hdr[68:74] = SRC_MAC
     hdr[76] = SEQ
     struct.pack_into("<I", hdr, 88, US)
@@ -112,7 +115,9 @@ def main() -> int:
         assert r.channel == CHANNEL, r.channel
         assert r.width == "80MHz", r.width
         assert r.seq == SEQ, r.seq
-        assert r.rssi == [-43, -44], r.rssi
+        # Written into the synthetic header as the firmware writes it (a
+        # positive magnitude); both readers must hand back dBm.
+        assert r.rssi == [-RSSI_A, -RSSI_B], r.rssi
         assert r.src_mac == SRC_MAC, r.src_mac
         assert r.phy is not None and r.phy.modulation == "he", r.phy
         assert r.phy.mcs == 2 and r.phy.nss == 1, r.phy

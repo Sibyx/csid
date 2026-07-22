@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csiscope</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23070a0e'/><path d='M1 12 L4 5 L6 10 L8 3 L10 11 L12 7 L15 9' stroke='%2335b779' fill='none' stroke-width='1.4'/></svg>">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">csi<b>scope</b></div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="scope" class="on">Scope</button>
+    <button data-tab="config">Config</button>
+    <button data-tab="sessions">Sessions</button>
+    <button data-tab="node">Node</button>
+  </nav>
+
+  <div class="strip" id="strip">
+    <div class="tile"><span class="k">rate</span><span class="v" id="t-rate">—</span></div>
+    <div class="tile"><span class="k">class</span><span class="v" id="t-class">—</span></div>
+    <div class="tile"><span class="k">mimo</span><span class="v" id="t-mimo">—</span></div>
+    <div class="tile"><span class="k">mcs</span><span class="v" id="t-phy">—</span></div>
+    <div class="tile"><span class="k">rssi</span><span class="v" id="t-rssi">—</span></div>
+    <div class="tile"><span class="k">bundle</span><span class="v" id="t-bundle">—</span></div>
+    <div class="tile"><span class="k">records</span><span class="v" id="t-records">—</span></div>
+  </div>
+
+  <div class="actions">
+    <span id="demo-badge" hidden
+          title="This stream is generated, not captured. Nothing on screen is a measurement.">synthetic data</span>
+    <span class="conn" id="conn" title="live stream">offline</span>
+    <button id="btn-pause" title="freeze the analysis (space)">pause</button>
+    <button id="btn-present" title="presentation mode (P)">present</button>
+  </div>
+</header>
+
+<div id="shell">
+
+  <!-- ---------------------------------------------------------------- rail -->
+  <aside id="rail">
+    <div class="rail-group">
+      <label>record class
+        <select id="c-class"></select>
+      </label>
+      <label>waterfall shows
+        <select id="c-wfscope">
+          <option value="class">the selected class only</option>
+          <option value="all">every class, on one frequency axis</option>
+        </select>
+      </label>
+      <p class="hint">
+        An ambient channel interleaves several PHY types at once. The spectrum,
+        phase, impulse-response and Doppler views are scoped to one class —
+        mixing geometries would change the array widths under the plots and
+        make a time series compare unlike things. The waterfall can show all of
+        them, placed by frequency. <b>Nothing is dropped from the capture
+        either way</b>: csiscope only reads the live stream, and every record
+        still lands in capture.raw.
+      </p>
+    </div>
+
+    <div class="rail-group">
+      <label>chain
+        <select id="c-chain"></select>
+      </label>
+      <label>pair with
+        <select id="c-chainb"><option value="">none</option></select>
+      </label>
+      <p class="hint" id="hint-pair">
+        The second chain cancels CFO/SFO by conjugate multiplication before the
+        Doppler transform. Without it the spectrum smears.
+      </p>
+    </div>
+
+    <div class="rail-group">
+      <label>window <output id="o-window"></output>
+        <input type="range" id="c-window" min="32" max="2048" step="32">
+      </label>
+      <label>frame rate <output id="o-fps"></output>
+        <input type="range" id="c-fps" min="2" max="40" step="1">
+      </label>
+      <label>waterfall rows/frame <output id="o-wfrows"></output>
+        <input type="range" id="c-wfrows" min="1" max="128" step="1">
+      </label>
+    </div>
+
+    <div class="rail-group">
+      <label>dB floor <output id="o-dbmin"></output>
+        <input type="range" id="c-dbmin" min="-20" max="80" step="1">
+      </label>
+      <label>dB ceiling <output id="o-dbmax"></output>
+        <input type="range" id="c-dbmax" min="0" max="140" step="1">
+      </label>
+      <label>colour ramp
+        <select id="c-ramp">
+          <option value="viridis">viridis</option>
+          <option value="magma">magma</option>
+          <option value="grey">greyscale</option>
+        </select>
+      </label>
+      <button id="btn-autoscale" class="wide">auto-scale to signal</button>
+    </div>
+
+    <div class="rail-group">
+      <label>phase view
+        <select id="c-phase">
+          <option value="detrended">sanitised (linear fit removed)</option>
+          <option value="unwrapped">unwrapped</option>
+          <option value="raw">raw (wrapped)</option>
+        </select>
+      </label>
+      <label>CIR taps <output id="o-taps"></output>
+        <input type="range" id="c-taps" min="16" max="512" step="8">
+      </label>
+      <label>Doppler FFT
+        <select id="c-dnfft">
+          <option>128</option><option>256</option><option>512</option><option>1024</option>
+        </select>
+      </label>
+      <label>centre frequency (MHz)
+        <input type="number" id="c-freq" placeholder="inferred" step="5">
+      </label>
+      <p class="hint">
+        Pin the frequency to make the Doppler speed axis exact. Inference cannot
+        resolve 6 GHz, whose channel numbers overlap 2.4 GHz.
+      </p>
+    </div>
+  </aside>
+
+  <main>
+
+  <!-- --------------------------------------------------------------- scope -->
+  <section id="tab-scope" class="tab on">
+    <div class="grid">
+
+      <figure class="panel span2 tall" id="p-waterfall">
+        <figcaption>
+          <span class="title">Waterfall</span>
+          <span class="sub">|H| in dB · subcarrier (x) × time (y, newest at top)</span>
+          <span class="readout" id="r-waterfall"></span>
+        </figcaption>
+        <canvas></canvas>
+        <canvas class="legend"></canvas>
+      </figure>
+
+      <figure class="panel" id="p-spectrum">
+        <figcaption>
+          <span class="title">Spectrum &amp; bundle</span>
+          <span class="sub">current |H(f)| against the p05–p95 envelope over the window</span>
+          <span class="readout" id="r-spectrum"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-doppler">
+        <figcaption>
+          <span class="title">Doppler spectrogram</span>
+          <span class="sub">time (x, newest right) × Doppler shift (y) · STFT of the conjugate product</span>
+          <span class="readout" id="r-doppler"></span>
+        </figcaption>
+        <canvas></canvas>
+        <canvas class="legend"></canvas>
+      </figure>
+
+      <figure class="panel" id="p-phase">
+        <figcaption>
+          <span class="title">Phase</span>
+          <span class="sub">across subcarriers · raw phase carries CFO/SFO and is not the channel</span>
+          <span class="readout" id="r-phase"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-cir">
+        <figcaption>
+          <span class="title">Impulse response</span>
+          <span class="sub">power–delay profile from the Hann-windowed IFFT of H(f)</span>
+          <span class="readout" id="r-cir"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-constellation">
+        <figcaption>
+          <span class="title">Complex plane</span>
+          <span class="sub">H per subcarrier, coloured by subcarrier index</span>
+          <span class="readout" id="r-constellation"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-chains">
+        <figcaption>
+          <span class="title">Chains</span>
+          <span class="sub">|H(f)| per RX·TX chain — identical chains mean a misparse</span>
+          <span class="readout" id="r-chains"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-tones">
+        <figcaption>
+          <span class="title">Subcarrier time series</span>
+          <span class="sub">|H| in dB over the window, three subcarriers across the band</span>
+          <span class="readout" id="r-tones"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-rssi">
+        <figcaption>
+          <span class="title">RSSI</span>
+          <span class="sub">per chain · the only absolute amplitude anchor (|H| is AGC-normalised)</span>
+          <span class="readout" id="r-rssi"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-jitter">
+        <figcaption>
+          <span class="title">Inter-arrival</span>
+          <span class="sub">measured on the 320 MHz baseband clock</span>
+          <span class="readout" id="r-jitter"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-clocks">
+        <figcaption>
+          <span class="title">Clock divergence</span>
+          <span class="sub">host and firmware clocks minus the baseband clock, over the window</span>
+          <span class="readout" id="r-clocks"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-talkers">
+        <figcaption>
+          <span class="title">Who is sounding the channel</span>
+          <span class="sub">ambient capture: the record rate is somebody else's transmit rate</span>
+        </figcaption>
+        <div class="scroll"><table id="tbl-talkers"></table></div>
+      </figure>
+
+      <figure class="panel" id="p-classes">
+        <figcaption>
+          <span class="title">Everything on the channel</span>
+          <span class="sub">every record class in the window — click one to scope the deep views to it</span>
+          <span class="readout" id="r-classes"></span>
+        </figcaption>
+        <div class="scroll"><table id="tbl-classes"></table></div>
+      </figure>
+
+      <figure class="panel" id="p-mix">
+        <figcaption>
+          <span class="title">CSI mix</span>
+          <span class="sub">PHY labels and tone counts over the window</span>
+        </figcaption>
+        <div class="scroll"><div id="mix-body"></div></div>
+      </figure>
+
+      <figure class="panel" id="p-validation">
+        <figcaption>
+          <span class="title">Extraction checks</span>
+          <span class="sub">is this really CSI? — the qualitative tests from Free Your CSI</span>
+        </figcaption>
+        <div class="scroll"><table id="tbl-validation"></table></div>
+      </figure>
+
+      <figure class="panel" id="p-stream">
+        <figcaption>
+          <span class="title">Stream health</span>
+          <span class="sub">the live path is best-effort by construction; the capture is not</span>
+        </figcaption>
+        <div class="scroll"><table id="tbl-stream"></table></div>
+      </figure>
+
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------------- config -->
+  <section id="tab-config" class="tab">
+    <div class="cols">
+      <div class="col-narrow">
+        <h2>Experiments</h2>
+        <table class="list" id="tbl-experiments"></table>
+        <div class="row-actions">
+          <input id="new-exp-name" placeholder="new-experiment" spellcheck="false">
+          <button id="btn-new-exp">create</button>
+        </div>
+
+        <h2>Node configuration</h2>
+        <table class="list" id="tbl-node-config"></table>
+        <button id="btn-edit-global" class="wide">edit /etc/csid/config.toml</button>
+      </div>
+
+      <div class="col-wide">
+        <h2 id="editor-title">Editor</h2>
+        <div class="editor-bar">
+          <span id="editor-path" class="path"></span>
+          <span class="spacer"></span>
+          <button id="btn-validate">validate</button>
+          <button id="btn-save" class="primary">save</button>
+          <button id="btn-delete" class="danger">delete</button>
+        </div>
+        <textarea id="editor" spellcheck="false" wrap="off"></textarea>
+        <div id="editor-verdict" class="verdict"></div>
+
+        <h3>Resolved tuning</h3>
+        <table class="list" id="tbl-tuning"></table>
+
+        <h3>Units</h3>
+        <table class="list" id="tbl-units"></table>
+
+        <h3>Journal</h3>
+        <div class="editor-bar">
+          <select id="c-journal-unit"></select>
+          <button id="btn-journal">refresh</button>
+        </div>
+        <pre id="journal-out" class="term"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ sessions -->
+  <section id="tab-sessions" class="tab">
+    <h2>Spool <span id="spool-path" class="path"></span></h2>
+    <div class="scroll"><table class="list" id="tbl-sessions"></table></div>
+    <h3>Sidecar</h3>
+    <pre id="sidecar-out" class="term">Select a session.</pre>
+  </section>
+
+  <!-- ---------------------------------------------------------------- node -->
+  <section id="tab-node" class="tab">
+    <div class="cols">
+      <div class="col-narrow">
+        <h2>Node</h2>
+        <table class="list" id="tbl-node"></table>
+        <h2>Capability envelope</h2>
+        <table class="list" id="tbl-caps"></table>
+        <ul id="caps-notes" class="notes"></ul>
+      </div>
+      <div class="col-wide">
+        <h2>csid doctor</h2>
+        <div class="editor-bar">
+          <input id="c-doctor-iface" placeholder="wlp1s0" spellcheck="false">
+          <button id="btn-doctor">run</button>
+        </div>
+        <pre id="doctor-out" class="term">Not run yet.</pre>
+      </div>
+    </div>
+  </section>
+
+  </main>
+</div>
+
+<footer id="statusbar">
+  <span id="s-source">—</span>
+  <span id="s-session">—</span>
+  <span id="s-skip">—</span>
+  <span class="spacer"></span>
+  <span id="s-mode"></span>
+  <span id="s-version">—</span>
+</footer>
+
+<div id="toast"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,299 @@
+/* csiscope — flat, sharp, dark.
+ *
+ * Design rules, matching the project's web and figure contracts:
+ *   * tables over cards; radius 0, no shadows
+ *   * numbers are monospace and right-aligned, so columns compare by eye
+ *   * one accent colour, spent on state that matters (running, invalid, live)
+ *   * plot colour lives in plot.js — nothing here paints data
+ */
+
+:root {
+  --bg:        #070a0e;
+  --panel:     #0d1117;
+  --panel-2:   #11161d;
+  --line:      #1c232c;
+  --line-2:    #2a323d;
+  --ink:       #e6e9ee;
+  --ink-dim:   #98a2b0;
+  --muted:     #6b7684;
+
+  --accent:    #35b779;  /* viridis green — the live/ok state */
+  --accent-2:  #56b4e9;  /* Okabe-Ito sky — selection */
+  --warn:      #e69f00;
+  --bad:       #d55e00;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.45 var(--sans);
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+/* ------------------------------------------------------------------ topbar */
+
+#topbar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-2);
+  min-height: 44px;
+}
+
+.brand {
+  display: flex; align-items: center;
+  padding: 0 14px;
+  font: 600 15px/1 var(--mono);
+  letter-spacing: .04em;
+  color: var(--muted);
+  border-right: 1px solid var(--line);
+}
+.brand b { color: var(--accent); font-weight: 600; }
+
+.tabs { display: flex; border-right: 1px solid var(--line); }
+.tabs button {
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  color: var(--ink-dim); font: 12px var(--sans); letter-spacing: .02em;
+  padding: 0 14px; cursor: pointer;
+}
+.tabs button:hover { color: var(--ink); background: var(--panel-2); }
+.tabs button.on { color: var(--ink); border-bottom-color: var(--accent); }
+
+.strip { display: flex; flex: 1; overflow: hidden; }
+.tile {
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 3px 12px; min-width: 78px;
+  border-right: 1px solid var(--line);
+}
+.tile .k { font-size: 9px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.tile .v { font: 13px/1.2 var(--mono); color: var(--ink); white-space: nowrap; }
+.tile.alert .v { color: var(--bad); }
+.tile.warn  .v { color: var(--warn); }
+
+.actions { display: flex; align-items: center; gap: 8px; padding: 0 12px; }
+.conn {
+  font: 10px var(--mono); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--bad); border: 1px solid currentColor; padding: 2px 6px;
+}
+.conn.live { color: var(--accent); }
+.conn.stale { color: var(--warn); }
+
+/* The demo generator is convincing enough that a screenshot could pass for a
+   capture. This badge is deliberately impossible to miss, and it is one of the
+   few things presentation mode does not hide. */
+#demo-badge {
+  font: 700 10px var(--mono); letter-spacing: .12em; text-transform: uppercase;
+  background: var(--bad); color: #0b0507; padding: 3px 8px;
+}
+
+/* ------------------------------------------------------------------- shell */
+
+#shell { display: flex; min-height: 0; overflow: hidden; }
+
+#rail {
+  width: 232px; flex: none;
+  background: var(--panel);
+  border-right: 1px solid var(--line-2);
+  overflow-y: auto;
+  padding-bottom: 20px;
+}
+body.no-rail #rail { display: none; }
+
+.rail-group { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.rail-group label {
+  display: block; margin-bottom: 9px;
+  font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+}
+.rail-group output { float: right; font: 11px var(--mono); color: var(--ink); text-transform: none; }
+.rail-group input[type=range] { width: 100%; margin: 3px 0 0; accent-color: var(--accent-2); }
+.hint { margin: 4px 0 0; font-size: 10.5px; line-height: 1.4; color: var(--muted); }
+
+main { flex: 1; min-width: 0; overflow: auto; }
+.tab { display: none; padding: 12px; }
+.tab.on { display: block; }
+
+/* ------------------------------------------------------------------- grid */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.panel {
+  margin: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  min-width: 0;
+  height: 216px;
+}
+.panel.span2 { grid-column: span 2; }
+.panel.tall  { grid-row: span 2; height: auto; min-height: 442px; }
+
+/* Two rows, never more: title + live readout, then the standing caption.
+   Everything truncates rather than wrapping, so a panel's plot area never
+   shrinks because a number got longer. The full text stays in `title`. */
+.panel figcaption {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 8px;
+  padding: 5px 9px 4px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.panel .title   { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+.panel .readout { grid-column: 2; justify-self: end;
+                  font: 10.5px var(--mono); color: var(--accent-2);
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.panel .sub     { grid-column: 1 / -1; font-size: 10px; color: var(--muted);
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.panel canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+.panel canvas.legend { flex: none; height: 22px; padding: 0 8px 4px; }
+.panel .scroll { flex: 1; overflow: auto; min-height: 0; }
+
+@media (max-width: 1500px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 1100px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #rail { width: 200px; }
+}
+
+/* ------------------------------------------------------------------ tables */
+
+table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+th, td {
+  text-align: left; padding: 3px 9px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+th { color: var(--muted); font-weight: 500; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; }
+td.num, th.num { text-align: right; font-family: var(--mono); }
+td.mono { font-family: var(--mono); }
+/* Long paths truncate in place in the narrow config column, where the value is
+   a filesystem path and the column width is fixed; the full text stays in the
+   cell's tooltip. Panel tables are deliberately left alone — capping width
+   there collapsed short numeric values like "-1.8 dB" to an ellipsis. */
+.col-narrow td.clip {
+  overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+}
+tbody tr:hover { background: var(--panel-2); }
+tr.sel { background: #14202b; }
+tr.click { cursor: pointer; }
+
+.ok   { color: var(--accent); }
+.warn { color: var(--warn); }
+.bad  { color: var(--bad); }
+.dim  { color: var(--muted); }
+
+.pill {
+  font: 9.5px var(--mono); letter-spacing: .06em; text-transform: uppercase;
+  border: 1px solid currentColor; padding: 0 4px;
+}
+
+/* ------------------------------------------------------------------- forms */
+
+button, select, input, textarea {
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line-2); border-radius: 0;
+  font: 11.5px var(--sans); padding: 3px 8px;
+}
+select, input { width: 100%; font-family: var(--mono); }
+button { cursor: pointer; width: auto; }
+button:hover { border-color: var(--muted); background: #182029; }
+button.wide { width: 100%; margin-top: 4px; }
+button.primary { border-color: var(--accent); color: var(--accent); }
+button.danger  { border-color: var(--bad); color: var(--bad); }
+button.on { background: var(--accent-2); border-color: var(--accent-2); color: #06121b; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* --------------------------------------------------------------- long tabs */
+
+.cols { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 14px; }
+.col-narrow, .col-wide { min-width: 0; }
+h2 { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+     margin: 14px 0 6px; font-weight: 500; }
+h2:first-child { margin-top: 0; }
+h3 { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+     margin: 14px 0 5px; font-weight: 500; }
+
+.editor-bar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.editor-bar .spacer, footer .spacer { flex: 1; }
+.editor-bar select, .editor-bar input { width: auto; flex: 0 1 220px; }
+.path { font: 10.5px var(--mono); color: var(--muted); }
+
+textarea#editor {
+  width: 100%; height: 340px;
+  font: 12px/1.55 var(--mono);
+  background: #05080c; border-color: var(--line-2);
+  resize: vertical; white-space: pre;
+}
+
+.verdict { margin: 6px 0 0; padding: 6px 9px; font: 11.5px var(--mono);
+           border-left: 2px solid var(--line-2); color: var(--muted); }
+.verdict.ok  { border-left-color: var(--accent); color: var(--accent); }
+.verdict.bad { border-left-color: var(--bad); color: var(--bad); white-space: pre-wrap; }
+
+.term {
+  margin: 0; padding: 8px 10px; max-height: 320px; overflow: auto;
+  background: #05080c; border: 1px solid var(--line);
+  font: 11px/1.5 var(--mono); color: var(--ink-dim); white-space: pre-wrap;
+}
+
+.notes { margin: 6px 0 0; padding-left: 16px; color: var(--muted); font-size: 11px; }
+.notes li { margin-bottom: 3px; }
+
+.row-actions { display: flex; gap: 6px; margin-top: 6px; }
+.row-actions input { flex: 1; }
+
+/* --------------------------------------------------------------- statusbar */
+
+#statusbar {
+  display: flex; gap: 16px; align-items: center;
+  padding: 3px 12px;
+  background: var(--panel); border-top: 1px solid var(--line-2);
+  font: 10.5px var(--mono); color: var(--muted);
+}
+
+#toast {
+  position: fixed; right: 14px; bottom: 34px; z-index: 40;
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+  pointer-events: none;
+}
+#toast div {
+  background: var(--panel-2); border-left: 2px solid var(--accent);
+  padding: 6px 12px; font: 11.5px var(--mono); max-width: 460px;
+  white-space: pre-wrap;
+}
+#toast div.bad { border-left-color: var(--bad); color: var(--bad); }
+
+/* ---------------------------------------------------------- presentation */
+
+body.present #topbar .tabs,
+body.present #topbar .actions > button,
+body.present #topbar .conn,
+body.present #rail,
+body.present #statusbar { display: none; }
+body.present .tab { padding: 8px; }
+body.present .panel { height: 300px; }
+body.present .panel.tall { min-height: 610px; }
+body.present .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+body.present .panel .title { font-size: 13px; }
+body.present .panel .sub { font-size: 11px; }
+body.present .tile .v { font-size: 16px; }
+body.present .tile { min-width: 104px; }
+body.present #topbar { min-height: 54px; }
+body.present #demo-badge { font-size: 12px; padding: 5px 12px; }

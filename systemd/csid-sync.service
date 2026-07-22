@@ -1,6 +1,11 @@
 [Unit]
 Description=Ship completed CSI sessions to object storage
 Documentation=https://github.com/Sibyx/csid
+# Config management writes /etc/csid/sync.env only where object-storage
+# credentials exist. Without it there is nothing to ship, so skip cleanly
+# rather than failing: a node with no S3 config still runs captures, and
+# shipping is simply inert.
+ConditionPathExists=/etc/csid/sync.env
 After=network-online.target
 Wants=network-online.target
 

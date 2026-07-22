@@ -8,19 +8,6 @@
 //! See `docs/architecture.md` for the threading model and `docs/CSIQ-format-v1.md`
 //! for the on-disk format.
 
-mod caps;
-mod commands;
-mod config;
-mod debugfs;
-mod engine;
-mod export;
-mod notify;
-mod radio;
-mod sidecar;
-mod sinks;
-mod source;
-mod util;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,7 +16,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use config::{GlobalConfig, DEFAULT_CONFIG, DEFAULT_EXPERIMENT_DIR};
+use csid::commands;
+use csid::config::{GlobalConfig, DEFAULT_CONFIG, DEFAULT_EXPERIMENT_DIR};
 
 /// Set by the signal handler; mirrored into the session stop flag.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
@@ -75,6 +63,11 @@ enum Command {
         #[arg(long)]
         probe: bool,
     },
+    /// Parse-check the node-global configuration file and exit.
+    ///
+    /// The `nginx -t` of csid: config management can validate a candidate file
+    /// before installing it, so a typo never reaches a running node.
+    CheckConfig,
     /// Print the measured capability envelope and tuning tables.
     Caps {
         /// Emit JSON instead of a human-readable report.
@@ -149,6 +142,19 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }
         Command::Validate { experiment, probe } => {
             commands::validate(experiment, &cli.experiments, *probe)
+        }
+        Command::CheckConfig => {
+            let global = GlobalConfig::load(&cli.config)?;
+            println!(
+                "{}: ok — spool={} sync={} otel={} driver oui=0x{:06x} subcmd=0x{:02x}",
+                cli.config.display(),
+                global.node.spool.display(),
+                global.sync.enabled,
+                global.otel.enabled,
+                global.driver.vendor_oui,
+                global.driver.csi_event_subcmd,
+            );
+            Ok(())
         }
         Command::Caps { json } => commands::caps_cmd(*json),
         Command::Doctor { interface } => {

@@ -91,6 +91,7 @@ class CsiRecord:
     nrx: int = 0
     ntx: int = 0
     ntone: int = 0
+    #: Per-chain RSSI in dBm (negative). Zero means the chain reported nothing.
     rssi: Sequence[int] = field(default_factory=list)
     src_mac: bytes = b"\x00" * 6
     channel: int = 0
@@ -301,8 +302,13 @@ def parse_raw_record(hdr: bytes, csi: bytes, width: str = "NOHT") -> CsiRecord:
         raise CsiqError("raw header shorter than base fields")
     nrx = hdr[_OFF_NRX]
     ntx = hdr[_OFF_NTX]
+    # The firmware reports RSSI as a positive magnitude (the convention Intel
+    # uses for the __le32 RSSI fields in fw/api/stats.h); negate it so records
+    # carry ordinary dBm. Zero is preserved as zero — it means "this chain
+    # reported nothing", not 0 dBm. Kept in lockstep with `raw::rssi_dbm`.
     (rssi_a,) = struct.unpack_from("<i", hdr, _OFF_RSSI_A)
     (rssi_b,) = struct.unpack_from("<i", hdr, _OFF_RSSI_B)
+    rssi_a, rssi_b = -rssi_a, -rssi_b
     (rnf,) = struct.unpack_from("<I", hdr, _OFF_RNF)
 
     unix_ts_ns, channel = 0, 0

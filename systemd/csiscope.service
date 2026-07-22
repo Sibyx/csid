@@ -1,0 +1,44 @@
+[Unit]
+Description=csiscope — live CSI console for csid
+Documentation=https://github.com/Sibyx/csid
+After=network-online.target
+Wants=network-online.target
+
+# A crash-looping console must never hammer the node. StartLimit* are [Unit]
+# directives — systemd ignores them (with a warning) under [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# Arguments come from the environment file so config management can change the
+# bind address or read-only mode without rewriting the unit.
+EnvironmentFile=-/etc/csid/csiscope.env
+ExecStart=/usr/local/bin/csiscope $CSISCOPE_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# csiscope is a strict consumer of the live stream: it binds the datagram
+# socket, never touches the radio, and holds nothing the daemon needs. If it
+# dies mid-experiment the capture is unaffected — that is the point of csid's
+# best-effort live path.
+RuntimeDirectory=csid
+RuntimeDirectoryPreserve=yes
+
+# Nice it below the capture path so the console can never compete with the
+# RX thread for CPU.
+Nice=10
+CPUSchedulingPolicy=other
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/etc/csid /run/csid /var/lib/csid
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=csiscope
+
+[Install]
+WantedBy=multi-user.target

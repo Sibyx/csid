@@ -2,25 +2,42 @@
 # Ship completed CSI sessions to object storage.
 #
 # Idempotent by design: a session is copied only if it has no `.synced` marker,
-# so the `OnSuccess=` hook and the 15-minute timer may both fire safely. A node
+# so the `OnSuccess=` hook and the periodic timer may both fire safely. A node
 # that is offline for days simply catches up on reconnect.
+#
+# Configuration comes from the environment (systemd EnvironmentFile), using
+# rclone's env-var S3 backend so there is no rclone.conf to manage:
+#
+#   CSID_SPOOL           session spool root            (default /var/lib/csid)
+#   CSID_HOSTNAME        node name used in the key     (default `hostname`)
+#   CSID_S3_ENDPOINT     S3 endpoint URL
+#   CSID_S3_BUCKET       bucket
+#   CSID_S3_PREFIX       key prefix                    (default datasets/ax210-csi-captures)
+#   CSID_S3_ACCESS_KEY   / CSID_S3_SECRET_KEY
 set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
-REMOTE="${CSID_SYNC_REMOTE:-hetzner}"
-BUCKET="${CSID_SYNC_BUCKET:-monad-knowledge}"
-PREFIX="${CSID_SYNC_PREFIX:-datasets/ax210-csi-captures}"
 HOST="${CSID_HOSTNAME:-$(hostname)}"
+PREFIX="${CSID_S3_PREFIX:-datasets/ax210-csi-captures}"
+BUCKET="${CSID_S3_BUCKET:?CSID_S3_BUCKET is required}"
 
 command -v rclone >/dev/null || { echo "csid-sync: rclone not installed" >&2; exit 1; }
 [[ -d "$SPOOL" ]] || { echo "csid-sync: spool $SPOOL missing" >&2; exit 0; }
 
+# rclone env-var backend: no config file needed.
+export RCLONE_CONFIG_S3_TYPE=s3
+export RCLONE_CONFIG_S3_PROVIDER=Other
+export RCLONE_CONFIG_S3_ENDPOINT="${CSID_S3_ENDPOINT:?CSID_S3_ENDPOINT is required}"
+export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${CSID_S3_ACCESS_KEY:?CSID_S3_ACCESS_KEY is required}"
+export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${CSID_S3_SECRET_KEY:?CSID_S3_SECRET_KEY is required}"
+
 shipped=0
+failed=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
     session="$(basename "$dir")"
 
-    # Only ship sessions that have finished writing.
+    # Only ship sessions that have finished writing (sidecar carries the status).
     [[ -f "$dir/metadata.json" ]] || continue
     if ! grep -q '"status": *"\(complete\|stopped\|failed\)"' "$dir/metadata.json"; then
         continue
@@ -28,7 +45,7 @@ for dir in "$SPOOL"/*/; do
     # Already shipped.
     [[ -f "$dir/.synced" ]] && continue
 
-    dest="${REMOTE}:${BUCKET}/${PREFIX}/${HOST}/${session}/"
+    dest="s3:${BUCKET}/${PREFIX}/${HOST}/${session}/"
     echo "csid-sync: shipping $session -> $dest"
     if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
         date -Is > "$dir/.synced"
@@ -36,7 +53,9 @@ for dir in "$SPOOL"/*/; do
     else
         # Leave it unmarked; the timer retries on the next pass.
         echo "csid-sync: FAILED $session (will retry)" >&2
+        failed=$((failed + 1))
     fi
 done
 
-echo "csid-sync: $shipped session(s) shipped"
+echo "csid-sync: $shipped shipped, $failed failed"
+[[ $failed -eq 0 ]]

@@ -190,8 +190,10 @@ mod tests {
         hdr[46] = 2; // nrx
         hdr[47] = 2; // ntx
         hdr[52..54].copy_from_slice(&52u16.to_le_bytes()); // ntone
-        hdr[60..64].copy_from_slice(&(-43i32).to_le_bytes()); // rssi a
-        hdr[64..68].copy_from_slice(&(-44i32).to_le_bytes()); // rssi b
+                                                           // The firmware writes RSSI as a positive magnitude, as measured on
+                                                           // hardware; the parser must hand back dBm.
+        hdr[60..64].copy_from_slice(&43i32.to_le_bytes()); // rssi a
+        hdr[64..68].copy_from_slice(&44i32.to_le_bytes()); // rssi b
         hdr[68..74].copy_from_slice(&[1, 2, 3, 4, 5, 6]); // src mac
         hdr[76] = 9; // seq
         hdr[88..92].copy_from_slice(&555u32.to_le_bytes()); // us
@@ -220,6 +222,11 @@ mod tests {
         assert_eq!(rec.nrx, 2);
         assert_eq!(rec.ntone, 52);
         assert_eq!(rec.channel, 36);
+        assert_eq!(
+            rec.rssi,
+            vec![-43, -44],
+            "the driver's positive magnitude must reach consumers as dBm"
+        );
         assert_eq!(rec.unix_ts_ns, 42);
         assert_eq!(rec.phy.unwrap().modulation, Modulation::He);
         assert_eq!(rec.iq.len(), 2 * coeffs);

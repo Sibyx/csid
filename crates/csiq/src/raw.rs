@@ -52,6 +52,27 @@ fn le_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
+/// Convert the header's RSSI field into dBm.
+///
+/// The firmware reports RSSI as a **positive magnitude** — the same convention
+/// as the `__le32 beacon_rssi_a/b` fields in `fw/api/stats.h`, which userspace
+/// negates. Measured on the reference node over 20 000 consecutive records:
+/// range 47…89, not a single negative or zero value, and monotone with distance
+/// (a talker at ≈50 was metres away and delivering thousands of frames; one at
+/// ≈84 delivered a handful).
+///
+/// Left un-negated it reads as an impossibly strong +50 dBm signal, and every
+/// consumer has to know to flip it. Negating here means the record carries
+/// ordinary dBm and the sign convention is stated once, in the format.
+///
+/// `0` is preserved as `0`, because Intel's own reader treats a zero RSSI field
+/// as "this chain reported nothing" rather than as a measurement (see
+/// `get_total_rss.m`, which skips zero entries) — and negation maps the
+/// sentinel onto itself.
+fn rssi_dbm(raw: i32) -> i16 {
+    -(raw as i16)
+}
+
 /// Decode `rate_n_flags` v2 into a [`PhyLabel`].
 ///
 /// v2 layout (iwlwifi): MCS in bits 0–3, NSS-1 in bits 4–5, modulation type in
@@ -87,10 +108,11 @@ pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
     let mut src_mac = [0u8; 6];
     src_mac.copy_from_slice(&hdr[off::SRC_MAC..off::SRC_MAC + 6]);
 
-    // Per-RX-chain RSSI (two entries in the header; keep `nrx` of them).
+    // Per-RX-chain RSSI (two entries in the header; keep `nrx` of them),
+    // **negated into dBm** — see [`rssi_dbm`].
     let rssi_all = [
-        le_i32(hdr, off::RSSI_A) as i16,
-        le_i32(hdr, off::RSSI_B) as i16,
+        rssi_dbm(le_i32(hdr, off::RSSI_A)),
+        rssi_dbm(le_i32(hdr, off::RSSI_B)),
     ];
     let rssi = rssi_all[..(nrx as usize).min(2)].to_vec();
 

@@ -1,0 +1,45 @@
+[package]
+name = "csiscope"
+description = "Live CSI oscilloscope and operator console for csid — realtime waterfall, spectrum, phase, CIR and Doppler views over a self-contained no-auth web UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "csiscope"
+path = "src/main.rs"
+
+[dependencies]
+# The format and the daemon's own configuration/validation code. Depending on
+# `csid` rather than re-deriving the schema is deliberate: the console must
+# reject an impossible capture exactly the way `csid validate` does.
+csiq = { workspace = true }
+csid = { path = "../csid", version = "0.1.0" }
+
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# HTTP + WebSocket. Pure Rust the whole way down, so the aarch64 cross-build
+# stays a plain `cargo build --target`.
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# FFT for the channel impulse response and the Doppler spectrogram.
+rustfft = "6"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/csiq", "crates/csid"]
+members = ["crates/csiq", "crates/csid", "crates/csiscope"]
 
 [workspace.package]
 version = "0.1.0"

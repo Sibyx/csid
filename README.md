@@ -10,6 +10,7 @@ for CSI.
 # csid validate exp-c1 --probe     # is this capture even possible?
 # csid run exp-c1                  # or: systemctl start csid@exp-c1
 $ csid stream                      # watch it live
+$ csiscope                         # ...or watch it properly, at :8088
 $ csid export /var/lib/csid/monad05_exp-c1_20260722-093107
 ```
 
@@ -104,6 +105,31 @@ while True:
     print(seq, rec.ntone, rec.rssi, rec.matrix().shape)
 ```
 
+## The live console
+
+`csiscope` is a second binary that subscribes to the same stream and serves a
+browser console: waterfall, spectrum, sanitised phase, impulse response and
+Doppler spectrogram, next to the node's configuration and unit control.
+
+```console
+$ csiscope                     # http://127.0.0.1:8088
+$ csiscope --read-only         # views only, safe on an open network
+$ csiscope --demo              # synthetic stream, no hardware needed
+```
+
+It is a strict consumer — it never touches the radio and never writes to the
+capture path — and it is **unauthenticated by design**, so it binds loopback
+unless told otherwise.
+
+One thing it makes unavoidable: an ambient channel carries several PHY types at
+once (measured on channel 11: 74% legacy 52-tone, 26% HT 56-tone, interleaved
+packet by packet), and views that mix them are not measurements of anything. So
+every analytical panel is scoped to one **record class**, while the waterfall
+can still show the whole channel on a shared frequency axis. Nothing is dropped
+from the capture either way.
+
+Full guide: [dashboard.md](docs/dashboard.md).
+
 ## Reading captures
 
 ```python
@@ -142,17 +168,19 @@ Full walkthrough: [deployment.md](docs/deployment.md).
 | [architecture.md](docs/architecture.md) | Threading model, invariants, failure modes |
 | [configuration.md](docs/configuration.md) | Complete TOML reference |
 | [deployment.md](docs/deployment.md) | Install, systemd, bring-up, fleet notes |
+| [dashboard.md](docs/dashboard.md) | The live console: views, record classes, security |
 
 ## Layout
 
 ```text
-crates/csiq/    format library — no OS dependencies, builds anywhere
-crates/csid/    the daemon — capture path is Linux-only
-python/csiq/    Python reference reader
-docs/           specification and guides
-systemd/        unit files
-config/         example configuration
-scripts/        sync and prune helpers
+crates/csiq/     format library — no OS dependencies, builds anywhere
+crates/csid/     the daemon — capture path is Linux-only
+crates/csiscope/ the live console — a consumer of the stream, never a producer
+python/csiq/     Python reference reader
+docs/            specification and guides
+systemd/         unit files
+config/          example configuration
+scripts/         sync and prune helpers
 ```
 
 ## Status
@@ -168,6 +196,9 @@ scripts/        sync and prune helpers
 - live streaming to an on-node subscriber **concurrent with** a durable capture:
   contiguous sequence numbers, zero drops, capture unaffected
 - `csid doctor`, `validate`, `caps`, `export`, `stream` exercised on the node
+- `csiscope` served against a live 8-hour capture on a busy 2.4 GHz channel
+  (~290 Hz, interleaved legacy-52 and HT-56 records), deployed by the fleet's
+  Ansible role
 
 The format, configuration, export, and CLI layers are additionally covered by
 tests that run on every platform (Linux, macOS, Windows) plus a cross-language

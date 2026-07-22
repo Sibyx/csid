@@ -65,11 +65,13 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+        run: cargo build --release --target aarch64-unknown-linux-gnu --workspace
       - uses: actions/upload-artifact@v4
         with:
           name: csid-aarch64
-          path: target/aarch64-unknown-linux-gnu/release/csid
+          path: |
+            target/aarch64-unknown-linux-gnu/release/csid
+            target/aarch64-unknown-linux-gnu/release/csiscope
 
   # The format's cross-language claim is only real if it is tested: Rust writes
   # a CSIQ file, Python reads it back and must agree field for field.

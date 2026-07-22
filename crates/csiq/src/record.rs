@@ -24,6 +24,15 @@ pub enum Width {
     Unknown(u16),
 }
 
+impl std::fmt::Display for Width {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Width::Unknown(v) => write!(f, "unknown({v})"),
+            other => f.write_str(other.as_str()),
+        }
+    }
+}
+
 impl Width {
     /// Encode to the on-wire `u16` used by the `Width` TLV.
     pub fn to_code(self) -> u16 {
@@ -36,6 +45,21 @@ impl Width {
             Width::W160 => 5,
             Width::W320 => 6,
             Width::Unknown(v) => v,
+        }
+    }
+
+    /// The width as `iw` spells it — the same token the TOML configuration
+    /// uses, so one vocabulary covers config, capture and display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Width::Noht => "NOHT",
+            Width::Ht20 => "HT20",
+            Width::Ht40Minus => "HT40-",
+            Width::Ht40Plus => "HT40+",
+            Width::W80 => "80MHz",
+            Width::W160 => "160MHz",
+            Width::W320 => "320MHz",
+            Width::Unknown(_) => "unknown",
         }
     }
 
@@ -122,8 +146,14 @@ pub struct CsiRecord {
     pub ntx: u8,
     /// Number of subcarriers (tones): 52/56/242/484/996/1992 (…4096 for EHT).
     pub ntone: u16,
-    /// Per-chain RSSI in dB (AGC context — amplitude is normalised, absolute
-    /// scale must come from here).
+    /// Per-chain RSSI in **dBm** (negative), one entry per RX chain.
+    ///
+    /// The absolute amplitude reference for the record: `iq` is AGC-normalised
+    /// and carries channel *shape* only, so any absolute scale must come from
+    /// here. `0` means the chain reported no measurement, not 0 dBm.
+    ///
+    /// The driver delivers this as a positive magnitude; the raw parser negates
+    /// it, so the sign convention is applied once and never again.
     pub rssi: Vec<i16>,
     /// Source MAC of the sounded frame.
     pub src_mac: [u8; 6],

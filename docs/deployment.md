@@ -6,7 +6,7 @@
   built via DKMS. The in-tree `iwlwifi` does **not** emit CSI vendor events.
 - An Intel AX210 (or AX200) radio.
 - Root, or `CAP_NET_ADMIN` plus read/write access to
-  `/sys/kernel/debug/ieee80211/*/iwlmvm`.
+  `/sys/kernel/debug/ieee80211/*/iwlwifi/iwlmvm`.
 
 Verify all of it in one command:
 
@@ -65,13 +65,14 @@ which OUI, subcommand, and attribute ids carry the CSI blobs. If a capture runs
 but records never arrive:
 
 1. Confirm the driver actually emits events:
-   `sudo cat /sys/kernel/debug/ieee80211/phy1/iwlmvm/csi_enabled` should be `1`
+   `sudo cat /sys/kernel/debug/ieee80211/phy1/iwlwifi/iwlmvm/csi_enabled` should be `1`
    during a session, and the channel must carry traffic (`csid caps` lists which
    channels were busy on the reference node).
 2. Check the ABI constants against the driver source — `mvm/vendor-cmd.c`, the
    `IWL_MVM_VENDOR_CMD_CSI_EVENT` subcommand and its attribute enum — and set
    them in `[driver]`.
-3. Re-run with `-vv` (`CSID_LOG=trace`) to see family resolution and group join.
+3. Re-run with `-vv` (`CSID_LOG=trace`) to see family resolution and the
+   registration handshake.
 
 Once a session produces records, the ABI is settled for that driver build.
 
@@ -121,7 +122,9 @@ Check the hardening posture with:
 ```
 
 `csid-sync` ships completed sessions with `rclone copy --checksum` to
-`<remote>:<bucket>/<prefix>/<host>/<session_id>/` and writes a `.synced` marker.
+`<bucket>/<prefix>/<host>/<session_id>/` and writes a `.synced` marker. It uses
+rclone's **env-var S3 backend** (`CSID_S3_*` from `/etc/csid/sync.env`), so there
+is no `rclone.conf` to distribute.
 It is idempotent — the marker is checked before copying — so the
 `OnSuccess=` hook and the 15-minute timer can both fire safely. A node that is
 offline for days simply catches up when it reconnects.
