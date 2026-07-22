@@ -1,0 +1,27 @@
+# csid node-global configuration.
+# Install to /etc/csid/config.toml
+# Reference: docs/configuration.md
+
+[node]
+spool = "/var/lib/csid"
+# hostname = "monad05"        # defaults to the system hostname
+
+[sync]
+enabled          = false
+remote           = "hetzner"
+bucket           = "monad-knowledge"
+prefix           = "datasets/ax210-csi-captures"
+prune_after_days = 7
+
+[otel]
+enabled  = false
+endpoint = "http://localhost:4317"
+
+# Driver ABI coupling. Defaults target the iax (fflq) iwlwifi backport.
+# Verify against the driver's mvm/vendor-cmd.c on first bring-up; see
+# docs/deployment.md#first-bring-up. `csid doctor` prints the values in use.
+[driver]
+vendor_oui       = 0x001735   # INTEL_OUI
+csi_event_subcmd = 0x24       # IWL_MVM_VENDOR_CMD_CSI_EVENT
+attr_csi_hdr     = 0x4d       # IWL_MVM_VENDOR_ATTR_CSI_HDR
+attr_csi_data    = 0x4e       # IWL_MVM_VENDOR_ATTR_CSI_DATA

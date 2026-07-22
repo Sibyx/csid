@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/csiq", "crates/csid"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-2.0-only"
+authors = ["Jakub Dubec <jakub.dubec@stuba.sk>"]
+repository = "https://github.com/Sibyx/csid"
+homepage = "https://github.com/Sibyx/csid"
+
+[workspace.dependencies]
+csiq = { path = "crates/csiq", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+[profile.release]
+# The netlink RX loop is latency-sensitive; prefer predictable codegen over
+# aggressive LTO that can lengthen tail latencies unpredictably.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

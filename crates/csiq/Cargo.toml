@@ -1,0 +1,22 @@
+[package]
+name = "csiq"
+description = "CSIQ Interchange Format v1 — a self-describing container for Wi-Fi Channel State Information, plus a parser for the raw iwlwifi/iax vendor-event stream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["csi", "wifi", "sensing", "802-11", "channel-state-information"]
+categories = ["encoding", "science"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# nothing extra — the crate is intentionally dependency-light so it stays
+# trivially portable and auditable (it is the citable artifact).

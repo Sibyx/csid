@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The real target: the capture path (netlink, debugfs, realtime scheduling)
+  # only compiles on Linux, so this is the job that proves the daemon builds.
+  linux:
+    name: build + test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Release build
+        run: cargo build --release --workspace
+
+  # Proves the crate split holds: `csiq` and the portable half of `csid` must
+  # build without Linux, so the format stays vendorable anywhere and the daemon
+  # can be developed on a non-Linux machine.
+  portable:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+
+  # aarch64 is the deployment target (Raspberry Pi 5).
+  cross:
+    name: cross-build aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csid-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/csid
+
+  # The format's cross-language claim is only real if it is tested: Rust writes
+  # a CSIQ file, Python reads it back and must agree field for field.
+  interop:
+    name: rust -> python interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install reference reader
+        run: pip install numpy ./python
+      - name: Build csid
+        run: cargo build --release -p csid
+      - name: Synthesise a raw capture, export, and read it from Python
+        run: python3 tests/interop.py

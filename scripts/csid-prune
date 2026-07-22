@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Delete raw captures that have been verifiably shipped and have aged past the
+# grace window.
+#
+# What is deleted: `capture.raw` only.
+# What is kept forever: `metadata.json` and `.synced` — together they form a
+# greppable on-node index of every session the node ever ran.
+set -euo pipefail
+
+SPOOL="${CSID_SPOOL:-/var/lib/csid}"
+GRACE_DAYS="${CSID_PRUNE_GRACE_DAYS:-7}"
+
+[[ -d "$SPOOL" ]] || { echo "csid-prune: spool $SPOOL missing" >&2; exit 0; }
+
+freed=0
+pruned=0
+for dir in "$SPOOL"/*/; do
+    [[ -d "$dir" ]] || continue
+    raw="$dir/capture.raw"
+    marker="$dir/.synced"
+
+    [[ -f "$raw" ]] || continue
+    # Never prune what was never confirmed shipped.
+    [[ -f "$marker" ]] || continue
+
+    # Marker older than the grace window?
+    if [[ -z "$(find "$marker" -mtime "+${GRACE_DAYS}" -print -quit 2>/dev/null)" ]]; then
+        continue
+    fi
+
+    size=$(wc -c < "$raw" 2>/dev/null || echo 0)
+    rm -f "$raw"
+    freed=$((freed + size))
+    pruned=$((pruned + 1))
+    echo "csid-prune: removed $(basename "$dir")/capture.raw"
+done
+
+echo "csid-prune: pruned $pruned capture(s), freed $((freed / 1024 / 1024)) MiB"

@@ -1,0 +1,50 @@
+[Unit]
+Description=CSI capture session (%i)
+Documentation=https://github.com/Sibyx/csid
+# Refuse to start on a kernel where the CSI-capable driver is not the one loaded.
+# (Provided by the fleet's kernel-tracking layer; harmless if absent.)
+Wants=csid-driver-guard.service
+After=csid-driver-guard.service network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/csid run %i
+WatchdogSec=30
+Restart=no
+
+# Bound the session even if the config says "run until stopped". Override per
+# instance with a drop-in: systemctl edit csid@<exp>
+# RuntimeMaxSec=1h
+
+# The RX thread requests SCHED_RR itself; this raises the unit's ceiling so it
+# is permitted to.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=50
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# Privileges: CAP_NET_ADMIN for interface/monitor setup and netlink; nothing more.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_NICE
+NoNewPrivileges=yes
+
+# Filesystem hardening. debugfs must stay readable/writable for the CSI knobs.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/csid /run/csid /sys/kernel/debug
+StateDirectory=csid
+RuntimeDirectory=csid
+RuntimeDirectoryPreserve=yes
+
+# Logging goes to journald; the per-session record is metadata.json.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=csid
+
+# Ship the session as soon as it closes cleanly; the timer heals the rest.
+OnSuccess=csid-sync.service
+
+[Install]
+WantedBy=multi-user.target

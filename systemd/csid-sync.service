@@ -1,0 +1,12 @@
+[Unit]
+Description=Ship completed CSI sessions to object storage
+Documentation=https://github.com/Sibyx/csid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/csid/sync.env
+ExecStart=/usr/local/bin/csid-sync
+Nice=10
+IOSchedulingClass=idle

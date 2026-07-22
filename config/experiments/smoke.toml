@@ -1,0 +1,25 @@
+# A short validation capture — the first thing to run on a new node.
+#   csid validate smoke --probe
+#   csid run smoke
+tag = "bring-up smoke test"
+
+[radio]
+interface   = "wlp1s0"
+monitor     = "wlp1s0mon0"
+channel     = 36
+width       = "80MHz"
+interval_us = 0
+mac_filter  = []
+
+[capture]
+mode     = "passive"
+duration = "60s"
+
+[stream]
+enabled     = true
+transport   = "unix"
+unix_socket = "/run/csid/live.sock"
+max_queue   = 4096
+
+[export]
+on_close = true

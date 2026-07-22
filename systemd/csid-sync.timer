@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic CSI session sync (heals offline gaps)
+Documentation=https://github.com/Sibyx/csid
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# Catch up after downtime rather than silently skipping.
+Persistent=yes
+# Stagger a fleet so 14 nodes do not hit object storage simultaneously.
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

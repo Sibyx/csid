@@ -1,0 +1,160 @@
+//! The semantic CSI record — the in-memory representation shared by the file
+//! container, the live stream, and the raw-stream parser.
+
+use serde::{Deserialize, Serialize};
+
+/// Channel width of the *monitor* interface that captured the record.
+///
+/// This bounds what CSI type is decodable; the actual per-record tone count
+/// (`ntone`) follows the received frame (a 20 MHz HE frame yields 242 tones
+/// even on a 160 MHz monitor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Width {
+    Noht,
+    Ht20,
+    Ht40Minus,
+    Ht40Plus,
+    W80,
+    W160,
+    /// 802.11be 320 MHz — reserved; the AX210 cannot reach this, kept so the
+    /// format need not change when EHT hardware arrives.
+    W320,
+    /// Width the capturer could not classify — value carried verbatim.
+    Unknown(u16),
+}
+
+impl Width {
+    /// Encode to the on-wire `u16` used by the `Width` TLV.
+    pub fn to_code(self) -> u16 {
+        match self {
+            Width::Noht => 0,
+            Width::Ht20 => 1,
+            Width::Ht40Minus => 2,
+            Width::Ht40Plus => 3,
+            Width::W80 => 4,
+            Width::W160 => 5,
+            Width::W320 => 6,
+            Width::Unknown(v) => v,
+        }
+    }
+
+    /// Decode from the on-wire `u16`.
+    pub fn from_code(v: u16) -> Self {
+        match v {
+            0 => Width::Noht,
+            1 => Width::Ht20,
+            2 => Width::Ht40Minus,
+            3 => Width::Ht40Plus,
+            4 => Width::W80,
+            5 => Width::W160,
+            6 => Width::W320,
+            other => Width::Unknown(other),
+        }
+    }
+}
+
+/// PHY modulation family, decoded from `rate_n_flags` v2 (iwlwifi).
+///
+/// Measured on the AX210: HE 2×2 records carry `Modulation::He`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modulation {
+    Cck,
+    LegacyOfdm,
+    Ht,
+    Vht,
+    He,
+    /// 802.11be — reserved for forward compatibility.
+    Eht,
+    Unknown(u8),
+}
+
+impl Modulation {
+    /// The `rate_n_flags` v2 modulation-type nibble → [`Modulation`].
+    pub fn from_rnf_type(t: u8) -> Self {
+        match t {
+            0 => Modulation::Cck,
+            1 => Modulation::LegacyOfdm,
+            2 => Modulation::Ht,
+            3 => Modulation::Vht,
+            4 => Modulation::He,
+            5 => Modulation::Eht,
+            other => Modulation::Unknown(other),
+        }
+    }
+}
+
+/// Decoded PHY label for a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhyLabel {
+    pub modulation: Modulation,
+    pub mcs: u8,
+    /// Number of spatial streams.
+    pub nss: u8,
+}
+
+/// A single CSI record: the triple-clock provenance, PHY labels, per-chain
+/// RSSI, geometry, source, and the raw CSI matrix.
+///
+/// Timing rule (see the CSIQ spec): **analyse on `ftm`** (the 320 MHz RF-plane
+/// clock, 3.125 ns, wraps every ~13.42 s — unwrap with [`unwrap_ftm`]) and
+/// **anchor wallclock on `unix_ts_ns`**.
+///
+/// [`unwrap_ftm`]: crate::unwrap_ftm
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CsiRecord {
+    /// 320 MHz baseband timestamp (3.125 ns tick). Wraps at 2^32 ticks.
+    pub ftm: u32,
+    /// Firmware microsecond clock (wraps ~71.6 min). Third timescale.
+    pub us: u32,
+    /// Kernel wallclock at vendor-event delivery (nanoseconds since epoch).
+    pub unix_ts_ns: u64,
+    /// Raw `rate_n_flags` v2 word (kept verbatim; `phy` is its decode).
+    pub rnf: u32,
+    /// Decoded PHY label (may be absent if `rnf` was unavailable).
+    pub phy: Option<PhyLabel>,
+    /// 802.11 sequence byte (NOT a reliable completeness counter — see spec).
+    pub seq: u8,
+    /// Number of RX chains.
+    pub nrx: u8,
+    /// Number of TX spatial streams in the sounding.
+    pub ntx: u8,
+    /// Number of subcarriers (tones): 52/56/242/484/996/1992 (…4096 for EHT).
+    pub ntone: u16,
+    /// Per-chain RSSI in dB (AGC context — amplitude is normalised, absolute
+    /// scale must come from here).
+    pub rssi: Vec<i16>,
+    /// Source MAC of the sounded frame.
+    pub src_mac: [u8; 6],
+    /// Control-channel index (802.11 channel number).
+    pub channel: u32,
+    /// Monitor-interface width at capture time.
+    pub width: Width,
+    /// Interleaved I/Q, `i16`, length `2 * ntone * nrx * ntx`, row-major over
+    /// `[tone][chain]`. Stored verbatim (AGC-normalised amplitude).
+    pub iq: Vec<i16>,
+}
+
+impl CsiRecord {
+    /// Number of complex CSI coefficients (`ntone * nrx * ntx`).
+    pub fn coeff_count(&self) -> usize {
+        self.ntone as usize * self.nrx as usize * self.ntx as usize
+    }
+
+    /// Materialise the CSI matrix as `(re, im)` `f32` pairs, tone-major.
+    ///
+    /// Returns `None` if `iq` does not match the declared dimensions.
+    pub fn complex(&self) -> Option<Vec<(f32, f32)>> {
+        let n = self.coeff_count();
+        if self.iq.len() != 2 * n {
+            return None;
+        }
+        Some(
+            self.iq
+                .chunks_exact(2)
+                .map(|c| (c[0] as f32, c[1] as f32))
+                .collect(),
+        )
+    }
+}

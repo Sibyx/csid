@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily CSI spool prune
+Documentation=https://github.com/Sibyx/csid
+
+[Timer]
+OnCalendar=daily
+Persistent=yes
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

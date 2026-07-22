@@ -1,0 +1,36 @@
+[package]
+name = "csid"
+description = "Systemd-native Wi-Fi CSI capture daemon for Intel AX210 (iwlwifi/iax) on Linux 6.x — TOML-configured, self-describing CSIQ output, best-effort live streaming."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+default-run = "csid"
+
+[[bin]]
+name = "csid"
+path = "src/main.rs"
+
+[dependencies]
+csiq = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+humantime-serde = "1"
+libc = "0.2"
+
+# Linux-only machinery: raw netlink (via libc), realtime scheduling / CPU
+# affinity (nix), and journald log export. Not built on other platforms, so the
+# portable structure (config, CLI, sinks, sidecar, export) still `cargo check`s
+# on a dev macOS/Windows box; the capture path is exercised on the Pi / in CI.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["sched", "socket", "net", "process"] }
+tracing-journald = "0.3"

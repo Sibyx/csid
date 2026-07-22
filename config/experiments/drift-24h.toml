@@ -1,0 +1,21 @@
+# Long unattended drift run. Throttled so a multi-day capture does not fill the
+# card: 10 ms interval caps the rate at roughly 88 Hz (~65 MB/h).
+tag = "24h channel drift, unattended"
+
+[radio]
+interface   = "wlp1s0"
+monitor     = "wlp1s0mon0"
+channel     = 36
+width       = "80MHz"
+interval_us = 10000
+mac_filter  = []
+
+[capture]
+mode     = "passive"
+duration = "24h"
+
+[stream]
+enabled = false
+
+[export]
+on_close = true

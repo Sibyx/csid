@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Ship completed CSI sessions to object storage.
+#
+# Idempotent by design: a session is copied only if it has no `.synced` marker,
+# so the `OnSuccess=` hook and the 15-minute timer may both fire safely. A node
+# that is offline for days simply catches up on reconnect.
+set -euo pipefail
+
+SPOOL="${CSID_SPOOL:-/var/lib/csid}"
+REMOTE="${CSID_SYNC_REMOTE:-hetzner}"
+BUCKET="${CSID_SYNC_BUCKET:-monad-knowledge}"
+PREFIX="${CSID_SYNC_PREFIX:-datasets/ax210-csi-captures}"
+HOST="${CSID_HOSTNAME:-$(hostname)}"
+
+command -v rclone >/dev/null || { echo "csid-sync: rclone not installed" >&2; exit 1; }
+[[ -d "$SPOOL" ]] || { echo "csid-sync: spool $SPOOL missing" >&2; exit 0; }
+
+shipped=0
+for dir in "$SPOOL"/*/; do
+    [[ -d "$dir" ]] || continue
+    session="$(basename "$dir")"
+
+    # Only ship sessions that have finished writing.
+    [[ -f "$dir/metadata.json" ]] || continue
+    if ! grep -q '"status": *"\(complete\|stopped\|failed\)"' "$dir/metadata.json"; then
+        continue
+    fi
+    # Already shipped.
+    [[ -f "$dir/.synced" ]] && continue
+
+    dest="${REMOTE}:${BUCKET}/${PREFIX}/${HOST}/${session}/"
+    echo "csid-sync: shipping $session -> $dest"
+    if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
+        date -Is > "$dir/.synced"
+        shipped=$((shipped + 1))
+    else
+        # Leave it unmarked; the timer retries on the next pass.
+        echo "csid-sync: FAILED $session (will retry)" >&2
+    fi
+done
+
+echo "csid-sync: $shipped session(s) shipped"

@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python reference reader
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Local captures — never commit CSI data to the repo
+*.raw
+*.csiq
+/captures/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
