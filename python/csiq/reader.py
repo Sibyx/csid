@@ -24,6 +24,13 @@ LIVE_VERSION = 1
 FLAG_SESSION = 0x0001
 FTM_HZ = 320_000_000
 
+#: RSSI value meaning "this chain reported no measurement".
+#: The firmware writes magnitude 0x7F, which negates to -127 dBm — Intel's
+#: documented "not available" marker (IWL_NOISE_MEAS_NOT_AVAILABLE). It is not a
+#: weak signal (-127 dBm is ~26 dB below a 20 MHz channel's thermal noise floor),
+#: and the chain's CSI slice is a stale duplicate — discard it.
+RSSI_NO_MEASUREMENT = -127
+
 # -- TLV type codes (see docs/CSIQ-format-v1.md) ------------------------------
 T_FTM = 0x01
 T_US = 0x02
@@ -103,6 +110,19 @@ class CsiRecord:
         """Source MAC as ``aa:bb:cc:dd:ee:ff``."""
         return ":".join(f"{b:02x}" for b in self.src_mac)
 
+    def chains_measured(self) -> list:
+        """Which RX chains actually measured, by RSSI.
+
+        A ``False`` entry means the chain reported
+        :data:`RSSI_NO_MEASUREMENT` and its CSI is a stale duplicate — exclude
+        it rather than treating it as a very weak signal.
+        """
+        return [r != RSSI_NO_MEASUREMENT for r in self.rssi]
+
+    def fully_measured(self) -> bool:
+        """True when every reported chain carries a real measurement."""
+        return bool(self.rssi) and all(r != RSSI_NO_MEASUREMENT for r in self.rssi)
+
     def coeff_count(self) -> int:
         """Number of complex coefficients (``ntone * nrx * ntx``)."""
         return self.ntone * self.nrx * self.ntx
@@ -121,8 +141,11 @@ class CsiRecord:
                 f"CSI payload does not match dimensions: {len(self.iq)} i16 for {n} coefficients"
             )
         flat = _np.asarray(self.iq, dtype=_np.int16).astype(_np.float32)
-        cplx = flat[0::2] + 1j * flat[1::2]
-        return cplx.reshape(self.ntone, self.nrx * self.ntx)
+        # Stored imaginary-first, and chain-major (nrx*ntx blocks of ntone).
+        # Both differ from the obvious reading — see the format spec.
+        cplx = flat[1::2] + 1j * flat[0::2]
+        chains = self.nrx * self.ntx
+        return _np.ascontiguousarray(cplx.reshape(chains, self.ntone).T)
 
 
 class FtmUnwrapper:
@@ -276,14 +299,14 @@ _OFF_FTM = 8
 _OFF_NRX = 46
 _OFF_NTX = 47
 _OFF_NTONE = 52
-_OFF_RSSI_A = 60
-_OFF_RSSI_B = 64
+_OFF_RSSI_A = 60  # u8 magnitude; 61..63 reserved
+_OFF_RSSI_B = 64  # u8 magnitude; 65..67 reserved
 _OFF_SRC_MAC = 68
 _OFF_SEQ = 76
 _OFF_US = 88
 _OFF_RNF = 92
 _OFF_UNIX_TS_NS = 208
-_OFF_CHANNEL = 216
+_OFF_CHANNEL = 216  # u8 (driver writes one byte)
 
 
 def _decode_rnf(rnf: int) -> Optional[PhyLabel]:
@@ -312,9 +335,9 @@ def parse_raw_record(hdr: bytes, csi: bytes, width: str = "NOHT") -> CsiRecord:
     (rnf,) = struct.unpack_from("<I", hdr, _OFF_RNF)
 
     unix_ts_ns, channel = 0, 0
-    if len(hdr) >= _OFF_CHANNEL + 4:
+    if len(hdr) >= _OFF_CHANNEL + 1:
         (unix_ts_ns,) = struct.unpack_from("<Q", hdr, _OFF_UNIX_TS_NS)
-        (channel,) = struct.unpack_from("<I", hdr, _OFF_CHANNEL)
+        channel = hdr[_OFF_CHANNEL]  # driver writes a single byte here
 
     return CsiRecord(
         ftm=struct.unpack_from("<I", hdr, _OFF_FTM)[0],

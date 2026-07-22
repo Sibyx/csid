@@ -109,6 +109,20 @@ impl Modulation {
     }
 }
 
+/// RSSI value meaning **this chain reported no measurement**.
+///
+/// The firmware writes the magnitude `0x7F`, which negates to `-127` dBm —
+/// Intel's documented "not available" marker (`IWL_NOISE_MEAS_NOT_AVAILABLE`).
+/// It is not a weak signal: -127 dBm sits ~26 dB below the thermal noise floor
+/// of a 20 MHz channel.
+///
+/// **Consumer rule:** when a chain reports this, that chain's slice of the CSI
+/// matrix is a byte-identical stale copy of an earlier frame, not a fresh
+/// measurement — discard it. Verified as an exact biconditional over 44 577
+/// records: a chain reads `-127` if and only if its CSI block is a duplicate.
+/// Records with one valid chain remain usable single-chain.
+pub const RSSI_NO_MEASUREMENT: i16 = -127;
+
 /// Decoded PHY label for a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhyLabel {
@@ -167,23 +181,71 @@ pub struct CsiRecord {
 }
 
 impl CsiRecord {
+    /// Which RX chains actually measured this record.
+    ///
+    /// A `false` entry means the chain reported [`RSSI_NO_MEASUREMENT`] and its
+    /// CSI is stale — exclude it rather than treating it as a weak signal.
+    pub fn chains_measured(&self) -> Vec<bool> {
+        self.rssi
+            .iter()
+            .map(|r| *r != RSSI_NO_MEASUREMENT)
+            .collect()
+    }
+
+    /// True when every reported chain carries a real measurement.
+    pub fn fully_measured(&self) -> bool {
+        !self.rssi.is_empty() && self.rssi.iter().all(|r| *r != RSSI_NO_MEASUREMENT)
+    }
+
     /// Number of complex CSI coefficients (`ntone * nrx * ntx`).
     pub fn coeff_count(&self) -> usize {
         self.ntone as usize * self.nrx as usize * self.ntx as usize
     }
 
-    /// Materialise the CSI matrix as `(re, im)` `f32` pairs, tone-major.
+    /// Materialise the CSI matrix as `(re, im)` `f32` pairs in **tone-major**
+    /// order, i.e. `index(tone t, chain c) = t * (nrx*ntx) + c`.
+    ///
+    /// Note the two conversions this performs, because the stored bytes are the
+    /// driver's and neither is what a naive read assumes:
+    ///
+    /// * storage is **chain-major** — `nrx*ntx` contiguous blocks of `ntone`
+    ///   coefficients — so this de-interleaves into the tone-major view;
+    /// * each coefficient is stored **imaginary first, then real**.
     ///
     /// Returns `None` if `iq` does not match the declared dimensions.
     pub fn complex(&self) -> Option<Vec<(f32, f32)>> {
         let n = self.coeff_count();
-        if self.iq.len() != 2 * n {
+        if self.iq.len() != 2 * n || n == 0 {
+            return None;
+        }
+        let chains = self.nrx as usize * self.ntx as usize;
+        let ntone = self.ntone as usize;
+        let mut out = Vec::with_capacity(n);
+        for t in 0..ntone {
+            for c in 0..chains {
+                let i = 2 * (c * ntone + t); // chain-major storage
+                out.push((self.iq[i + 1] as f32, self.iq[i] as f32)); // im, re
+            }
+        }
+        Some(out)
+    }
+
+    /// One chain's frequency response as `(re, im)` pairs, tone-ordered.
+    ///
+    /// Prefer this over slicing [`complex`](Self::complex): it reads the
+    /// chain's contiguous block directly.
+    pub fn chain(&self, chain: usize) -> Option<Vec<(f32, f32)>> {
+        let chains = self.nrx as usize * self.ntx as usize;
+        let ntone = self.ntone as usize;
+        if chain >= chains || self.iq.len() != 2 * self.coeff_count() || ntone == 0 {
             return None;
         }
         Some(
-            self.iq
-                .chunks_exact(2)
-                .map(|c| (c[0] as f32, c[1] as f32))
+            (0..ntone)
+                .map(|t| {
+                    let i = 2 * (chain * ntone + t);
+                    (self.iq[i + 1] as f32, self.iq[i] as f32)
+                })
                 .collect(),
         )
     }

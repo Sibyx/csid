@@ -100,10 +100,13 @@ pub fn chain(rec: &CsiRecord, chain: usize) -> Vec<Complex32> {
     if nc == 0 || chain >= nc || !g.matches(rec) {
         return Vec::new();
     }
+    // Storage is chain-major (nrx*ntx contiguous blocks of ntone), and each
+    // coefficient is imaginary-first. Both differ from the obvious reading —
+    // see docs/CSIQ-format-v1.md, "The CSI matrix".
     (0..g.ntone)
         .map(|t| {
-            let i = 2 * (t * nc + chain);
-            Complex32::new(rec.iq[i] as f32, rec.iq[i + 1] as f32)
+            let i = 2 * (chain * g.ntone + t);
+            Complex32::new(rec.iq[i + 1] as f32, rec.iq[i] as f32)
         })
         .collect()
 }
@@ -752,12 +755,14 @@ mod tests {
 
     fn rec(ntone: u16, nrx: u8, ntx: u8, f: impl Fn(usize, usize) -> (i16, i16)) -> CsiRecord {
         let nc = (nrx * ntx) as usize;
+        // Build the buffer the way the driver does: chain-major blocks of
+        // tones, each coefficient imaginary-first.
         let mut iq = Vec::with_capacity(2 * ntone as usize * nc);
-        for t in 0..ntone as usize {
-            for c in 0..nc {
+        for c in 0..nc {
+            for t in 0..ntone as usize {
                 let (re, im) = f(t, c);
-                iq.push(re);
                 iq.push(im);
+                iq.push(re);
             }
         }
         CsiRecord {
@@ -779,8 +784,9 @@ mod tests {
     }
 
     #[test]
-    fn chain_extraction_is_tone_major() {
-        // Encode the chain index in the real part so a transposed read is visible.
+    fn chain_extraction_reads_chain_major_storage() {
+        // Encode the chain index in the real part so a transposed read — or a
+        // swapped I/Q — is immediately visible.
         let r = rec(4, 2, 2, |t, c| ((c * 100 + t) as i16, 0));
         for c in 0..4 {
             let h = chain(&r, c);

@@ -33,8 +33,6 @@ pub enum Source {
     Unix(std::path::PathBuf),
     /// Bind UDP and accept datagrams from any `csid` targeting this address.
     Udp(String),
-    /// No transport: the synthetic generator in [`crate::demo`].
-    Demo,
 }
 
 impl Source {
@@ -43,7 +41,6 @@ impl Source {
         match self {
             Source::Unix(p) => format!("unix:{}", p.display()),
             Source::Udp(a) => format!("udp:{a}"),
-            Source::Demo => "demo:synthetic".to_string(),
         }
     }
 }
@@ -54,7 +51,6 @@ pub fn spawn(source: Source, hub: Arc<Hub>) -> Result<()> {
     match source {
         Source::Unix(path) => spawn_unix(path, hub),
         Source::Udp(addr) => spawn_udp(addr, hub),
-        Source::Demo => anyhow::bail!("the demo source is started by `demo::spawn`, not here"),
     }
 }
 

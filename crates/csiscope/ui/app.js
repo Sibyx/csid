@@ -738,9 +738,6 @@ function connect() {
         $('s-version').textContent = `csiscope ${m.csiscope_version} · csid ${m.csid_version}`;
         $('s-mode').textContent = m.read_only ? 'READ-ONLY' : '';
         document.body.classList.toggle('read-only', m.read_only);
-        // `--demo` must never be mistaken for a capture, least of all in the
-        // screenshot that ends up on a slide.
-        $('demo-badge').hidden = !String(m.source).startsWith('demo:');
         syncControls();
       } else if (m.t === 'settings') {
         S.settings = m.settings;

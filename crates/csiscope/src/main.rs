@@ -19,7 +19,6 @@
 
 mod analyze;
 mod console;
-mod demo;
 mod dsp;
 mod frame;
 mod ingest;
@@ -69,14 +68,6 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     udp_bind: Option<String>,
 
-    /// Feed the console a synthetic stream instead of subscribing to `csid`.
-    ///
-    /// For talks and for working on the UI without hardware. Everything it
-    /// produces is fabricated, the source is labelled `demo:` throughout, and
-    /// the console shows a banner saying so.
-    #[arg(long, conflicts_with = "udp_bind")]
-    demo: bool,
-
     /// Node-global configuration file.
     #[arg(long, default_value = DEFAULT_CONFIG)]
     config: PathBuf,
@@ -86,7 +77,7 @@ struct Cli {
     experiments: PathBuf,
 
     /// Serve the views but refuse every write: no config edits, no unit
-    /// control, no exports. The safe mode for a demo on an open network.
+    /// control, no exports. The safe mode on an untrusted network.
     #[arg(long)]
     read_only: bool,
 
@@ -123,10 +114,9 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let source = match (&cli.demo, &cli.udp_bind) {
-        (true, _) => ingest::Source::Demo,
-        (_, Some(addr)) => ingest::Source::Udp(addr.clone()),
-        _ => ingest::Source::Unix(cli.socket.clone()),
+    let source = match &cli.udp_bind {
+        Some(addr) => ingest::Source::Udp(addr.clone()),
+        None => ingest::Source::Unix(cli.socket.clone()),
     };
 
     let hub = state::Hub::new(
@@ -134,10 +124,7 @@ fn run(cli: Cli) -> Result<()> {
         cli.history.max(64),
         cli.coeff_budget.max(100_000),
     );
-    match source {
-        ingest::Source::Demo => demo::spawn(hub.clone()),
-        other => ingest::spawn(other, hub.clone())?,
-    }
+    ingest::spawn(source, hub.clone())?;
 
     if cli.read_only {
         tracing::info!("read-only: configuration, unit control and export are disabled");

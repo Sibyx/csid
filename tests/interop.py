@@ -59,8 +59,16 @@ def synthesise_raw(path: Path) -> None:
     struct.pack_into("<Q", hdr, 208, UNIX_TS_NS)
     struct.pack_into("<I", hdr, 216, CHANNEL)
 
-    coeffs = NTONE * NRX * NTX
-    csi = b"".join(struct.pack("<h", (i % 200) - 100) for i in range(2 * coeffs))
+    # Chain-major blocks of tones, each coefficient IMAGINARY first — the
+    # driver's actual layout. (re, im) = (c*100 + t, -(c*100 + t)) encodes the
+    # position so a transposed read or a swapped I/Q is visible downstream.
+    chains = NRX * NTX
+    vals = []
+    for c in range(chains):
+        for t in range(NTONE):
+            vals.append(-(c * 100 + t))   # imag
+            vals.append(c * 100 + t)      # real
+    csi = b"".join(struct.pack("<h", v) for v in vals)
 
     body = struct.pack(">I", len(hdr)) + bytes(hdr) + struct.pack(">I", len(csi)) + csi
     frame = struct.pack(">I", len(body)) + body
@@ -129,11 +137,19 @@ def main() -> int:
         assert raw_first.ntone == r.ntone
         assert list(raw_first.iq) == list(r.iq), "raw and CSIQ CSI payloads differ"
 
-        # -- optional NumPy view
+        # -- the CSI layout: chain-major storage, imaginary-first coefficients,
+        #    presented as a tone-major [ntone, nchain] view. Amplitude alone
+        #    cannot catch either mistake (|a+bi| == |b+ai|), so assert the
+        #    actual complex values.
         try:
             matrix = r.matrix()
             assert matrix.shape == (NTONE, NRX * NTX), matrix.shape
-            shape = f", matrix {matrix.shape}"
+            for c in range(NRX * NTX):
+                for t in (0, 1, NTONE - 1):
+                    want = complex(c * 100 + t, -(c * 100 + t))
+                    got = matrix[t, c]
+                    assert got == want, f"chain {c} tone {t}: got {got}, want {want}"
+            shape = f", matrix {matrix.shape} layout verified"
         except RuntimeError:
             shape = " (NumPy absent; matrix view skipped)"
 

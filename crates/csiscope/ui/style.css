@@ -91,13 +91,6 @@ body {
 .conn.live { color: var(--accent); }
 .conn.stale { color: var(--warn); }
 
-/* The demo generator is convincing enough that a screenshot could pass for a
-   capture. This badge is deliberately impossible to miss, and it is one of the
-   few things presentation mode does not hide. */
-#demo-badge {
-  font: 700 10px var(--mono); letter-spacing: .12em; text-transform: uppercase;
-  background: var(--bad); color: #0b0507; padding: 3px 8px;
-}
 
 /* ------------------------------------------------------------------- shell */
 
@@ -296,4 +289,3 @@ body.present .panel .sub { font-size: 11px; }
 body.present .tile .v { font-size: 16px; }
 body.present .tile { min-width: 104px; }
 body.present #topbar { min-height: 54px; }
-body.present #demo-badge { font-size: 12px; padding: 5px 12px; }

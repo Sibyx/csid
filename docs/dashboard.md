@@ -9,7 +9,6 @@ $ csiscope                                  # http://127.0.0.1:8088
 $ csiscope --bind 0.0.0.0:8088              # reachable from a laptop
 $ csiscope --udp-bind 0.0.0.0:5599          # off-node, via [stream] transport = "udp"
 $ csiscope --read-only                      # views only: no config, no unit control
-$ csiscope --demo                           # synthetic stream, no hardware needed
 ```
 
 It is a **strict consumer**. It never touches the radio, never writes to the
@@ -160,18 +159,6 @@ also attach — they are alternative subscribers, not concurrent ones.
 To watch from a second machine, or alongside the CLI, set the experiment's
 `[stream] transport = "udp"` with a target and run the console with
 `--udp-bind`.
-
-## Demo mode
-
-`--demo` replaces the ingest with a synthetic generator: a multipath channel
-with a moving reflector, per-packet CFO and sampling offsets, per-chain array
-geometry, band-edge taper, a DC notch and Erlang-distributed arrivals. It exists
-so a talk does not depend on the venue's Wi-Fi, and so every panel is exercised
-by a test rather than only by real captures.
-
-It is **not** a simulator of anything scientific. The source is labelled
-`demo:` throughout, the MACs are locally administered, and the console shows an
-unmissable **SYNTHETIC DATA** badge that presentation mode does not hide.
 
 ## Keyboard
 

@@ -94,7 +94,7 @@ Each record payload is a flat sequence of fields:
 | `0x09` | `SRC_MAC` | 6 B | |
 | `0x0A` | `CHANNEL` | `u32` — 802.11 channel number | |
 | `0x0B` | `WIDTH` | `u16` — width code (below) | |
-| `0x0C` | `RSSI` | `i16[]` — one per RX chain, **dBm** (negative); `0` = no measurement | |
+| `0x0C` | `RSSI` | `i16[]` — one per RX chain, **dBm** (negative); `-127` = no measurement | |
 | `0x0D` | `SEQ` | `u8` — 802.11 sequence byte | |
 | `0x10` | `CSI_MATRIX` | `i16[]` — interleaved I/Q | |
 | `0x20`–`0x2F` | *reserved* | 802.11be / EHT (RU allocation, per-RU tone maps) | |
@@ -132,27 +132,76 @@ frame captured on a 160 MHz monitor still yields 242 tones.
 
 ### The CSI matrix (`0x10`)
 
-Interleaved little-endian `i16` pairs — `re, im, re, im, …` — of length
-`2 × ntone × nrx × ntx`, ordered tone-major:
+An array of little-endian `i16` pairs, `2 x ntone x nrx x ntx` values, stored
+exactly as the driver produced them. **Two properties of that storage are not
+what a naive read assumes, and getting either wrong silently corrupts every
+phase-derived result:**
+
+**1. The layout is chain-major.** The payload is `nrx*ntx` *contiguous blocks*
+of `ntone` coefficients — not tone-interleaved:
 
 ```text
-index(tone t, chain c) = 2 * (t * (nrx*ntx) + c)
+[chain 0: tone 0 .. tone N-1][chain 1: tone 0 .. tone N-1] ...
+
+index(chain c, tone t) = 2 * (c * ntone + t)
 ```
 
-Reshaped, this is `[ntone, nrx*ntx]` complex.
+This is the vendor reader's own loop order (`for rx { for tx { for tone { ... } } }`,
+`iaxcsi.m`), and it is confirmed empirically: reading chain-major yields a more
+compact channel impulse response than the tone-major reading in **99.4 % of
+5 186 records** (mean gain in top-4-tap energy +0.115, 95 % CI [+0.113, +0.117]),
+across both legacy 52-tone and HT 56-tone frames.
+
+**2. Each coefficient is imaginary first, then real.**
+
+```text
+value(c, t) = iq[index+1] + i * iq[index]
+```
+
+The vendor readers do the same (`imag = le16i(buf(pos:pos+1)); real = le16i(buf(pos+2:pos+3))`).
+Reading it the other way round yields `i * conj(H)` — which leaves `|H|`
+untouched, so amplitude work looks perfectly healthy while every phase is
+mirrored. The tell is causality: on real captures the correct order concentrates
+**21.5x** more impulse-response energy at early delays than at late ones, while
+the swapped order inverts that ratio to 0.48 — an anti-causal "channel", which
+is physically impossible.
+
+Both reference readers expose a tone-major *view* (`[ntone, nrx*ntx]`) built
+from this storage, so consumers keep a stable shape without having to know the
+on-disk order. Use `chain()` when you want one chain's contiguous response.
 
 **Amplitude is AGC-normalised.** `|H|` carries the channel's *shape* only; the
 correlation between `|H|²` and RSSI is ≈ 0.01 on the reference hardware. Any
 absolute scale must come from the `RSSI` field.
 
 **RSSI is dBm, and the sign is applied at parse time.** The driver header
-carries RSSI as a *positive magnitude* — Intel's convention for the `__le32`
-RSSI fields in `fw/api/stats.h`. Measured on the reference node across 20 000
-consecutive records: range 47…89, no negative and no zero value, monotone with
-distance. Both reference readers negate it, so a `CsiRecord` always carries
-ordinary negative dBm and no consumer has to know the driver's convention. A
-`0` is passed through unchanged and means *this chain reported nothing* — not
-0 dBm.
+carries RSSI as a **`u8` positive magnitude** — the vendor reader's own
+`iaxcsi.h` declares `uint8_t opp_rssi1; uint8_t v61[3];`, i.e. one byte followed
+by three reserved bytes, and both its C++ and MATLAB readers print
+`-opp_rssi1`. Both reference readers here negate it, so a `CsiRecord` always
+carries ordinary negative dBm and no consumer has to know the driver's
+convention. Observed valid range on the reference hardware: **-18 ... -89 dBm**,
+a smooth unimodal continuum over 659 083 records.
+
+**`-127` dBm means "this chain reported no measurement".** The firmware writes
+the magnitude `0x7F`; this is Intel's documented not-available marker, the same
+value as `IWL_NOISE_MEAS_NOT_AVAILABLE` in the driver's `dvm/dev.h`, chosen
+there because it "is below the range of measurable". Treating it as a very weak
+signal is wrong in two independent ways: -127 dBm sits roughly 26 dB *below* the
+thermal noise floor of a 20 MHz channel (kTB is about -101 dBm), so it cannot be
+a measurement; and empirically the sentinel is a discrete spike separated from
+the real distribution by a 60 dB gap, not a tail.
+
+> **Consumer rule.** When a chain reports `-127`, that chain's slice of
+> `CSI_MATRIX` **must be discarded** — it is a byte-identical stale copy of an
+> earlier frame, not a weak measurement. Verified as an exact biconditional over
+> 44 577 records: a chain reads `-127` if and only if its CSI block duplicates
+> the previous one. A record whose other chain is valid remains usable
+> single-chain; records with *both* chains at `-127` have never been observed.
+> Both reference readers expose `chains_measured()` / `fully_measured()` for
+> exactly this.
+
+`0` is **not** a sentinel and has never been observed (703 660 records).
 
 **Phase is usable, with alignment.** Raw phase is dominated by carrier frequency
 offset. The inter-chain conjugate product is concentrated (circular σ ≈ 2.2°)
@@ -269,15 +318,15 @@ reference hardware, with little-endian fields at these offsets:
 | 8 | `ftm` | `u32` |
 | 46 | `nrx` | `u8` |
 | 47 | `ntx` | `u8` |
-| 52 | `ntone` | `u16` |
-| 60 | `rssi_a` | `i32` — positive magnitude; readers negate into dBm |
-| 64 | `rssi_b` | `i32` — positive magnitude; readers negate into dBm |
+| 52 | `ntone` | `u16` (low half of the vendor struct's `u32`) |
+| 60 | `rssi_a` | `u8` — positive magnitude; readers negate into dBm (61-63 reserved) |
+| 64 | `rssi_b` | `u8` — positive magnitude; readers negate into dBm (65-67 reserved) |
 | 68 | `src_mac` | 6 B |
 | 76 | `seq` | `u8` |
 | 88 | `us` | `u32` |
 | 92 | `rnf` | `u32` |
 | 208 | `unix_ts_ns` | `u64` |
-| 216 | `channel` | `u32` |
+| 216 | `channel` | `u8` (217-219 reserved) |
 
 This layout is **driver-coupled** — it is the one part of the pipeline that a
 firmware or driver revision can invalidate. That is precisely why CSIQ exists:

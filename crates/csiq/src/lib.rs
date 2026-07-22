@@ -33,7 +33,7 @@ pub mod tlv;
 
 pub use container::{Reader, Writer};
 pub use error::{CsiqError, Result};
-pub use record::{CsiRecord, Modulation, PhyLabel, Width};
+pub use record::{CsiRecord, Modulation, PhyLabel, Width, RSSI_NO_MEASUREMENT};
 
 /// File magic at the start of every `.csiq` container.
 pub const MAGIC: [u8; 4] = *b"CSIQ";
@@ -110,6 +110,46 @@ mod tests {
             channel: 36,
             width: Width::W80,
             iq,
+        }
+    }
+
+    /// The layout and I/Q order are invisible in amplitude — |a+bi| == |b+ai|,
+    /// and a transposed read still "looks like CSI". Only an explicit test
+    /// pins them, which is why this one exists.
+    #[test]
+    fn csi_storage_is_chain_major_and_imag_first() {
+        let (ntone, nrx, ntx) = (4usize, 2u8, 1u8);
+        let chains = nrx as usize * ntx as usize;
+        // Build as the driver does: chain-major blocks, imaginary first.
+        // Encode (chain, tone) into the real part so any mis-read shows up.
+        let mut iq = Vec::new();
+        for c in 0..chains {
+            for t in 0..ntone {
+                iq.push(-((c * 100 + t) as i16)); // imag
+                iq.push((c * 100 + t) as i16); // real
+            }
+        }
+        let mut r = sample_record(ntone as u16, nrx, ntx);
+        r.iq = iq;
+
+        // chain() reads one contiguous block.
+        for c in 0..chains {
+            let ch = r.chain(c).expect("chain in range");
+            assert_eq!(ch.len(), ntone);
+            for (t, (re, im)) in ch.iter().enumerate() {
+                assert_eq!(*re, (c * 100 + t) as f32, "chain {c} tone {t} real");
+                assert_eq!(*im, -((c * 100 + t) as f32), "chain {c} tone {t} imag");
+            }
+        }
+        assert!(r.chain(chains).is_none(), "out-of-range chain");
+
+        // complex() presents the same data as a tone-major view.
+        let flat = r.complex().expect("dimensions match");
+        assert_eq!(flat.len(), ntone * chains);
+        for t in 0..ntone {
+            for c in 0..chains {
+                assert_eq!(flat[t * chains + c].0, (c * 100 + t) as f32);
+            }
         }
     }
 

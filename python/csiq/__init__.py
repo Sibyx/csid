@@ -24,6 +24,7 @@ source of truth rather than the derived container::
 """
 
 from .reader import (  # noqa: F401
+    RSSI_NO_MEASUREMENT,
     CsiRecord,
     CsiqError,
     FtmUnwrapper,
@@ -35,6 +36,7 @@ from .reader import (  # noqa: F401
 )
 
 __all__ = [
+    "RSSI_NO_MEASUREMENT",
     "CsiRecord",
     "CsiqError",
     "FtmUnwrapper",

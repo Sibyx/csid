@@ -114,7 +114,6 @@ Doppler spectrogram, next to the node's configuration and unit control.
 ```console
 $ csiscope                     # http://127.0.0.1:8088
 $ csiscope --read-only         # views only, safe on an open network
-$ csiscope --demo              # synthetic stream, no hardware needed
 ```
 
 It is a strict consumer — it never touches the radio and never writes to the
