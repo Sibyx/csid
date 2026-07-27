@@ -9,8 +9,11 @@ name = "monad01"
 [listen]
 # The phone reaches this over the experiment AP, whose address on this node is assigned by
 # hostapd/dnsmasq and is not knowable ahead of time — so bind everywhere rather than guessing.
-# The port must match `collector.udp_port` in the lab bundle the app fetches from the API.
-bind = "0.0.0.0:9999"
+#
+# NOT 9999: the illuminator broadcasts its paced frames to <subnet>.255:9999, and although nothing
+# listens there, binding it would feed 25 Hz of illuminator traffic into this daemon as malformed
+# datagrams. The port must match `collector.udp_port` in the lab bundle the app fetches.
+bind = "0.0.0.0:9998"
 
 # Answer the four-timestamp clock exchange. Turning this off makes the collector a pure sink and
 # leaves every phone session with an undisciplined clock, so leave it on unless you are
