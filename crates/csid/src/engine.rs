@@ -38,6 +38,18 @@ pub struct SessionOutcome {
     pub summary: SummaryMeta,
 }
 
+/// One-line capture status for `systemctl status`: how much has been captured,
+/// and how fast it is arriving right now.
+///
+/// The rate matters as much as the total. A passive session yields nothing when
+/// the monitored channel carries no CSI-bearing traffic, so `active (running)`
+/// on its own says only that the process is alive — a starving capture pings the
+/// watchdog exactly like a healthy one. Reporting `0 rec, 0.0 Hz` here makes the
+/// difference visible without opening the spool.
+fn capture_status(session_id: &str, records: u64, rate_hz: f64) -> String {
+    format!("capturing {session_id} ({records} rec, {rate_hz:.1} Hz)")
+}
+
 /// Run one capture session to completion.
 pub fn run_session(
     global: &GlobalConfig,
@@ -193,10 +205,11 @@ pub fn run_session(
 
     // -- supervise ---------------------------------------------------------
     crate::notify::ready();
-    crate::notify::status(&format!("capturing {session_id}"));
+    crate::notify::status(&capture_status(&session_id, 0, 0.0));
     let deadline = cfg.capture.duration.map(|d| Instant::now() + d);
     let watchdog_every = crate::notify::watchdog_interval().unwrap_or(Duration::from_secs(10));
     let mut last_log = Instant::now();
+    let mut last_records: u64 = 0;
 
     let status = loop {
         thread::sleep(Duration::from_millis(200));
@@ -217,13 +230,25 @@ pub fn run_session(
 
         if last_log.elapsed() >= watchdog_every.max(Duration::from_secs(10)) {
             let (records, bytes, sent, dropped) = counters.snapshot();
+            // Rate over the interval just elapsed, not since session start: a
+            // capture that flowed for an hour and then stalled must not be
+            // averaged back into looking healthy.
+            let window = last_log.elapsed().as_secs_f64();
+            let rate_hz = if window > 0.0 {
+                records.saturating_sub(last_records) as f64 / window
+            } else {
+                0.0
+            };
             tracing::info!(
                 records,
                 bytes,
+                rate_hz,
                 live_sent = sent,
                 live_dropped = dropped,
                 "capturing"
             );
+            crate::notify::status(&capture_status(&session_id, records, rate_hz));
+            last_records = records;
             last_log = Instant::now();
         }
     };
