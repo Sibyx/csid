@@ -133,7 +133,7 @@ pub fn channel_to_freq(band: Band, channel: u32) -> Option<u32> {
         Band::Ghz5 => CH5.contains(&channel).then(|| 5000 + 5 * channel),
         Band::Ghz6 => {
             // 6 GHz 20 MHz channels are 1, 5, 9 … 233.
-            (channel >= 1 && channel <= 233 && (channel - 1) % 4 == 0).then(|| 5950 + 5 * channel)
+            ((1..=233).contains(&channel) && (channel - 1) % 4 == 0).then(|| 5950 + 5 * channel)
         }
     }
 }

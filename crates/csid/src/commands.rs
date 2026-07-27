@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -269,6 +270,7 @@ pub fn export_cmd(dir: &Path, out: Option<PathBuf>) -> Result<()> {
 }
 
 /// `csid stream` — attach a debug subscriber to the live socket.
+#[cfg(unix)]
 pub fn stream_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
     // A datagram receiver must own (bind) the path.
     if socket.exists() {
@@ -323,6 +325,13 @@ pub fn stream_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
     }
 }
 
+/// The live socket is Unix-domain; without it there is nothing to attach to.
+#[cfg(not(unix))]
+pub fn stream_cmd(_socket: &Path, _limit: Option<u64>) -> Result<()> {
+    anyhow::bail!("`csid stream` requires Unix-domain sockets, unavailable on this platform")
+}
+
+#[cfg(unix)]
 fn fmt_mac(m: &[u8; 6]) -> String {
     m.iter()
         .map(|b| format!("{b:02x}"))
@@ -350,8 +359,8 @@ pub fn bench(
     };
 
     println!(
-        "{:<8} {:<8} {:>10} {:>12} {:>10}  {}",
-        "channel", "width", "records", "rate (Hz)", "bytes", "tones"
+        "{:<8} {:<8} {:>10} {:>12} {:>10}  tones",
+        "channel", "width", "records", "rate (Hz)", "bytes"
     );
     for ch in channels {
         let mut cfg = base.clone();

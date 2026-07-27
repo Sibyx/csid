@@ -432,7 +432,7 @@ pub fn list_sessions(spool: &Path, limit: usize) -> Vec<Session> {
             Some(describe_session(&path, id))
         })
         .collect();
-    out.sort_by(|a, b| b.modified_ns.cmp(&a.modified_ns));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified_ns));
     out.truncate(limit);
     out
 }

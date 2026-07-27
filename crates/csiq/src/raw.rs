@@ -112,7 +112,7 @@ pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
     let rssi = rssi_all[..(nrx as usize).min(2)].to_vec();
 
     // flq extension fields are only present on long-enough headers.
-    let (unix_ts_ns, channel) = if hdr.len() >= off::CHANNEL + 1 {
+    let (unix_ts_ns, channel) = if hdr.len() > off::CHANNEL {
         (le_u64(hdr, off::UNIX_TS_NS), hdr[off::CHANNEL] as u32)
     } else {
         (0, 0)

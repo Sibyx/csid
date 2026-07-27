@@ -6,10 +6,12 @@
 //! When `NOTIFY_SOCKET` is unset (interactive runs) every call is a no-op.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
 /// Send a raw notification string. No-op when not started by systemd.
+#[cfg(unix)]
 pub fn notify(state: &str) -> io::Result<()> {
     let Some(raw) = std::env::var_os("NOTIFY_SOCKET") else {
         return Ok(());
@@ -32,6 +34,12 @@ pub fn notify(state: &str) -> io::Result<()> {
     }
 
     sock.send_to(state.as_bytes(), &path).map(|_| ())
+}
+
+/// systemd (and its socket protocol) does not exist here; every call no-ops.
+#[cfg(not(unix))]
+pub fn notify(_state: &str) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

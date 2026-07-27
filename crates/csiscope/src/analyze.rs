@@ -677,8 +677,8 @@ mod tests {
         let mut iq = Vec::new();
         for t in 0..ntone as usize {
             for c in 0..nc {
-                iq.push((100 + t as i16 + c as i16 * 5) as i16);
-                iq.push((t as i16 % 7) as i16);
+                iq.push(100 + t as i16 + c as i16 * 5);
+                iq.push(t as i16 % 7);
             }
         }
         Sample {

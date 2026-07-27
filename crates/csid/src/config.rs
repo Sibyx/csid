@@ -27,7 +27,7 @@ pub const DEFAULT_EXPERIMENT_DIR: &str = "/etc/csid/experiments";
 // -- node-global --------------------------------------------------------------
 
 /// Node-global configuration (`/etc/csid/config.toml`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     #[serde(default)]
@@ -38,17 +38,6 @@ pub struct GlobalConfig {
     pub otel: OtelConfig,
     #[serde(default)]
     pub driver: DriverConfig,
-}
-
-impl Default for GlobalConfig {
-    fn default() -> Self {
-        GlobalConfig {
-            node: NodeConfig::default(),
-            sync: SyncConfig::default(),
-            otel: OtelConfig::default(),
-            driver: DriverConfig::default(),
-        }
-    }
 }
 
 /// Node identity and local storage.
@@ -283,18 +272,12 @@ impl Default for StreamConfig {
 }
 
 /// Post-capture export behaviour.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     /// Produce a `.csiq` alongside `capture.raw` when the session closes.
     #[serde(default)]
     pub on_close: bool,
-}
-
-impl Default for ExportConfig {
-    fn default() -> Self {
-        ExportConfig { on_close: false }
-    }
 }
 
 // -- loading + validation -----------------------------------------------------

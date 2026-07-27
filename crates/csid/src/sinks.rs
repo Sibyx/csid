@@ -14,6 +14,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::UdpSocket;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +106,7 @@ impl DurableSink {
 /// Best-effort transport for live CSIQ datagrams.
 pub enum LiveTransport {
     /// On-node consumers (the v1 default).
+    #[cfg(unix)]
     Unix { sock: UnixDatagram, path: PathBuf },
     /// Opt-in network transport.
     Udp {
@@ -129,6 +131,7 @@ impl LiveSink {
     /// The socket is *unbound* — we only send. If no consumer has bound the
     /// path yet, sends fail with `ENOENT`/`ECONNREFUSED` and are counted as
     /// drops; a consumer may appear at any time and start receiving.
+    #[cfg(unix)]
     pub fn unix(path: &Path, session_uid: u64, counters: Arc<Counters>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -144,6 +147,15 @@ impl LiveSink {
             counters,
             warned: false,
         })
+    }
+
+    /// Unix-domain sockets don't exist here; the caller falls back to counting
+    /// the session as stream-disabled.
+    #[cfg(not(unix))]
+    pub fn unix(_path: &Path, _session_uid: u64, _counters: Arc<Counters>) -> Result<Self> {
+        anyhow::bail!(
+            "Unix-socket live transport is unavailable on this platform; use `transport = \"udp\"`"
+        )
     }
 
     /// Bind a UDP sender aimed at one or more `host:port` targets.
@@ -167,6 +179,7 @@ impl LiveSink {
         self.seq = self.seq.wrapping_add(1);
 
         let result = match &self.transport {
+            #[cfg(unix)]
             LiveTransport::Unix { sock, path } => sock.send_to(&datagram, path).map(|_| ()),
             LiveTransport::Udp { sock, targets } => {
                 let mut last = Ok(());
@@ -211,7 +224,8 @@ mod tests {
         hdr[46] = 2; // nrx
         hdr[47] = 1; // ntx
         hdr[52..54].copy_from_slice(&52u16.to_le_bytes());
-        let csi = vec![0u8; 52 * 2 * 1 * 2 * 2];
+        // ntone(52) x nrx(2) x ntx(1) x I/Q x i16
+        let csi = vec![0u8; 52 * 2 * 2 * 2];
 
         let mut sink = DurableSink::create(&dir, counters.clone()).unwrap();
         sink.write(&RawCsiMessage {
