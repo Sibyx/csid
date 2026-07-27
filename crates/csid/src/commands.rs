@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::caps::{self, Envelope};
 use crate::config::{ExperimentConfig, GlobalConfig};
