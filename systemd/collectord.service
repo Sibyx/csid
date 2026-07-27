@@ -1,0 +1,44 @@
+[Unit]
+Description=MonadCount UDP lab collector
+Documentation=https://github.com/Sibyx/csid
+After=network-online.target
+Wants=network-online.target
+# Not bound to csid: the collector is useful on a node that is only running an AP, and a capture
+# failure must not take the phone's reference clock down with it.
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/collectord --config /etc/collector/config.toml run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+WatchdogSec=60
+
+# Unprivileged: unlike csid, this binds a high UDP port and needs no CAP_NET_ADMIN, no debugfs and
+# no realtime scheduling.
+User=collector
+Group=collector
+StateDirectory=collector
+RuntimeDirectory=collector
+ConfigurationDirectory=collector
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Sessions are small text files; a runaway is a bug, not a workload.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

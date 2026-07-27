@@ -69,8 +69,16 @@ interval_us = 0               # 0 = unthrottled; otherwise a rate cap
 mac_filter  = []              # source-MAC allowlist; empty = all
 
 [capture]
-mode     = "passive"          # "inject" is reserved
+mode     = "passive"          # "passive" | "inject" (paced illumination, see [inject])
 duration = "30m"              # omit to run until stopped
+
+# Only read when capture.mode = "inject". Defaults shown.
+# [inject]
+# rate_hz      = 25                    # absolute-deadline paced; missed slots skipped, never bunched
+# frame_bytes  = 200                   # 802.11 MPDU size
+# src_mac      = "ef:be:ad:de:ad:de"   # the analysis sentinel receivers filter on
+# dst_mac      = "ff:ff:ff:ff:ff:ff"   # broadcast = unACKed; loss stays measurable
+# bitrate_mbps = 6                     # legacy OFDM only (6/9/12/18/24/36/48/54)
 
 [stream]
 enabled     = true
@@ -106,8 +114,28 @@ valid group**, so an impossible capture fails at `validate` time. Run
 
 | Key | Type | Notes |
 |---|---|---|
-| `mode` | string | `passive` only. `inject` is reserved and currently rejected. |
+| `mode` | string | `passive` (ambient traffic) or `inject` (passive capture **plus** the paced monitor-mode injector configured under `[inject]`). |
 | `duration` | duration | Human format: `30s`, `10m`, `4h`. Omit to run until stopped. systemd's `RuntimeMaxSec` remains the outer bound. |
+
+### `[inject]` (only read when `capture.mode = "inject"`)
+
+Transmits paced 802.11 data frames on the monitor interface — the campaign's
+illumination source. Replaces the hostapd soft-AP arm, whose multicast queue
+released frames in beacon-aligned bunches (measured 2026-07-27: inter-arrival
+p50 15.3 ms at a commanded 40 ms, CV 2.6); injection leaves only CSMA between
+the pacing loop and the air. Works on any band the radio can tune — including
+5 GHz, where the iax firmware crashes in AP mode. The payload carries a
+sequence number and TX wallclock stamp, and the close-time sidecar records
+`summary.inject = {sent, errors, skipped}`, so the receiver-side delivery
+fraction is `receiver records ÷ sent`.
+
+| Key | Type | Notes |
+|---|---|---|
+| `rate_hz` | int | 1..=1000. Absolute-deadline paced; missed slots are skipped, never bunched. |
+| `frame_bytes` | int | 64..=1500. 802.11 MPDU size (radiotap not counted). |
+| `src_mac` | string | Source MAC — the analysis sentinel receivers filter on. |
+| `dst_mac` | string | Broadcast by default (unACKed, loss visible). |
+| `bitrate_mbps` | int | Legacy OFDM only (6/9/12/18/24/36/48/54), via the radiotap RATE field, so receivers see the 52-tone `legacy_ofdm` class on both bands. CCK rates are rejected — they carry no CSI. |
 
 ### `[stream]`
 

@@ -1,0 +1,34 @@
+# collectord — node-global configuration.
+# Install to /etc/collector/config.toml. Check a candidate before installing it:
+#     collectord --config ./candidate.toml validate
+
+[node]
+# Recorded into every session sidecar. Empty means "use $HOSTNAME".
+name = "monad01"
+
+[listen]
+# The phone reaches this over the experiment AP, whose address on this node is assigned by
+# hostapd/dnsmasq and is not knowable ahead of time — so bind everywhere rather than guessing.
+# The port must match `collector.udp_port` in the lab bundle the app fetches from the API.
+bind = "0.0.0.0:9999"
+
+# Answer the four-timestamp clock exchange. Turning this off makes the collector a pure sink and
+# leaves every phone session with an undisciplined clock, so leave it on unless you are
+# deliberately measuring what that costs.
+answer_time_requests = true
+
+buffer_bytes = 2048
+
+[session]
+# Deliberately NOT csid's spool: csid-prune deletes by csid's own filenames, so sharing a spool
+# would leave these artefacts growing without bound.
+spool = "/var/lib/collector/sessions"
+
+# A phone never announces the end of a session — it runs out of battery, walks out of range, or is
+# killed by the OS — so silence is the only end-of-session signal there is. 120 s is comfortably
+# longer than the worst CSMA stall observed in EXP-P2 (~1.1 s) and than a clock-burst gap.
+idle_timeout_seconds = 120
+
+# How often a live session's sidecar is refreshed, so a run in progress can be inspected on the
+# node without waiting for it to close.
+heartbeat_seconds = 15

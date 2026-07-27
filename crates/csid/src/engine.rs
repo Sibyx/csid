@@ -89,6 +89,29 @@ pub fn run_session(
     // complete provenance on disk.
     let mut sidecar = Sidecar::open(&dir, session_id.clone(), cfg, global, &tuning)?;
 
+    // -- injector (capture.mode = "inject") --------------------------------
+    // Spawned before the RX loop so a failed socket open fails the session at
+    // setup. Runs on the tuned monitor interface; capture continues unchanged
+    // (the driver reports no CSI for locally transmitted frames).
+    let inject_counters = Arc::new(crate::inject::InjectCounters::default());
+    let injector = if cfg.capture.mode == "inject" {
+        match crate::inject::spawn(
+            &cfg.radio.monitor,
+            &cfg.inject,
+            stop.clone(),
+            inject_counters.clone(),
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                knobs.set_best_effort(crate::debugfs::knob::CSI_ENABLED, "0");
+                sidecar.close(Status::Failed, None);
+                return Err(e).context("starting the injector");
+            }
+        }
+    } else {
+        None
+    };
+
     // -- source ------------------------------------------------------------
     // The vendor registration must name the radio; CSI then arrives unicast to
     // this process's netlink portid.
@@ -256,6 +279,9 @@ pub fn run_session(
     // -- teardown ----------------------------------------------------------
     crate::notify::stopping();
     stop.store(true, Ordering::Relaxed);
+    if let Some(h) = injector {
+        let _ = h.join();
+    }
     let _ = rx.join();
     let raw_path = match durable.join() {
         Ok(Ok(p)) => Some(p),
@@ -273,10 +299,19 @@ pub fn run_session(
     knobs.set_best_effort(crate::debugfs::knob::CSI_ENABLED, "0");
 
     // Close-time summary is best effort — it must never invalidate the capture.
-    let summary = raw_path
+    let mut summary = raw_path
         .as_ref()
         .map(|p| summarize(p, cfg, &counters))
         .unwrap_or_else(|| base_summary(&counters));
+
+    if cfg.capture.mode == "inject" {
+        let (sent, errors, skipped) = inject_counters.snapshot();
+        summary.inject = Some(crate::sidecar::InjectSummary {
+            sent,
+            errors,
+            skipped,
+        });
+    }
 
     sidecar.close(status, Some(summary.clone()));
 
@@ -314,6 +349,7 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
         mean_rate_hz: 0.0,
         live_dropped: dropped,
         tone_counts: Vec::new(),
+        inject: None,
     }
 }
 

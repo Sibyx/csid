@@ -19,6 +19,7 @@
 //! | [`radio`] | Linux (execs `iw`) | Monitor setup, tuning, regdomain |
 //! | [`debugfs`] | Linux | The `iwlmvm` CSI knobs |
 //! | [`source`] | Linux | nl80211 vendor-event netlink consumption |
+//! | [`inject`] | Linux (AF_PACKET) | Paced monitor-mode frame injection (`capture.mode = "inject"`) |
 //! | [`engine`], [`sinks`], [`notify`] | Linux | Session orchestration, the two sinks, `sd_notify` |
 //!
 //! [`csiscope`]: https://github.com/Sibyx/csid/tree/master/crates/csiscope
@@ -29,6 +30,7 @@ pub mod config;
 pub mod debugfs;
 pub mod engine;
 pub mod export;
+pub mod inject;
 pub mod notify;
 pub mod radio;
 pub mod sidecar;

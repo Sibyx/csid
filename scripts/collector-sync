@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Ship finished collector sessions to object storage.
+#
+# Modelled on csid-sync, but with a different key layout on purpose: a phone session's own
+# artefacts already live at
+#     datasets/monad-app-sessions/<participant>/<session>/
+# and the collector's view of that same session belongs beside them, not in a parallel tree —
+# an analysis opens one prefix and finds both ends of the link.
+#
+#     .../<participant>/<session>/collector/
+#
+# The participant is learned from the SESSION_HELLO the phone repeats with each clock burst; a
+# session that never sent one ships under `unknown-participant`, which is visible rather than lost.
+set -euo pipefail
+
+SPOOL="${COLLECTOR_SPOOL:-/var/lib/collector/sessions}"
+BUCKET="${CSID_SYNC_BUCKET:?CSID_SYNC_BUCKET must be set (see /etc/csid/sync.env)}"
+PREFIX="${COLLECTOR_SYNC_PREFIX:-datasets/monad-app-sessions}"
+
+command -v rclone >/dev/null || { echo "collector-sync: rclone not installed" >&2; exit 1; }
+command -v jq >/dev/null || { echo "collector-sync: jq not installed" >&2; exit 1; }
+
+[[ -d "$SPOOL" ]] || { echo "collector-sync: no spool at $SPOOL"; exit 0; }
+
+shipped=0
+skipped=0
+
+for dir in "$SPOOL"/*/; do
+    [[ -d "$dir" ]] || continue
+    session="$(basename "$dir")"
+    sidecar="$dir/metadata.json"
+
+    # Only ship sessions that have finished being written. A `receiving` session is still open;
+    # uploading it would publish a partial recording that looks complete.
+    [[ -f "$sidecar" ]] || continue
+    status="$(jq -r '.status // "unknown"' "$sidecar")"
+    case "$status" in
+        complete|stopped|failed) ;;
+        *) skipped=$((skipped + 1)); continue ;;
+    esac
+
+    [[ -f "$dir/.synced" ]] && continue
+
+    participant="$(jq -r '.identity.participant_id // "" ' "$sidecar")"
+    [[ -n "$participant" ]] || participant="unknown-participant"
+    # Path-safe, matching the API's own sanitiser: these become object-key segments.
+    participant="$(printf '%s' "$participant" | tr -c 'A-Za-z0-9._-' '_')"
+
+    dest="s3:${BUCKET}/${PREFIX}/${participant}/${session}/collector/"
+    echo "collector-sync: shipping $session ($status) -> $dest"
+    if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
+        date -Is > "$dir/.synced"
+        shipped=$((shipped + 1))
+    else
+        echo "collector-sync: upload FAILED for $session; leaving it on disk" >&2
+    fi
+done
+
+echo "collector-sync: shipped=$shipped still-open=$skipped"

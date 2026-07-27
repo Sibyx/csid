@@ -1,0 +1,37 @@
+# Injector arm, 2.4 GHz: this node illuminates the channel with paced legacy
+# OFDM broadcast frames while capturing as usual. The peer runs a passive
+# profile on the same channel and filters analysis to inject.src_mac.
+#
+# Replaces the hostapd soft-AP illuminator: the AP's multicast queue released
+# frames in beacon-aligned bunches (inter-arrival p50 15.3 ms at a commanded
+# 40 ms, CV 2.6 — office pair, 2026-07-27); injection paces on the monitor
+# interface directly, so only CSMA remains between the loop and the air.
+tag = "2.4 GHz injector illumination arm"
+
+[radio]
+interface   = "wlp1s0"
+monitor     = "wlp1s0mon0"
+channel     = 11
+width       = "HT20"
+interval_us = 0
+mac_filter  = []
+
+[capture]
+mode     = "inject"
+duration = "30m"
+
+[inject]
+rate_hz      = 25                    # 85% delivered on contended office 2.4 GHz
+frame_bytes  = 200
+src_mac      = "ef:be:ad:de:ad:de"   # the fleet's analysis sentinel
+dst_mac      = "ff:ff:ff:ff:ff:ff"   # broadcast: unACKed, loss stays visible
+bitrate_mbps = 6                     # legacy OFDM => 52-tone class on both bands
+
+[stream]
+enabled     = true
+transport   = "unix"
+unix_socket = "/run/csid/live.sock"
+max_queue   = 4096
+
+[export]
+on_close = true

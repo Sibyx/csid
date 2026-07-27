@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic collector session upload
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+# A node that was asleep or offline at the scheduled moment still ships on the next boot rather
+# than waiting a full interval.
+Persistent=yes
+
+[Install]
+WantedBy=timers.target

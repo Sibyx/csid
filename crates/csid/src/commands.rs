@@ -69,6 +69,17 @@ pub fn validate(experiment: &str, experiment_dir: &Path, probe: bool) -> Result<
         }
     );
     println!("mac filter    : {:?}", cfg.radio.mac_filter);
+    println!("mode          : {}", cfg.capture.mode);
+    if cfg.capture.mode == "inject" {
+        println!(
+            "inject        : {} Hz, {} B frames, {} -> {}, {} Mbps legacy OFDM",
+            cfg.inject.rate_hz,
+            cfg.inject.frame_bytes,
+            cfg.inject.src_mac,
+            cfg.inject.dst_mac,
+            cfg.inject.bitrate_mbps
+        );
+    }
     println!(
         "duration      : {}",
         cfg.capture

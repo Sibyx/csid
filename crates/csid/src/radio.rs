@@ -96,19 +96,36 @@ pub fn resolve(radio: &RadioConfig) -> Result<Tuning> {
     })
 }
 
+/// Build the `iw dev … set freq` argument vector for a tuning.
+///
+/// iw has two mutually exclusive syntaxes: keyword widths (`HT20`, `80MHz`, …)
+/// belong to the centre-less form, and centre frequencies require the numeric
+/// width (`80`). Mixing them makes iw print usage and exit 1 — which is how
+/// every ≥80 MHz tune silently failed until 2026-07-27.
+fn tune_args(monitor: &str, t: &Tuning) -> Vec<String> {
+    let mut args: Vec<String> = ["dev", monitor, "set", "freq"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    args.push(t.freq.to_string());
+    match t.center {
+        Some(c) => {
+            args.push(t.width.iw_numeric().to_string());
+            args.push(c.to_string());
+        }
+        None => args.push(t.width.iw_token().to_string()),
+    }
+    args
+}
+
 /// Tune the monitor interface, retrying once.
 ///
 /// The retry exists for a measured hardware quirk: the first 6 GHz tune after a
 /// 5 GHz retune can return a transient `-EIO`.
 pub fn tune(monitor: &str, t: &Tuning) -> Result<()> {
-    let freq = t.freq.to_string();
-    let width = t.width.iw_token();
-    let center = t.center.map(|c| c.to_string());
-
-    let mut args: Vec<&str> = vec!["dev", monitor, "set", "freq", &freq, width];
-    if let Some(c) = center.as_deref() {
-        args.push(c);
-    }
+    let args = tune_args(monitor, t);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let width = args[5];
 
     match run("iw", &args) {
         Ok(_) => {
@@ -133,4 +150,37 @@ pub fn regdomain() -> Option<String> {
     out.lines()
         .find(|l| l.trim_start().starts_with("country"))
         .map(|l| l.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tune_args_use_numeric_width_with_center() {
+        let t = Tuning {
+            band: Band::Ghz5,
+            freq: 5180,
+            center: Some(5210),
+            width: WidthCfg::W80,
+        };
+        assert_eq!(
+            tune_args("wlp1s0mon0", &t),
+            ["dev", "wlp1s0mon0", "set", "freq", "5180", "80", "5210"]
+        );
+    }
+
+    #[test]
+    fn tune_args_use_keyword_width_without_center() {
+        let t = Tuning {
+            band: Band::Ghz24,
+            freq: 2462,
+            center: None,
+            width: WidthCfg::Ht20,
+        };
+        assert_eq!(
+            tune_args("wlp1s0mon0", &t),
+            ["dev", "wlp1s0mon0", "set", "freq", "2462", "HT20"]
+        );
+    }
 }

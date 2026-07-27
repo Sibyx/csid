@@ -69,6 +69,29 @@ pub struct SummaryMeta {
     pub live_dropped: u64,
     /// Distinct tone counts observed (52 / 242 / 996 …).
     pub tone_counts: Vec<u16>,
+    /// Injector totals — present only for `capture.mode = "inject"` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<InjectSummary>,
+}
+
+/// What the injector actually did, for delivery-ratio analysis downstream
+/// (receiver records ÷ `sent` is the arm's delivery fraction).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InjectSummary {
+    pub sent: u64,
+    pub errors: u64,
+    pub skipped: u64,
+}
+
+/// Injector configuration as applied — the provenance the receiving side's
+/// analysis keys on (sentinel MAC, commanded pace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectMeta {
+    pub rate_hz: u32,
+    pub frame_bytes: usize,
+    pub src_mac: String,
+    pub dst_mac: String,
+    pub bitrate_mbps: u32,
 }
 
 /// The full sidecar document.
@@ -79,6 +102,9 @@ pub struct Sidecar {
     pub experiment: String,
     pub tag: Option<String>,
     pub radio: RadioMeta,
+    /// Present only for `capture.mode = "inject"` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<InjectMeta>,
     pub environment: EnvironmentMeta,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -109,12 +135,21 @@ impl Sidecar {
             mac_filter: cfg.radio.mac_filter.clone(),
         };
 
+        let inject = (cfg.capture.mode == "inject").then(|| InjectMeta {
+            rate_hz: cfg.inject.rate_hz,
+            frame_bytes: cfg.inject.frame_bytes,
+            src_mac: cfg.inject.src_mac.clone(),
+            dst_mac: cfg.inject.dst_mac.clone(),
+            bitrate_mbps: cfg.inject.bitrate_mbps,
+        });
+
         let sc = Sidecar {
             schema: SCHEMA.to_string(),
             session_id,
             experiment: cfg.slug().to_string(),
             tag: cfg.tag.clone(),
             radio,
+            inject,
             environment: capture_environment(global, &cfg.radio.interface),
             started_at: rfc3339_utc(util::now_unix()),
             ended_at: None,

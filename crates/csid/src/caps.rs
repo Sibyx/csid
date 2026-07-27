@@ -73,6 +73,22 @@ impl WidthCfg {
     pub fn needs_center(self) -> bool {
         matches!(self, WidthCfg::W80 | WidthCfg::W160 | WidthCfg::W320)
     }
+
+    /// The numeric width for iw's `set freq <control> <width> <center1>` form.
+    ///
+    /// iw has two mutually exclusive syntaxes: the keyword tokens (`HT20`,
+    /// `80MHz`, …) belong to the centre-less form, and passing a centre
+    /// frequency after them makes iw print usage and exit 1. Whenever a
+    /// centre is supplied the width must be numeric.
+    pub fn iw_numeric(self) -> &'static str {
+        match self {
+            WidthCfg::Noht | WidthCfg::Ht20 => "20",
+            WidthCfg::Ht40Minus | WidthCfg::Ht40Plus => "40",
+            WidthCfg::W80 => "80",
+            WidthCfg::W160 => "160",
+            WidthCfg::W320 => "320",
+        }
+    }
 }
 
 /// 5 GHz 80 MHz groups → centre channel.

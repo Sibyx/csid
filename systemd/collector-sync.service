@@ -1,0 +1,14 @@
+[Unit]
+Description=Ship finished collector sessions to object storage
+Documentation=https://github.com/Sibyx/csid
+# Without credentials there is nothing to do; failing loudly every 15 minutes on a node that was
+# never meant to sync is noise, not information.
+ConditionPathExists=/etc/csid/sync.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/csid/sync.env
+ExecStart=/usr/local/bin/collector-sync
+User=collector
+Group=collector
+StateDirectory=collector

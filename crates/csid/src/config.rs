@@ -167,6 +167,9 @@ pub struct ExperimentConfig {
     pub radio: RadioConfig,
     #[serde(default)]
     pub capture: CaptureConfig,
+    /// Only read when `capture.mode = "inject"`.
+    #[serde(default)]
+    pub inject: InjectConfig,
     #[serde(default)]
     pub stream: StreamConfig,
     #[serde(default)]
@@ -206,7 +209,8 @@ fn default_monitor() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// `passive` (ambient traffic) — `inject` is reserved for the injector mode.
+    /// `passive` (ambient traffic) or `inject` (passive capture **plus** the
+    /// paced monitor-mode injector configured under `[inject]`).
     #[serde(default = "default_mode")]
     pub mode: String,
     /// Session duration; `None` runs until stopped (systemd `RuntimeMaxSec`
@@ -227,6 +231,68 @@ impl Default for CaptureConfig {
         }
     }
 }
+
+/// Injector configuration (`capture.mode = "inject"`).
+///
+/// The injector transmits paced 802.11 data frames on the monitor interface —
+/// the illumination source the receiving arm's analysis keys on. Defaults
+/// mirror the proven illuminator arm: 25 Hz (85% delivered on contended office
+/// 2.4 GHz, measured 2026-07-27), 200-byte frames, the `ef:be:ad:de:ad:de`
+/// sentinel, 6 Mbps legacy OFDM (⇒ the 52-tone `legacy_ofdm` record class on
+/// both bands — the band-contrast invariant).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InjectConfig {
+    /// Frames per second. Absolute-deadline paced; missed slots are skipped,
+    /// never bunched.
+    #[serde(default = "default_inject_rate")]
+    pub rate_hz: u32,
+    /// 802.11 MPDU size in bytes (header + payload; radiotap not counted).
+    #[serde(default = "default_inject_frame_bytes")]
+    pub frame_bytes: usize,
+    /// Source MAC — the analysis sentinel receivers filter on.
+    #[serde(default = "default_inject_src_mac")]
+    pub src_mac: String,
+    /// Destination MAC. Broadcast (the default) is unACKed: loss is visible
+    /// to analysis instead of being papered over by retries.
+    #[serde(default = "default_inject_dst_mac")]
+    pub dst_mac: String,
+    /// Legacy OFDM bitrate in Mbps, requested via the radiotap RATE field.
+    #[serde(default = "default_inject_bitrate")]
+    pub bitrate_mbps: u32,
+}
+
+fn default_inject_rate() -> u32 {
+    25
+}
+fn default_inject_frame_bytes() -> usize {
+    200
+}
+fn default_inject_src_mac() -> String {
+    "ef:be:ad:de:ad:de".to_string()
+}
+fn default_inject_dst_mac() -> String {
+    "ff:ff:ff:ff:ff:ff".to_string()
+}
+fn default_inject_bitrate() -> u32 {
+    6
+}
+
+impl Default for InjectConfig {
+    fn default() -> Self {
+        InjectConfig {
+            rate_hz: default_inject_rate(),
+            frame_bytes: default_inject_frame_bytes(),
+            src_mac: default_inject_src_mac(),
+            dst_mac: default_inject_dst_mac(),
+            bitrate_mbps: default_inject_bitrate(),
+        }
+    }
+}
+
+/// Legal 802.11a/g OFDM bitrates (Mbps). DSSS/CCK rates are excluded on
+/// purpose: they carry no OFDM preamble, so the receiver would get no CSI.
+pub const OFDM_BITRATES_MBPS: [u32; 8] = [6, 9, 12, 18, 24, 36, 48, 54];
 
 /// Best-effort live streaming. Never blocks or slows the durable path.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -336,10 +402,35 @@ impl ExperimentConfig {
 
         match self.capture.mode.as_str() {
             "passive" => {}
-            "inject" => anyhow::bail!(
-                "capture.mode = \"inject\" is reserved (injector mode is not implemented yet)"
+            "inject" => {
+                let inj = &self.inject;
+                if inj.rate_hz == 0 || inj.rate_hz > 1000 {
+                    anyhow::bail!("inject.rate_hz must be 1..=1000 (got {})", inj.rate_hz);
+                }
+                if inj.frame_bytes < 64 || inj.frame_bytes > 1500 {
+                    anyhow::bail!(
+                        "inject.frame_bytes must be 64..=1500 (got {})",
+                        inj.frame_bytes
+                    );
+                }
+                if !is_mac(&inj.src_mac) {
+                    anyhow::bail!("inject.src_mac {:?} is not a MAC address", inj.src_mac);
+                }
+                if !is_mac(&inj.dst_mac) {
+                    anyhow::bail!("inject.dst_mac {:?} is not a MAC address", inj.dst_mac);
+                }
+                if !OFDM_BITRATES_MBPS.contains(&inj.bitrate_mbps) {
+                    anyhow::bail!(
+                        "inject.bitrate_mbps must be an OFDM rate {:?} (got {}) — \
+                         CCK rates carry no CSI",
+                        OFDM_BITRATES_MBPS,
+                        inj.bitrate_mbps
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "capture.mode must be \"passive\" or \"inject\" (got {other:?})"
             ),
-            other => anyhow::bail!("capture.mode must be \"passive\" (got {other:?})"),
         }
 
         if self.stream.enabled {
@@ -435,5 +526,44 @@ on_close = true
     fn rejects_unknown_key() {
         let bad = format!("{SAMPLE}\n[bogus]\nx = 1\n");
         assert!(toml::from_str::<ExperimentConfig>(&bad).is_err());
+    }
+
+    #[test]
+    fn inject_mode_validates_with_defaults() {
+        let toml_src = SAMPLE.replace("mode = \"passive\"", "mode = \"inject\"");
+        let cfg: ExperimentConfig = toml::from_str(&toml_src).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.inject.rate_hz, 25);
+        assert_eq!(cfg.inject.src_mac, "ef:be:ad:de:ad:de");
+    }
+
+    #[test]
+    fn inject_rejects_cck_bitrate() {
+        let toml_src = format!(
+            "{}\n[inject]\nbitrate_mbps = 11\n",
+            SAMPLE.replace("mode = \"passive\"", "mode = \"inject\"")
+        );
+        let cfg: ExperimentConfig = toml::from_str(&toml_src).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no CSI"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn inject_rejects_zero_rate() {
+        let toml_src = format!(
+            "{}\n[inject]\nrate_hz = 0\n",
+            SAMPLE.replace("mode = \"passive\"", "mode = \"inject\"")
+        );
+        let cfg: ExperimentConfig = toml::from_str(&toml_src).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn passive_mode_ignores_inject_section() {
+        // An [inject] section with nonsense must not fail a passive config —
+        // operators flip `mode` back and forth without pruning sections.
+        let toml_src = format!("{SAMPLE}\n[inject]\nrate_hz = 0\n");
+        let cfg: ExperimentConfig = toml::from_str(&toml_src).unwrap();
+        cfg.validate().unwrap();
     }
 }

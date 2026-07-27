@@ -217,3 +217,10 @@ density target, though it is x86-only and unavailable on ARM).
 ## License
 
 GPL-2.0-only. See [LICENSE](LICENSE).
+
+## `collectord` — the UDP lab collector
+
+A fourth crate in this workspace: the receiving end of the MonadCount mobile instrument's paced UDP
+stream. It kernel-timestamps arrivals, answers the four-timestamp clock exchange, and writes
+sessions in the same shape `csid` does so the existing sync machinery ships them. Lab-specific — it
+is not part of the portable `csiq`/`csid` story. See [docs/collector.md](docs/collector.md).
