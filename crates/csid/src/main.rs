@@ -96,6 +96,22 @@ enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
+    /// Report SoC temperature and the firmware throttle word.
+    ///
+    /// With no flags, a human-readable line. `--prometheus` emits
+    /// node_exporter textfile-collector input, so a systemd timer can publish
+    /// the throttle state the OS itself does not expose: above 80 °C the Pi 5
+    /// firmware reduces the ARM clock while `cpufreq` keeps reporting the
+    /// governor's requested 2.4 GHz.
+    Thermal {
+        /// Emit Prometheus text-format metrics.
+        #[arg(long)]
+        prometheus: bool,
+        /// Write the metrics to this path, replacing it atomically. Implies
+        /// `--prometheus`. Point this at the textfile collector's directory.
+        #[arg(long, value_name = "PATH")]
+        write: Option<PathBuf>,
+    },
     /// Timed capture(s) reporting achieved rate and CSI mix.
     Bench {
         experiment: String,
@@ -163,6 +179,9 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }
         Command::Export { session, out } => commands::export_cmd(session, out.clone()),
         Command::Stream { socket, limit } => commands::stream_cmd(socket, *limit),
+        Command::Thermal { prometheus, write } => {
+            commands::thermal_cmd(*prometheus, write.clone())
+        }
         Command::Bench {
             experiment,
             channels,

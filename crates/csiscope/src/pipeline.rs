@@ -241,6 +241,29 @@ impl Pipeline {
     }
 }
 
+/// How long a view may reuse its last analysis while no record arrives.
+///
+/// The guard below skips work when the ring has not advanced, but it must not
+/// skip forever: several fields of a frame are functions of the CLOCK rather
+/// than of the ring — how long since the last record, the delivered rate, the
+/// drop counters. Freezing those is precisely the failure IP-123 was written
+/// about, where a console showed a healthy-looking picture of a capture that
+/// had stopped. One second is far below the point a human reads a display as
+/// stalled, and still 20x less work than a 20 fps view doing it every tick.
+const IDLE_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether this tick has to run the analysis again.
+///
+/// Everything a frame contains except the clock-derived fields is a function of
+/// the ring, so an unchanged `Hub::total()` means an identical result. On a
+/// quiet channel that is the common case by a wide margin: monad02's console
+/// feed delivered 0.4 Hz on 2026-07-28 while the view ticked at 20 fps, so
+/// roughly 49 of every 50 analyses recomputed bytes that were already on the
+/// wire — on the node that had the least thermal headroom in the fleet.
+fn should_recompute(total: u64, last_total: u64, since_emit: std::time::Duration) -> bool {
+    total != last_total || since_emit >= IDLE_REFRESH
+}
+
 fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
     let (tx, rx) = watch::channel(None);
     let rates: Arc<Mutex<Vec<(u64, f32)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -251,6 +274,10 @@ fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
         let mut fps = settings.fps;
         let mut ticker = tokio::time::interval(settings.interval());
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `None` until the first analysis, so a view always produces one frame
+        // immediately rather than waiting out an idle interval.
+        let mut last_total: Option<u64> = None;
+        let mut last_emit = tokio::time::Instant::now();
 
         loop {
             ticker.tick().await;
@@ -258,6 +285,13 @@ fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
                 // Nobody is reading. The `Drop` on `View` aborts us too, but
                 // this covers the window before the registry notices.
                 return;
+            }
+
+            let total = hub.total();
+            if let Some(seen) = last_total {
+                if !should_recompute(total, seen, last_emit.elapsed().into()) {
+                    continue;
+                }
             }
 
             let want = task_rates
@@ -286,6 +320,12 @@ fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
             match handle.await {
                 Ok((frame, a)) => {
                     analysis = a;
+                    // Recorded whether or not a frame came back: a `None` means
+                    // the ring had nothing to analyse, and retrying that at the
+                    // full frame rate is the same wasted work the guard exists
+                    // to stop.
+                    last_total = Some(total);
+                    last_emit = tokio::time::Instant::now();
                     if let Some(f) = frame {
                         let _ = tx.send(Some(Arc::new(f)));
                     }
@@ -345,6 +385,54 @@ mod tests {
         assert!(52 * (128 + 256) < JOIN_THRESHOLD);
         // ...while an HE20 frame is worth splitting.
         assert!(242 * (128 + 256) >= JOIN_THRESHOLD);
+    }
+
+    /// The idle guard must save work on a quiet channel without ever letting a
+    /// view go stale — those are the two ways it can be wrong, in both
+    /// directions.
+    #[test]
+    fn an_idle_view_reuses_its_frame_but_never_freezes() {
+        use std::time::Duration;
+
+        // A new record always forces a recompute, however recently we emitted.
+        assert!(should_recompute(101, 100, Duration::ZERO));
+        // No new record and we published a moment ago: skip.
+        assert!(!should_recompute(100, 100, Duration::from_millis(50)));
+        // No new record, but the clock-derived fields are now a second old:
+        // recompute anyway, so a dead feed shows as dead.
+        assert!(should_recompute(100, 100, IDLE_REFRESH));
+        assert!(should_recompute(100, 100, Duration::from_secs(30)));
+    }
+
+    /// The guard is only worth its complexity if it actually removes most of
+    /// the work on the feed that motivated it.
+    #[test]
+    fn the_guard_removes_most_ticks_on_the_console_feed() {
+        use std::time::Duration;
+
+        // monad02's console view: 20 fps over a 0.4 Hz capture.
+        let tick = Duration::from_millis(50);
+        let mut total = 0u64;
+        let mut last_total = 0u64;
+        let mut since_emit = Duration::ZERO;
+        let mut computed = 0usize;
+        let ticks = 20 * 60; // one minute
+        for i in 1..=ticks {
+            // A record every 2.5 s = every 50th tick.
+            if i % 50 == 0 {
+                total += 1;
+            }
+            since_emit += tick;
+            if should_recompute(total, last_total, since_emit) {
+                computed += 1;
+                last_total = total;
+                since_emit = Duration::ZERO;
+            }
+        }
+        // Without the guard this is 1200 analyses a minute. With it, the
+        // 1 Hz idle refresh dominates: ~60, plus one per arriving record.
+        assert!(computed <= 90, "{computed} analyses/min is not a saving");
+        assert!(computed >= 24, "{computed} analyses/min is too stale");
     }
 
     #[test]

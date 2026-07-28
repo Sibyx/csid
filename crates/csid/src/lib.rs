@@ -21,6 +21,7 @@
 //! | [`source`] | Linux | nl80211 vendor-event netlink consumption |
 //! | [`inject`] | Linux (AF_PACKET) | Paced monitor-mode frame injection (`capture.mode = "inject"`) |
 //! | [`engine`], [`sinks`], [`notify`] | Linux | Session orchestration, the two sinks, `sd_notify` |
+//! | [`thermal`] | Linux (Pi) | Die temperature and the firmware throttle word — what qualifies a node for a long run |
 //!
 //! [`csiscope`]: https://github.com/Sibyx/csid/tree/master/crates/csiscope
 
@@ -36,6 +37,7 @@ pub mod radio;
 pub mod sidecar;
 pub mod sinks;
 pub mod source;
+pub mod thermal;
 pub mod util;
 
 /// The `csid` version string, so consumers report the same one the daemon does.

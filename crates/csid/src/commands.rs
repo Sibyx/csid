@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-#[cfg(unix)]
 use anyhow::Context;
 use anyhow::Result;
 
 use crate::caps::{self, Envelope};
 use crate::config::{ExperimentConfig, GlobalConfig};
+use crate::thermal::{self, Verdict};
 use crate::{debugfs, engine, export, radio, util};
 
 /// `csid run <experiment>` — the systemd `ExecStart`.
@@ -352,10 +352,145 @@ fn fmt_mac(m: &[u8; 6]) -> String {
         .join(":")
 }
 
-/// `csid bench` — timed capture(s) reporting achieved rate and CSI mix.
+/// `csid thermal` — the node's current thermal state, for humans or for the
+/// metrics pipeline.
+///
+/// ## Why this is a csid subcommand and not a shell script
+///
+/// The firmware throttle word is a bitmask whose meaning is not obvious and is
+/// easy to get subtly wrong — in particular the distinction between the live
+/// bits (0..3) and the sticky since-boot bits (16..19), which is exactly the
+/// distinction that matters. On 2026-07-28 monad02 read `0x80000`: nothing
+/// wrong at that instant, the soft temperature limit already engaged earlier.
+/// A check that only tested the live half would have reported a healthy node.
+///
+/// That decode is implemented and unit-tested once, in [`crate::thermal`].
+/// Emitting the Prometheus text from here means the metrics pipeline and the
+/// bench harness cannot disagree about what a bit means.
+///
+/// ## Why textfile rather than an exporter
+///
+/// node_exporter's `textfile` collector reads a directory of `.prom` files on
+/// each scrape. A timer writing this file costs two sysfs reads every 30 s,
+/// entirely outside the capture process — no port, no daemon, and nothing that
+/// can block, hold a lock, or share a core with the RX thread.
+pub fn thermal_cmd(prometheus: bool, write: Option<PathBuf>) -> Result<()> {
+    let temp = thermal::read_temp_c();
+    let throttle = thermal::read_throttle();
+
+    if !prometheus && write.is_none() {
+        match temp {
+            Some(c) => println!(
+                "temperature: {c:.1} °C ({:+.1} °C to the {:.0} °C soft limit)",
+                thermal::SOFT_LIMIT_C - c,
+                thermal::SOFT_LIMIT_C
+            ),
+            None => println!("temperature: unavailable (no thermal zone)"),
+        }
+        match throttle {
+            Some(t) => println!("throttle:    0x{:x} ({})", t.raw, t.describe()),
+            None => println!("throttle:    unavailable"),
+        }
+        return Ok(());
+    }
+
+    let text = prometheus_text(temp, throttle);
+    match write {
+        // Atomic replace: node_exporter may scrape the directory at any moment,
+        // and a half-written file is a parse error that blanks every series in
+        // it rather than merely delaying them.
+        Some(path) => {
+            let tmp = path.with_extension("prom.tmp");
+            std::fs::write(&tmp, text.as_bytes())
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("installing {}", path.display()))?;
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// Render the node's thermal state as node_exporter textfile-collector input.
+///
+/// Absent readings emit NO sample rather than a zero. A missing series is
+/// visibly missing in a dashboard; a fabricated `0 °C` looks like a working
+/// sensor on an impossibly cold node.
+fn prometheus_text(temp: Option<f32>, throttle: Option<thermal::Throttle>) -> String {
+    use crate::thermal::Throttle;
+    let mut s = String::new();
+
+    if let Some(c) = temp {
+        s.push_str("# HELP csid_node_temp_celsius SoC die temperature.\n");
+        s.push_str("# TYPE csid_node_temp_celsius gauge\n");
+        s.push_str(&format!("csid_node_temp_celsius {c:.3}\n"));
+
+        s.push_str(
+            "# HELP csid_node_thermal_headroom_celsius Degrees below the firmware soft throttle limit; negative means the clock is being reduced.\n",
+        );
+        s.push_str("# TYPE csid_node_thermal_headroom_celsius gauge\n");
+        s.push_str(&format!(
+            "csid_node_thermal_headroom_celsius {:.3}\n",
+            thermal::SOFT_LIMIT_C - c
+        ));
+    }
+
+    if let Some(t) = throttle {
+        s.push_str(
+            "# HELP csid_node_throttle_flags Raw firmware throttle word, as vcgencmd get_throttled.\n",
+        );
+        s.push_str("# TYPE csid_node_throttle_flags gauge\n");
+        s.push_str(&format!("csid_node_throttle_flags {}\n", t.raw));
+
+        s.push_str(
+            "# HELP csid_node_throttled Firmware throttle conditions. window=now is live, window=since_boot is sticky.\n",
+        );
+        s.push_str("# TYPE csid_node_throttled gauge\n");
+        for (mask, condition, window) in [
+            (Throttle::UNDERVOLT_NOW, "undervolt", "now"),
+            (Throttle::FREQ_CAPPED_NOW, "freq_capped", "now"),
+            (Throttle::THROTTLED_NOW, "throttled", "now"),
+            (Throttle::SOFT_LIMIT_NOW, "soft_limit", "now"),
+            (Throttle::UNDERVOLT_SEEN, "undervolt", "since_boot"),
+            (Throttle::FREQ_CAPPED_SEEN, "freq_capped", "since_boot"),
+            (Throttle::THROTTLED_SEEN, "throttled", "since_boot"),
+            (Throttle::SOFT_LIMIT_SEEN, "soft_limit", "since_boot"),
+        ] {
+            s.push_str(&format!(
+                "csid_node_throttled{{condition=\"{condition}\",window=\"{window}\"}} {}\n",
+                u8::from(t.bit(mask))
+            ));
+        }
+    }
+    s
+}
+
+/// How often the thermal sampler reads sysfs during a bench leg.
+///
+/// The die moves on a timescale of seconds under a step in load, so this is
+/// comfortably faster than the thing it measures while still being nothing:
+/// two small sysfs reads twice a second.
+const THERMAL_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `csid bench` — timed capture(s) reporting achieved rate, CSI mix, and the
+/// thermal state the rate was achieved in.
 ///
 /// This is the harness that produced the envelope in `csid caps`; pass several
 /// channels to sweep them one after another.
+///
+/// ## Why a rate without a temperature is not a result
+///
+/// The nodes pin the `performance` governor so capture timing does not move
+/// under the experiment. Above 80 °C the Pi 5 firmware takes the clock away
+/// anyway, and `cpufreq` keeps reporting 2.4 GHz while it does — so the
+/// governor's guarantee quietly stops holding with no OS-level symptom. A bench
+/// leg that hit its rate on a node at 84 °C and one that hit it at 55 °C are
+/// not the same measurement, and only one of them will still be true six hours
+/// into an unattended run.
+///
+/// Every leg therefore carries a [`Verdict`], and the command's exit status
+/// reflects the worst one — so this can gate a deployment rather than merely
+/// inform it.
 pub fn bench(
     global: &GlobalConfig,
     experiment: &str,
@@ -371,31 +506,191 @@ pub fn bench(
         channels
     };
 
+    // The state the node was in BEFORE any of this ran. A node that is already
+    // at the soft limit while idle has a cooling fault, and no per-leg number
+    // below will mean what it appears to mean.
+    match (thermal::read_temp_c(), thermal::read_throttle()) {
+        (Some(c), t) => {
+            let flags = t.map(|t| t.describe()).unwrap_or_else(|| "unknown".into());
+            println!("idle baseline: {c:.1} °C, throttle flags: {flags}");
+            if c >= thermal::SAFE_PEAK_C {
+                println!(
+                    "  WARNING: {:.1} °C at idle leaves {:.1} °C to the {:.0} °C soft limit; \
+                     a full-rate capture costs about 6 °C. Fix cooling before trusting these numbers.",
+                    c,
+                    thermal::SOFT_LIMIT_C - c,
+                    thermal::SOFT_LIMIT_C,
+                );
+            }
+        }
+        (None, _) => println!("idle baseline: no thermal zone on this host"),
+    }
+    println!();
+
     println!(
-        "{:<8} {:<8} {:>10} {:>12} {:>10}  tones",
-        "channel", "width", "records", "rate (Hz)", "bytes"
+        "{:<8} {:<8} {:>10} {:>12} {:>10} {:>8} {:>8} {:>10}  tones",
+        "channel", "width", "records", "rate (Hz)", "bytes", "peak °C", "rise °C", "verdict"
     );
+
+    let mut worst = Verdict::Pass;
     for ch in channels {
         let mut cfg = base.clone();
         cfg.radio.channel = ch;
         cfg.capture.duration = Some(duration);
         cfg.experiment = Some(format!("{}-bench-ch{ch}", base.slug()));
 
-        match engine::run_session(global, &cfg, stop.clone()) {
-            Ok(o) => println!(
-                "{:<8} {:<8} {:>10} {:>12.1} {:>10} {:?}",
-                ch,
-                cfg.radio.width.iw_token(),
-                o.summary.records,
-                o.summary.mean_rate_hz,
-                o.summary.capture_bytes,
-                o.summary.tone_counts
-            ),
-            Err(e) => println!("{:<8} {:<8} failed: {e}", ch, cfg.radio.width.iw_token()),
+        // Started before the session so the trace covers the radio setup too,
+        // and finished after it so the peak is not missed by ending early.
+        let sampler = thermal::Sampler::start(THERMAL_SAMPLE_INTERVAL);
+        let result = engine::run_session(global, &cfg, stop.clone());
+        let trace = sampler.finish();
+        let verdict = trace.verdict();
+
+        match result {
+            Ok(o) => {
+                let (peak, rise) = if trace.is_measured() {
+                    (
+                        format!("{:.1}", trace.max_c),
+                        format!("{:+.1}", trace.max_c - trace.min_c),
+                    )
+                } else {
+                    ("-".into(), "-".into())
+                };
+                println!(
+                    "{:<8} {:<8} {:>10} {:>12.1} {:>10} {:>8} {:>8} {:>10} {:?}",
+                    ch,
+                    cfg.radio.width.iw_token(),
+                    o.summary.records,
+                    o.summary.mean_rate_hz,
+                    o.summary.capture_bytes,
+                    peak,
+                    rise,
+                    verdict.label(),
+                    o.summary.tone_counts
+                );
+                if verdict != Verdict::Pass && verdict != Verdict::Unmeasured {
+                    let after = trace
+                        .throttle_after
+                        .map(|t| t.describe())
+                        .unwrap_or_else(|| "unknown".into());
+                    println!(
+                        "         headroom {:+.1} °C to the soft limit; degraded during run: {}; flags: {after}",
+                        trace.headroom_c(),
+                        trace.degraded_during,
+                    );
+                }
+            }
+            Err(e) => {
+                println!("{:<8} {:<8} failed: {e}", ch, cfg.radio.width.iw_token());
+                worst = Verdict::Fail;
+            }
         }
+
+        worst = worse_of(worst, verdict);
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
     }
+
+    println!();
+    println!("overall: {}", worst.label());
+    // A harness whose job is to qualify a node must be usable from a script.
+    // `Unmeasured` is not a failure — it is what a dev box legitimately reports.
+    if worst == Verdict::Fail {
+        anyhow::bail!(
+            "node is not fit for an unattended capture: peak temperature reached the \
+             {:.0} °C soft limit, the firmware degraded the clock, or the supply sagged",
+            thermal::SOFT_LIMIT_C
+        );
+    }
     Ok(())
+}
+
+/// Fold two verdicts to the more serious one.
+///
+/// `Unmeasured` is absorbed by anything real: on a host with no thermal zone
+/// every leg is unmeasured and the run reports that honestly, but one measured
+/// failure among measured legs must not be diluted back to "unknown".
+fn worse_of(a: Verdict, b: Verdict) -> Verdict {
+    fn rank(v: Verdict) -> u8 {
+        match v {
+            Verdict::Unmeasured => 0,
+            Verdict::Pass => 1,
+            Verdict::Marginal => 2,
+            Verdict::Fail => 3,
+        }
+    }
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// monad02's real state on 2026-07-28, rendered the way the scrape sees it.
+    #[test]
+    fn the_textfile_separates_live_throttling_from_its_history() {
+        let text = prometheus_text(Some(81.5), Some(thermal::Throttle { raw: 0x8_0000 }));
+        assert!(text.contains("csid_node_temp_celsius 81.500"));
+        // 81.5 is past the soft limit, so headroom is negative.
+        assert!(text.contains("csid_node_thermal_headroom_celsius -1.500"));
+        assert!(text.contains("csid_node_throttle_flags 524288"));
+        // The soft limit has fired at some point...
+        assert!(text.contains(
+            "csid_node_throttled{condition=\"soft_limit\",window=\"since_boot\"} 1"
+        ));
+        // ...but is not firing at this instant, and the supply is fine.
+        assert!(text.contains("csid_node_throttled{condition=\"soft_limit\",window=\"now\"} 0"));
+        assert!(text.contains(
+            "csid_node_throttled{condition=\"undervolt\",window=\"since_boot\"} 0"
+        ));
+    }
+
+    /// An unreadable sensor must produce no sample at all. A zero would render
+    /// as a working sensor reporting 0 °C.
+    #[test]
+    fn an_absent_reading_emits_nothing_rather_than_a_zero() {
+        let text = prometheus_text(None, None);
+        assert!(text.is_empty(), "{text:?}");
+
+        let only_temp = prometheus_text(Some(60.0), None);
+        assert!(only_temp.contains("csid_node_temp_celsius 60.000"));
+        assert!(!only_temp.contains("csid_node_throttle_flags"));
+    }
+
+    /// Every metric line must carry its HELP and TYPE, or the collector logs a
+    /// parse warning and drops the file wholesale.
+    #[test]
+    fn every_emitted_family_is_declared() {
+        let text = prometheus_text(Some(55.0), Some(thermal::Throttle { raw: 0 }));
+        for family in [
+            "csid_node_temp_celsius",
+            "csid_node_thermal_headroom_celsius",
+            "csid_node_throttle_flags",
+            "csid_node_throttled",
+        ] {
+            assert!(text.contains(&format!("# HELP {family} ")), "{family}");
+            assert!(text.contains(&format!("# TYPE {family} gauge")), "{family}");
+        }
+    }
+
+    #[test]
+    fn the_worst_verdict_wins_and_unmeasured_never_masks_a_real_one() {
+        assert_eq!(worse_of(Verdict::Pass, Verdict::Marginal), Verdict::Marginal);
+        assert_eq!(worse_of(Verdict::Marginal, Verdict::Pass), Verdict::Marginal);
+        assert_eq!(worse_of(Verdict::Marginal, Verdict::Fail), Verdict::Fail);
+        assert_eq!(worse_of(Verdict::Fail, Verdict::Pass), Verdict::Fail);
+        // A dev box with no thermal zone reports Unmeasured throughout...
+        assert_eq!(
+            worse_of(Verdict::Unmeasured, Verdict::Unmeasured),
+            Verdict::Unmeasured
+        );
+        // ...but a single measured verdict takes precedence over it.
+        assert_eq!(worse_of(Verdict::Unmeasured, Verdict::Pass), Verdict::Pass);
+        assert_eq!(worse_of(Verdict::Fail, Verdict::Unmeasured), Verdict::Fail);
+    }
 }
