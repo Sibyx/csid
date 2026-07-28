@@ -253,7 +253,11 @@ impl Analysis {
                 ..
             } = sc;
             let ntone = geom.ntone;
+            // Rough size of the two halves: the bundle reads `cols × ntone`,
+            // the Doppler reduction reads the window's chains.
+            let work = ntone * (cols + window_len);
             crate::pipeline::join(
+                work,
                 || dsp::bundle_flat(columns, ntone, bundle, bundle_scratch),
                 || {
                     dsp::doppler_series_into(recs, ticks, chain_idx, chain_b, series);

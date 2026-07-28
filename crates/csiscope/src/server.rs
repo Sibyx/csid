@@ -79,11 +79,54 @@ pub fn router(app: Shared) -> Router {
         .with_state(app)
 }
 
+/// How long to keep retrying a bind that fails *only* because the address is
+/// not on this host yet.
+///
+/// On the fleet the console binds the node's tailnet address, which tailscaled
+/// configures asynchronously during boot. Losing that race is expected and
+/// self-correcting; every other bind failure is a misconfiguration that waiting
+/// cannot fix, so only this one is retried.
+const BIND_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Bind, tolerating an address that has not appeared yet.
+///
+/// `EADDRNOTAVAIL` is the one bind error that means "not yet" rather than
+/// "no". Anything else — the port is taken, the port is privileged — fails
+/// immediately, because retrying it would turn a clear error into a three
+/// minute silence.
+async fn bind_when_available(bind: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let deadline = std::time::Instant::now() + BIND_WAIT;
+    let mut last_warned: Option<std::time::Instant> = None;
+
+    loop {
+        match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => return Ok(listener),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                    && std::time::Instant::now() < deadline =>
+            {
+                // Say so periodically rather than once: a genuinely wrong
+                // --bind looks exactly like a slow tailnet for as long as this
+                // loop runs, and the operator should be able to tell from the
+                // journal which one they are watching.
+                let now = std::time::Instant::now();
+                if last_warned.is_none_or(|t| now.duration_since(t).as_secs() >= 15) {
+                    tracing::warn!(
+                        %bind,
+                        "address is not on this host yet — waiting for it to appear"
+                    );
+                    last_warned = Some(now);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e).with_context(|| format!("binding {bind}")),
+        }
+    }
+}
+
 /// Serve the console.
 pub async fn serve(app: Shared, bind: SocketAddr) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
+    let listener = bind_when_available(bind).await?;
     tracing::info!(%bind, read_only = app.read_only, "console listening (no authentication)");
     axum::serve(listener, router(app))
         .with_graceful_shutdown(shutdown())

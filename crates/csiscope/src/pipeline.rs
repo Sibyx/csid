@@ -96,14 +96,36 @@ where
     }
 }
 
-/// Run two independent halves of a frame, in parallel where there is a pool.
-pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+/// Elements below which splitting a frame's two halves costs more than it saves.
+///
+/// Measured on the deployed console (monad02, 2026-07-28): against a 52-tone
+/// capture with a 57-record window the two halves are ~15 µs of arithmetic, and
+/// handing them to the pool twenty times a second put roughly a third of the
+/// process into `sched_yield` and `crossbeam_deque::Stealer::steal` — rayon
+/// workers spinning for work that had already finished. The threshold is set
+/// so a 242-tone frame still parallelises and a legacy-52 one does not.
+const JOIN_THRESHOLD: usize = 65_536;
+
+/// Run two independent halves of a frame, in parallel when there is enough of
+/// them to be worth it.
+///
+/// `work` is a caller's estimate of the elements involved, in the same units
+/// on both sides — it decides only whether to involve the pool, so it needs to
+/// be cheap and roughly right, not exact.
+///
+/// Staying off the pool for small frames matters more than it looks: `pool()`
+/// builds the threads lazily, so a console watching a narrow capture never
+/// creates them at all.
+pub fn join<A, B, RA, RB>(work: usize, a: A, b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,
     B: FnOnce() -> RB + Send,
     RA: Send,
     RB: Send,
 {
+    if work < JOIN_THRESHOLD {
+        return (a(), b());
+    }
     match pool() {
         Some(p) => p.install(|| rayon::join(a, b)),
         None => (a(), b()),
@@ -305,10 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn join_returns_both_halves() {
-        let (a, b) = join(|| 6 * 7, || "answer");
-        assert_eq!(a, 42);
-        assert_eq!(b, "answer");
+    fn join_returns_both_halves_on_either_side_of_the_threshold() {
+        for work in [0, JOIN_THRESHOLD - 1, JOIN_THRESHOLD, JOIN_THRESHOLD * 4] {
+            let (a, b) = join(work, || 6 * 7, || "answer");
+            assert_eq!(a, 42, "work={work}");
+            assert_eq!(b, "answer", "work={work}");
+        }
+    }
+
+    /// A narrow capture must never involve the pool. This is the regression
+    /// guard for the deployed finding: an ungated `join` at 20 Hz put a third
+    /// of the process into rayon's idle work-stealing.
+    #[test]
+    fn a_legacy_52_tone_frame_stays_off_the_pool() {
+        // 52 tones, a 256-record window, the full 128-column bundle — the
+        // largest a legacy capture gets.
+        assert!(52 * (128 + 256) < JOIN_THRESHOLD);
+        // ...while an HE20 frame is worth splitting.
+        assert!(242 * (128 + 256) >= JOIN_THRESHOLD);
     }
 
     #[test]

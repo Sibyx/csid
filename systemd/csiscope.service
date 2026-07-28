@@ -13,8 +13,8 @@ Wants=network-online.target
 # budget allowed, csiscope spent all five against an address that did not exist
 # yet, and the console then sat in a `failed` state for ten hours — a state
 # nothing clears automatically, because tripping the start limit is sticky
-# until `systemctl reset-failed`. IPFreeBind below removes that particular
-# race; this widens the budget for the next one.
+# until `systemctl reset-failed`. The in-process bind retry removes that
+# particular race; this widens the budget for the next one.
 StartLimitIntervalSec=600
 StartLimitBurst=20
 
@@ -27,18 +27,13 @@ ExecStart=/usr/local/bin/csiscope $CSISCOPE_ARGS
 Restart=on-failure
 RestartSec=5s
 
-# The console binds this node's tailnet address, which does not exist until
-# tailscaled has configured tailscale0 — and ordering after tailscaled.service
-# only guarantees the daemon has *started*, not that it has finished bringing
-# the interface up. IP_FREEBIND lets the listening socket be created against an
-# address the host does not have yet, so the boot race disappears instead of
-# being raced faster: csiscope starts immediately and begins answering the
-# moment the address appears.
-#
-# This does not widen exposure. The bind address is still exactly what
-# `--bind` names; freebind changes when the socket may be created, not who can
-# reach it.
-IPFreeBind=yes
+# NOTE: the boot race against tailscaled is handled inside csiscope, which
+# retries a bind that fails with EADDRNOTAVAIL for up to three minutes (see
+# `bind_when_available` in server.rs). It is deliberately not handled here:
+# systemd's FreeBind= applies to .socket units only, and there is no
+# equivalent for a Type=exec service — an `IPFreeBind=yes` line here is
+# silently ignored with "Unknown key name", which is exactly the failure this
+# comment exists to stop the next person rediscovering.
 
 # csiscope is a strict consumer of the live stream: it binds the datagram
 # socket, never touches the radio, and holds nothing the daemon needs. If it
