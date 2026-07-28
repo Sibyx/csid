@@ -10,9 +10,20 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 
+[lib]
+name = "csiscope"
+path = "src/lib.rs"
+
 [[bin]]
 name = "csiscope"
 path = "src/main.rs"
+
+# The analysis path is the console's entire cost, and it runs on the node that
+# is capturing. Keeping the bench in-tree means a regression shows up as a
+# number here rather than as dropped records in the field.
+[[bench]]
+name = "frame"
+harness = false
 
 [dependencies]
 # The format and the daemon's own configuration/validation code. Depending on
@@ -43,3 +54,16 @@ tokio = { version = "1", features = [
 
 # FFT for the channel impulse response and the Doppler spectrogram.
 rustfft = "6"
+
+# The f32 section of every frame is memcpy'd to the wire rather than encoded
+# one `to_le_bytes` at a time. `bytemuck` is how that cast stays safe.
+bytemuck = "1"
+
+# Views that are independent of one another (per-chain spectra, the percentile
+# bundle, waterfall quantisation) run on a pool sized in `pipeline.rs`. The
+# pool is deliberately smaller than the machine: `csid`'s RX thread has first
+# claim on this Pi, and the console is niced below it.
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

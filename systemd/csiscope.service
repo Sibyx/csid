@@ -6,8 +6,17 @@ Wants=network-online.target
 
 # A crash-looping console must never hammer the node. StartLimit* are [Unit]
 # directives — systemd ignores them (with a warning) under [Service].
-StartLimitIntervalSec=300
-StartLimitBurst=5
+#
+# The budget is deliberately generous. What this guards against is a genuine
+# crash loop; what it must NOT punish is a slow boot. On monad01 (2026-07-27)
+# tailscaled took longer to bring up tailscale0 than the old five-attempt
+# budget allowed, csiscope spent all five against an address that did not exist
+# yet, and the console then sat in a `failed` state for ten hours — a state
+# nothing clears automatically, because tripping the start limit is sticky
+# until `systemctl reset-failed`. IPFreeBind below removes that particular
+# race; this widens the budget for the next one.
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=exec
@@ -17,6 +26,19 @@ EnvironmentFile=-/etc/csid/csiscope.env
 ExecStart=/usr/local/bin/csiscope $CSISCOPE_ARGS
 Restart=on-failure
 RestartSec=5s
+
+# The console binds this node's tailnet address, which does not exist until
+# tailscaled has configured tailscale0 — and ordering after tailscaled.service
+# only guarantees the daemon has *started*, not that it has finished bringing
+# the interface up. IP_FREEBIND lets the listening socket be created against an
+# address the host does not have yet, so the boot race disappears instead of
+# being raced faster: csiscope starts immediately and begins answering the
+# moment the address appears.
+#
+# This does not widen exposure. The bind address is still exactly what
+# `--bind` names; freebind changes when the socket may be created, not who can
+# reach it.
+IPFreeBind=yes
 
 # csiscope is a strict consumer of the live stream: it binds the datagram
 # socket, never touches the radio, and holds nothing the daemon needs. If it

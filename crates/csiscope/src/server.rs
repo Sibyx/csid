@@ -28,14 +28,17 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::analyze::Analyzer;
+use crate::analyze::ClientView;
 use crate::console;
 use crate::frame::ViewSettings;
+use crate::pipeline::Pipeline;
 use crate::state::Hub;
 
 /// Everything a handler needs.
 pub struct App {
     pub hub: Arc<Hub>,
+    /// The running analyses, one per distinct view. See [`Pipeline`].
+    pub pipeline: Pipeline,
     pub config_path: PathBuf,
     pub experiment_dir: PathBuf,
     /// Refuse every mutating route. The views stay live.
@@ -136,13 +139,16 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<Shared>) -> Response
 /// One client's live session.
 ///
 /// Settings are per-connection, so two browsers can watch different chains at
-/// different frame rates off the same capture. The cost is that analysis runs
-/// once per client; at the intended scale (an operator and a projector) that is
-/// the right trade against a shared pipeline nobody can steer.
+/// different frame rates off the same capture. Clients whose settings *agree*
+/// now share one analysis: the windowed views are identical for both, and only
+/// the waterfall — which follows each client's own cursor through the ring —
+/// is drawn per connection. Changing a knob moves this client onto a different
+/// shared analysis, starting one if it is the first to ask for that view.
 async fn live(mut socket: WebSocket, app: Shared) {
     let mut settings = ViewSettings::default();
     settings.sanitise();
-    let mut analyzer = Analyzer::at_live_edge(&app.hub);
+    let mut client = ClientView::at_live_edge(&app.hub);
+    let mut subscription = app.pipeline.subscribe(&settings);
     let mut ticker = tokio::time::interval(settings.interval());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -173,8 +179,16 @@ async fn live(mut socket: WebSocket, app: Shared) {
                             Ok(mut next) => {
                                 next.sanitise();
                                 let refps = (next.fps - settings.fps).abs() > f32::EPSILON;
+                                // Anything that changes the numbers moves this
+                                // client to a different shared analysis; a
+                                // change of frame rate only retimes it.
+                                let review = next.view_key() != settings.view_key();
                                 settings = next;
+                                if review {
+                                    subscription = app.pipeline.subscribe(&settings);
+                                }
                                 if refps {
+                                    subscription.set_fps(settings.fps);
                                     ticker = tokio::time::interval(settings.interval());
                                     ticker.set_missed_tick_behavior(
                                         tokio::time::MissedTickBehavior::Delay,
@@ -201,30 +215,14 @@ async fn live(mut socket: WebSocket, app: Shared) {
                 if settings.paused {
                     continue;
                 }
-                // The analysis is synchronous and can be tens of milliseconds
-                // on a 996-tone window; keep it off the async worker so one
-                // slow client cannot stall the HTTP surface.
-                let hub = app.hub.clone();
-                let view = settings.clone();
-                let (frame, next) = match tokio::task::spawn_blocking(move || {
-                    let mut a = analyzer;
-                    let f = a.frame(&hub, &view);
-                    (f, a)
-                })
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!(error = %e, "analysis task failed");
-                        return;
-                    }
+                // The heavy work already happened on the shared task; all this
+                // client owes is its own waterfall rows and the splice.
+                let Some(shared) = subscription.latest() else {
+                    continue;
                 };
-                analyzer = next;
-
-                if let Some(bytes) = frame {
-                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
-                    }
+                let bytes = Vec::from(client.render(&app.hub, &shared));
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    return;
                 }
             }
         }

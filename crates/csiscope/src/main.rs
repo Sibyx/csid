@@ -17,14 +17,6 @@
 //! $ csiscope --read-only                  # views only, no config or unit control
 //! ```
 
-mod analyze;
-mod console;
-mod dsp;
-mod frame;
-mod ingest;
-mod server;
-mod state;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,16 +25,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use csid::config::{DEFAULT_CONFIG, DEFAULT_EXPERIMENT_DIR};
-
-/// Records held for the windowed views. At the measured 608 Hz ceiling this is
-/// about 13 seconds of history — comfortably more than the longest window the
-/// UI offers.
-const DEFAULT_HISTORY: usize = 8192;
-
-/// Total I/Q coefficient budget for the ring, in complex samples. 4 M is ≈16 MiB
-/// of `i16` pairs and bounds the console's footprint independently of tone
-/// count: a 996-tone 2×2 record is 76× larger than a legacy 52-tone 1×1 one.
-const DEFAULT_COEFF_BUDGET: usize = 4_000_000;
+use csiscope::{ingest, server, state, DEFAULT_COEFF_BUDGET, DEFAULT_HISTORY};
 
 #[derive(Parser)]
 #[command(
@@ -136,6 +119,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let app = Arc::new(server::App {
+        pipeline: csiscope::pipeline::Pipeline::new(hub.clone()),
         hub,
         config_path: cli.config,
         experiment_dir: cli.experiments,

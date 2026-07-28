@@ -137,11 +137,29 @@ impl Hub {
 
     /// The most recent `n` samples, oldest first.
     pub fn tail(&self, n: usize) -> Vec<Sample> {
+        let mut out = Vec::new();
+        self.tail_into(n, &mut out);
+        out
+    }
+
+    /// [`Hub::tail`], into a buffer the caller keeps between frames.
+    ///
+    /// The copy itself was never the problem — a `Sample` is four words and an
+    /// `Arc` bump — but allocating and freeing a 256-element `Vec` twenty
+    /// times a second, per client, was. Refilling a buffer the caller owns
+    /// makes the steady state allocation-free.
+    ///
+    /// The read lock is held only for the copy. Ingest must never wait on
+    /// analysis: the whole point of `csid`'s best-effort live path is that a
+    /// slow consumer stalls itself and nothing else.
+    pub fn tail_into(&self, n: usize, out: &mut Vec<Sample>) {
+        out.clear();
         let Ok(r) = self.ring.read() else {
-            return Vec::new();
+            return;
         };
         let skip = r.buf.len().saturating_sub(n);
-        r.buf.iter().skip(skip).cloned().collect()
+        out.reserve(r.buf.len() - skip);
+        out.extend(r.buf.iter().skip(skip).cloned());
     }
 
     /// Samples with absolute index `>= since`, capped at `max` (newest kept).
@@ -150,12 +168,21 @@ impl Hub {
     /// the caller fell behind the ring or the cap — the client needs the skip
     /// count to label the waterfall's real time compression honestly.
     pub fn since(&self, since: u64, max: usize) -> (u64, Vec<Sample>, u64) {
+        let mut out = Vec::new();
+        let (cursor, skipped) = self.since_into(since, max, &mut out);
+        (cursor, out, skipped)
+    }
+
+    /// [`Hub::since`], into a buffer the caller keeps. Returns the new cursor
+    /// and the skip count.
+    pub fn since_into(&self, since: u64, max: usize, out: &mut Vec<Sample>) -> (u64, u64) {
+        out.clear();
         let Ok(r) = self.ring.read() else {
-            return (since, Vec::new(), 0);
+            return (since, 0);
         };
         let total = r.total();
         if total <= since {
-            return (total, Vec::new(), 0);
+            return (total, 0);
         }
         let start = since.max(r.first_index);
         let lost = start.saturating_sub(since);
@@ -163,8 +190,9 @@ impl Hub {
         let take = avail.min(max);
         let dropped = (avail - take) as u64;
         let from = (start - r.first_index) as usize + (avail - take);
-        let out: Vec<Sample> = r.buf.iter().skip(from).cloned().collect();
-        (total, out, lost + dropped)
+        out.reserve(take);
+        out.extend(r.buf.iter().skip(from).cloned());
+        (total, lost + dropped)
     }
 
     /// How many samples the ring is holding right now.

@@ -18,12 +18,23 @@
 //! **Amplitude is AGC-normalised** (see `csid caps`): `|H|` carries channel
 //! *shape*, not absolute scale. Every amplitude view is therefore relative, and
 //! the absolute anchor is the per-chain RSSI reported alongside it.
+//!
+//! ## Two forms of every kernel
+//!
+//! Each kernel exists twice: an owning form that returns a `Vec` (what the
+//! tests and the literature read like) and an `_into` form that fills a buffer
+//! the caller keeps between frames. The console calls the second kind, because
+//! at 20 frames a second the owning forms were spending more time in `malloc`
+//! than in arithmetic — allocation was 17% of the process, against 1.7% for
+//! the FFTs those allocations were feeding.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use csiq::{CsiRecord, Modulation};
 use rustfft::num_complex::Complex32;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 
 /// Floor for log magnitude: one least-significant bit of the `i16` I/Q grid.
 ///
@@ -35,9 +46,87 @@ use rustfft::FftPlanner;
 /// the quantisation floor", which is exactly what a null subcarrier is.
 const MAG_FLOOR: f32 = 1.0;
 
+/// The same floor expressed as a power, since every amplitude path now works
+/// in `|H|²` and takes the square root implicitly inside the logarithm.
+const POWER_FLOOR: f32 = MAG_FLOOR * MAG_FLOOR;
+
 /// Taps this far below the strongest one are excluded from the RMS delay
 /// spread — see [`cir`].
 const RMS_THRESHOLD_DB: f32 = -20.0;
+
+// -- logarithm ----------------------------------------------------------------
+
+/// `log10(2)`, the bridge from a binary exponent to decibels.
+const LOG10_2: f32 = 0.301_029_995_7;
+
+/// Minimax coefficients for `log2(1+f)/f` on `f ∈ [√2/2 − 1, √2 − 1]`,
+/// ascending. Fitted at degree 6, which puts the approximation error at
+/// 1.7e-6 dB — below the resolution of the `f32` it is stored in, and five
+/// orders of magnitude below the 256-level quantisation the waterfall applies
+/// afterwards.
+const LOG2_COEFFS: [f32; 7] = [
+    1.442_696_5,
+    -0.721_364,
+    0.480_629_15,
+    -0.359_350_65,
+    0.295_633_6,
+    -0.269_506_28,
+    0.172_128_74,
+];
+
+/// Base-2 logarithm by exponent extraction and a polynomial on the mantissa.
+///
+/// The point is not that this is faster than `libm` scalar-to-scalar — it is,
+/// but only by a factor of a few. The point is that it is *branch-free and
+/// inlinable*, so a loop over a slice of subcarriers vectorises, which a call
+/// to `log10f` never can. Amplitude-in-dB is the most-executed kernel in the
+/// crate (every waterfall row, every bundle column, every chain spectrum), and
+/// it was 8% of the process before this.
+///
+/// **Precondition:** `x` is finite and strictly positive. Every call site
+/// reaches this through [`db_from_power`], which floors at [`POWER_FLOOR`], so
+/// the subnormal and non-positive cases are unreachable rather than handled.
+#[inline(always)]
+fn log2_fast(x: f32) -> f32 {
+    let bits = x.to_bits();
+    // IEEE-754 binary32: the biased exponent is the integer part of log2.
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    // ...and the mantissa, re-hosted at exponent 0, is the fractional part's
+    // argument, in [1, 2).
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+
+    // Re-centre on [√2/2, √2) so the polynomial argument straddles zero and a
+    // degree-6 fit suffices. Written as a select rather than a branch: a
+    // branch here would stop the enclosing loop from vectorising, which is the
+    // entire reason this function exists.
+    let high = mantissa > std::f32::consts::SQRT_2;
+    let mantissa = if high { mantissa * 0.5 } else { mantissa };
+    let exponent = exponent + high as i32;
+
+    let f = mantissa - 1.0;
+    // Horner, with plain multiply-add rather than `f32::mul_add`: on aarch64
+    // the two lower identically, while `mul_add` on a target without FMA
+    // lowers to a `fmaf` *call* and would defeat vectorisation.
+    let mut p = LOG2_COEFFS[6];
+    p = p * f + LOG2_COEFFS[5];
+    p = p * f + LOG2_COEFFS[4];
+    p = p * f + LOG2_COEFFS[3];
+    p = p * f + LOG2_COEFFS[2];
+    p = p * f + LOG2_COEFFS[1];
+    p = p * f + LOG2_COEFFS[0];
+
+    exponent as f32 + f * p
+}
+
+/// Power (`|H|²`) to decibels: `10·log10(p)`.
+///
+/// Amplitude views are `20·log10(|H|)`, which is the same number — and this
+/// way the square root inside `|H|` never happens. `Complex::norm` was 8.6% of
+/// the process purely to compute a value the logarithm was about to undo.
+#[inline(always)]
+pub fn db_from_power(power: f32) -> f32 {
+    10.0 * LOG10_2 * log2_fast(power.max(POWER_FLOOR))
+}
 
 // -- geometry -----------------------------------------------------------------
 
@@ -89,26 +178,94 @@ impl Geometry {
     }
 }
 
-/// Extract one chain's channel frequency response, tone-major.
+/// The `i16` slice holding one chain's interleaved coefficients, or `None` when
+/// the record's payload does not match its declared dimensions.
 ///
-/// The I/Q payload is interleaved `i16`, row-major over `[tone][chain]`
-/// (CSIQ v1 §CSI matrix). Returns an empty vector if the record's payload does
-/// not match its declared dimensions.
-pub fn chain(rec: &CsiRecord, chain: usize) -> Vec<Complex32> {
+/// Storage is chain-major (`nrx*ntx` contiguous blocks of `ntone`), and each
+/// coefficient is **imaginary-first**. Both differ from the obvious reading —
+/// see `docs/CSIQ-format-v1.md`, "The CSI matrix".
+#[inline]
+pub fn chain_slice(rec: &CsiRecord, chain: usize) -> Option<&[i16]> {
     let g = Geometry::of(rec);
     let nc = g.nchain();
     if nc == 0 || chain >= nc || !g.matches(rec) {
-        return Vec::new();
+        return None;
     }
-    // Storage is chain-major (nrx*ntx contiguous blocks of ntone), and each
-    // coefficient is imaginary-first. Both differ from the obvious reading —
-    // see docs/CSIQ-format-v1.md, "The CSI matrix".
-    (0..g.ntone)
-        .map(|t| {
-            let i = 2 * (chain * g.ntone + t);
-            Complex32::new(rec.iq[i + 1] as f32, rec.iq[i] as f32)
-        })
-        .collect()
+    let start = 2 * chain * g.ntone;
+    Some(&rec.iq[start..start + 2 * g.ntone])
+}
+
+/// Extract one chain's channel frequency response, tone-major.
+///
+/// Returns an empty vector if the record's payload does not match its declared
+/// dimensions.
+pub fn chain(rec: &CsiRecord, chain: usize) -> Vec<Complex32> {
+    let mut out = Vec::new();
+    chain_into(rec, chain, &mut out);
+    out
+}
+
+/// [`chain`], into a buffer the caller keeps.
+pub fn chain_into(rec: &CsiRecord, chain: usize, out: &mut Vec<Complex32>) {
+    out.clear();
+    let Some(iq) = chain_slice(rec, chain) else {
+        return;
+    };
+    out.reserve(iq.len() / 2);
+    out.extend(
+        iq.chunks_exact(2)
+            .map(|c| Complex32::new(c[1] as f32, c[0] as f32)),
+    );
+}
+
+/// One chain's `|H(f)|²`, straight from the `i16` payload.
+///
+/// This is the shortcut that matters: every amplitude view wants dB, dB wants
+/// power, and power does not need the record ever to become `Complex32`. The
+/// waterfall, the bundle, the per-chain spectra and the validation panel all
+/// come through here, which removed roughly 1,500 `Vec<Complex32>`
+/// allocations per frame.
+pub fn chain_power_into(rec: &CsiRecord, chain: usize, out: &mut Vec<f32>) {
+    out.clear();
+    let Some(iq) = chain_slice(rec, chain) else {
+        return;
+    };
+    out.resize(iq.len() / 2, 0.0);
+    for (o, c) in out.iter_mut().zip(iq.chunks_exact(2)) {
+        // `i16 -> f32` is exact; the product is not, but its relative error is
+        // 6e-8, which is 2.6e-7 dB.
+        let im = c[0] as f32;
+        let re = c[1] as f32;
+        *o = re * re + im * im;
+    }
+}
+
+/// One chain's amplitude in dB, straight from the `i16` payload.
+pub fn chain_amp_db_into(rec: &CsiRecord, chain: usize, out: &mut Vec<f32>) {
+    chain_power_into(rec, chain, out);
+    for v in out.iter_mut() {
+        *v = db_from_power(*v);
+    }
+}
+
+/// [`chain_amp_db_into`], writing into a fixed-width slice.
+///
+/// A record whose chain does not fill `out` exactly leaves it `NaN` — the
+/// console draws a gap rather than a stretched or truncated spectrum, which is
+/// the honest rendering of "this record does not have the geometry this row
+/// promised". Writing straight into the destination is also what lets the
+/// per-chain spectra and the bundle's columns be filled in parallel: each
+/// chunk is an independent output with no shared buffer behind it.
+pub fn chain_amp_db_into_slice(rec: &CsiRecord, chain: usize, out: &mut [f32]) {
+    let Some(iq) = chain_slice(rec, chain).filter(|s| s.len() == 2 * out.len()) else {
+        out.fill(f32::NAN);
+        return;
+    };
+    for (o, c) in out.iter_mut().zip(iq.chunks_exact(2)) {
+        let im = c[0] as f32;
+        let re = c[1] as f32;
+        *o = db_from_power(re * re + im * im);
+    }
 }
 
 // -- frequency axis -----------------------------------------------------------
@@ -134,13 +291,106 @@ pub fn occupied_bw_mhz(rec: &CsiRecord) -> f64 {
     rec.ntone as f64 * spacing_hz(rec) / 1e6
 }
 
+// -- cached transforms --------------------------------------------------------
+
+/// FFT plans and window functions, kept across frames.
+///
+/// `FftPlanner::plan_fft` is not a lookup. It factors the length, designs a
+/// radix chain and precomputes twiddle factors, and the console was calling
+/// `FftPlanner::new()` inside both [`cir`] and [`doppler`] — once per frame
+/// each. Planning cost about 7.5% of the process against 1.7% for running the
+/// transforms it produced: four times more effort spent deciding how to
+/// transform than transforming.
+///
+/// The Hann windows are cached for the same reason at smaller scale: they are
+/// a fixed function of length, recomputed with a `cos` per tone per frame.
+pub struct Transforms {
+    planner: FftPlanner<f32>,
+    plans: HashMap<(usize, bool), Arc<dyn Fft<f32>>>,
+    hann: HashMap<usize, Arc<[f32]>>,
+    /// Scratch for `process_with_scratch`, so rustfft does not allocate either.
+    scratch: Vec<Complex32>,
+}
+
+impl Default for Transforms {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transforms {
+    pub fn new() -> Self {
+        Transforms {
+            planner: FftPlanner::new(),
+            plans: HashMap::new(),
+            hann: HashMap::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    fn plan(&mut self, len: usize, inverse: bool) -> Arc<dyn Fft<f32>> {
+        let planner = &mut self.planner;
+        self.plans
+            .entry((len, inverse))
+            .or_insert_with(|| {
+                if inverse {
+                    planner.plan_fft_inverse(len)
+                } else {
+                    planner.plan_fft_forward(len)
+                }
+            })
+            .clone()
+    }
+
+    /// Transform `buf` in place, reusing the persistent scratch buffer.
+    fn run(&mut self, buf: &mut [Complex32], inverse: bool) {
+        let fft = self.plan(buf.len(), inverse);
+        let need = fft.get_inplace_scratch_len();
+        if self.scratch.len() < need {
+            self.scratch.resize(need, Complex32::new(0.0, 0.0));
+        }
+        fft.process_with_scratch(buf, &mut self.scratch[..need]);
+    }
+
+    /// A Hann window of `len` points, `0.5 − 0.5·cos(2πi/(len−1))`.
+    fn hann(&mut self, len: usize) -> Arc<[f32]> {
+        self.hann
+            .entry(len)
+            .or_insert_with(|| {
+                let denom = (len.max(2) - 1) as f32;
+                (0..len)
+                    .map(|i| {
+                        0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / denom).cos()
+                    })
+                    .collect()
+            })
+            .clone()
+    }
+}
+
+thread_local! {
+    /// Plans for the owning-form entry points ([`cir`], [`doppler`]), which the
+    /// tests and benches call without threading a [`Transforms`] through. The
+    /// console's own path carries an explicit one per analysis.
+    static LOCAL_TRANSFORMS: RefCell<Transforms> = RefCell::new(Transforms::new());
+}
+
 // -- amplitude ----------------------------------------------------------------
 
 /// Magnitude in dB (relative — the AGC has already normalised absolute scale).
 pub fn amp_db(h: &[Complex32]) -> Vec<f32> {
-    h.iter()
-        .map(|c| 20.0 * c.norm().max(MAG_FLOOR).log10())
-        .collect()
+    let mut out = Vec::new();
+    amp_db_into(h, &mut out);
+    out
+}
+
+/// [`amp_db`], into a buffer the caller keeps.
+pub fn amp_db_into(h: &[Complex32], out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(h.len(), 0.0);
+    for (o, c) in out.iter_mut().zip(h) {
+        *o = db_from_power(c.re * c.re + c.im * c.im);
+    }
 }
 
 /// The 5th/50th/95th percentile of `|H(f)|` in dB across a window of records —
@@ -150,8 +400,6 @@ pub fn amp_db(h: &[Complex32]) -> Vec<f32> {
 /// discriminative feature in that line of work: a static channel gives a tight
 /// bundle, occupancy and motion widen it. It is returned as
 /// [`Bundle::width_db`] so the console can show it as a single number.
-///
-/// `columns` is one `amp_db` vector per record, all the same length.
 #[derive(Debug, Clone, Default)]
 pub struct Bundle {
     pub p05: Vec<f32>,
@@ -163,45 +411,88 @@ pub struct Bundle {
     pub n: usize,
 }
 
+/// `columns` is one `amp_db` vector per record, all the same length.
+///
+/// Kept for callers that already hold a `Vec` per column; the console uses
+/// [`bundle_flat`], which does not build 128 vectors to throw them away.
 pub fn bundle(columns: &[Vec<f32>]) -> Bundle {
     let Some(ntone) = columns.first().map(|c| c.len()) else {
         return Bundle::default();
     };
     let usable: Vec<&Vec<f32>> = columns.iter().filter(|c| c.len() == ntone).collect();
-    if usable.is_empty() {
+    if usable.is_empty() || ntone == 0 {
         return Bundle::default();
     }
+    let mut flat = Vec::with_capacity(usable.len() * ntone);
+    for c in &usable {
+        flat.extend_from_slice(c);
+    }
+    let mut out = Bundle::default();
+    bundle_flat(&flat, ntone, &mut out, &mut Vec::new());
+    out
+}
 
-    let n = usable.len();
-    let mut p05 = vec![0.0f32; ntone];
-    let mut p50 = vec![0.0f32; ntone];
-    let mut p95 = vec![0.0f32; ntone];
-    let mut scratch = vec![0.0f32; n];
+/// [`bundle`] over a contiguous `n × ntone` row-major buffer.
+///
+/// `scratch` is one column's worth of values and is reused across subcarriers
+/// and across frames.
+pub fn bundle_flat(flat: &[f32], ntone: usize, out: &mut Bundle, scratch: &mut Vec<f32>) {
+    out.p05.clear();
+    out.p50.clear();
+    out.p95.clear();
+    out.width_db = 0.0;
+    out.n = 0;
+    if ntone == 0 || flat.len() < ntone {
+        return;
+    }
+    let n = flat.len() / ntone;
+    out.n = n;
+    out.p05.resize(ntone, 0.0);
+    out.p50.resize(ntone, 0.0);
+    out.p95.resize(ntone, 0.0);
+    scratch.clear();
+    scratch.resize(n, 0.0);
+
+    let (a, b, c) = (idx(n, 0.05), idx(n, 0.50), idx(n, 0.95));
     let mut width_sum = 0.0f64;
 
     for t in 0..ntone {
-        for (i, col) in usable.iter().enumerate() {
-            scratch[i] = col[t];
+        for (i, s) in scratch.iter_mut().enumerate() {
+            *s = flat[i * ntone + t];
         }
+
         // Selection, not a full sort: three O(n) passes beat n·log n at 996
         // tones × 20 frames a second on a Pi 5.
-        let (a, b, c) = (idx(n, 0.05), idx(n, 0.50), idx(n, 0.95));
-        scratch.select_nth_unstable_by(a, f32::total_cmp);
-        p05[t] = scratch[a];
-        scratch.select_nth_unstable_by(b, f32::total_cmp);
-        p50[t] = scratch[b];
-        scratch.select_nth_unstable_by(c, f32::total_cmp);
-        p95[t] = scratch[c];
-        width_sum += (p95[t] - p05[t]) as f64;
+        //
+        // The three quantiles are ordered, so they are not three independent
+        // selections. Selecting the median first partitions the column about
+        // it; p05 can then only be in the left part and p95 only in the right,
+        // and each of those scans half the data. Identical results, and the
+        // measured cost of the whole bundle drops by rather more than the
+        // factor of two that implies, because the two halves stay in cache.
+        let (lo, mid, hi) = scratch.select_nth_unstable_by(b, f32::total_cmp);
+        let p50 = *mid;
+
+        let p05 = if a < b && !lo.is_empty() {
+            let k = a.min(lo.len() - 1);
+            *lo.select_nth_unstable_by(k, f32::total_cmp).1
+        } else {
+            p50
+        };
+        let p95 = if c > b && !hi.is_empty() {
+            let k = (c - b - 1).min(hi.len() - 1);
+            *hi.select_nth_unstable_by(k, f32::total_cmp).1
+        } else {
+            p50
+        };
+
+        out.p05[t] = p05;
+        out.p50[t] = p50;
+        out.p95[t] = p95;
+        width_sum += (p95 - p05) as f64;
     }
 
-    Bundle {
-        width_db: (width_sum / ntone as f64) as f32,
-        p05,
-        p50,
-        p95,
-        n,
-    }
+    out.width_db = (width_sum / ntone as f64) as f32;
 }
 
 fn idx(n: usize, q: f64) -> usize {
@@ -216,12 +507,31 @@ fn idx(n: usize, q: f64) -> usize {
 /// carries CFO, SFO/STO and packet-detection-delay terms that dominate the
 /// channel term (Ma et al. 2020 §Phase Offsets Removal).
 pub fn phase(h: &[Complex32]) -> Vec<f32> {
-    h.iter().map(|c| c.im.atan2(c.re)).collect()
+    let mut out = Vec::new();
+    phase_into(h, &mut out);
+    out
+}
+
+/// [`phase`], into a buffer the caller keeps.
+pub fn phase_into(h: &[Complex32], out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(h.len(), 0.0);
+    for (o, c) in out.iter_mut().zip(h) {
+        *o = c.im.atan2(c.re);
+    }
 }
 
 /// Unwrap a phase sequence along the subcarrier axis.
 pub fn unwrap(phase: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(phase.len());
+    let mut out = Vec::new();
+    unwrap_into(phase, &mut out);
+    out
+}
+
+/// [`unwrap`], into a buffer the caller keeps.
+pub fn unwrap_into(phase: &[f32], out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(phase.len());
     let mut offset = 0.0f32;
     let mut prev = 0.0f32;
     for (i, &p) in phase.iter().enumerate() {
@@ -236,7 +546,6 @@ pub fn unwrap(phase: &[f32]) -> Vec<f32> {
         prev = p;
         out.push(p + offset);
     }
-    out
 }
 
 /// A linear fit removed from unwrapped phase.
@@ -265,9 +574,18 @@ pub struct Detrend {
 /// The cost is real and worth stating in the UI: any genuinely linear component
 /// of the channel goes with it.
 pub fn detrend(unwrapped: &[f32], spacing_hz: f64) -> (Vec<f32>, Detrend) {
+    let mut out = Vec::new();
+    let d = detrend_into(unwrapped, spacing_hz, &mut out);
+    (out, d)
+}
+
+/// [`detrend`], into a buffer the caller keeps.
+pub fn detrend_into(unwrapped: &[f32], spacing_hz: f64, out: &mut Vec<f32>) -> Detrend {
+    out.clear();
     let n = unwrapped.len();
     if n < 2 {
-        return (unwrapped.to_vec(), Detrend::default());
+        out.extend_from_slice(unwrapped);
+        return Detrend::default();
     }
     let nf = n as f64;
     let mean_x = (nf - 1.0) / 2.0;
@@ -283,23 +601,19 @@ pub fn detrend(unwrapped: &[f32], spacing_hz: f64) -> (Vec<f32>, Detrend) {
     let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
     let intercept = mean_y - slope * mean_x;
 
-    let out = unwrapped
-        .iter()
-        .enumerate()
-        .map(|(i, &y)| y - (slope * i as f64 + intercept) as f32)
-        .collect();
+    out.resize(n, 0.0);
+    for (i, (o, &y)) in out.iter_mut().zip(unwrapped).enumerate() {
+        *o = y - (slope * i as f64 + intercept) as f32;
+    }
 
     // φ(k) = −2π·τ·k·Δf  ⇒  τ = −slope / (2π·Δf).
     let tau_ns = (-slope / (2.0 * std::f64::consts::PI * spacing_hz) * 1e9) as f32;
 
-    (
-        out,
-        Detrend {
-            slope: slope as f32,
-            intercept: intercept as f32,
-            tau_ns,
-        },
-    )
+    Detrend {
+        slope: slope as f32,
+        intercept: intercept as f32,
+        tau_ns,
+    }
 }
 
 // -- channel impulse response -------------------------------------------------
@@ -336,37 +650,70 @@ pub struct Cir {
 /// **Assumption worth knowing:** the delivered tone vector is treated as
 /// contiguous and in ascending frequency order, with its centre at
 /// `ntone/2`. That matches the iax matrix layout; a driver revision that
-/// reorders or interleaves tones would smear this plot while leaving every
+/// reordered or interleaved tones would smear this plot while leaving every
 /// other view intact — which is itself a useful diagnostic.
 pub fn cir(h: &[Complex32], spacing_hz: f64, nfft: usize, taps: usize) -> Cir {
+    let mut out = Cir::default();
+    LOCAL_TRANSFORMS.with(|t| {
+        cir_into(&mut t.borrow_mut(), h, spacing_hz, nfft, taps, &mut Vec::new(), &mut out)
+    });
+    out
+}
+
+/// [`cir`], with cached plans and caller-owned buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn cir_into(
+    tf: &mut Transforms,
+    h: &[Complex32],
+    spacing_hz: f64,
+    nfft: usize,
+    taps: usize,
+    buf: &mut Vec<Complex32>,
+    out: &mut Cir,
+) {
+    out.mag_db.clear();
+    out.bin_ns = 0.0;
+    out.peak_bin = 0;
+    out.rms_delay_ns = 0.0;
+
     let n = h.len();
     if n < 4 || nfft < n {
-        return Cir::default();
+        return;
     }
-    let mut buf = vec![Complex32::new(0.0, 0.0); nfft];
+
+    let window = tf.hann(n);
+    buf.clear();
+    buf.resize(nfft, Complex32::new(0.0, 0.0));
     // Rotate so the band centre lands on FFT bin 0: the tone grid spans
     // [−BW/2, +BW/2] but the FFT expects DC first.
     let half = n / 2;
-    for (i, &c) in h.iter().enumerate() {
-        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos();
+    for (i, (&c, &w)) in h.iter().zip(window.iter()).enumerate() {
         let k = (i + nfft - half) % nfft;
         buf[k] = c * w;
     }
 
-    FftPlanner::new().plan_fft_inverse(nfft).process(&mut buf);
+    tf.run(buf, true);
 
     let taps = taps.min(nfft);
-    let mags: Vec<f32> = buf[..taps].iter().map(|c| c.norm()).collect();
-    let peak = mags
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let peak_mag = mags[peak].max(MAG_FLOOR);
+    // Work in power throughout: the peak search, the threshold and the second
+    // moment are all monotone in it, and dB comes out of the same logarithm
+    // the amplitude path uses.
+    let mut peak = 0usize;
+    let mut peak_power = 0.0f32;
+    out.mag_db.resize(taps, 0.0);
+    for (i, c) in buf[..taps].iter().enumerate() {
+        let p = c.re * c.re + c.im * c.im;
+        out.mag_db[i] = p;
+        if p > peak_power {
+            peak_power = p;
+            peak = i;
+        }
+    }
+    let peak_power = peak_power.max(POWER_FLOOR);
 
     let bin_s = 1.0 / (nfft as f64 * spacing_hz);
-    let bin_ns = (bin_s * 1e9) as f32;
+    out.bin_ns = (bin_s * 1e9) as f32;
+    out.peak_bin = peak;
 
     // RMS delay spread: the power-weighted standard deviation of tap delay,
     // measured from the power-weighted mean (not from the peak).
@@ -376,38 +723,36 @@ pub fn cir(h: &[Complex32], spacing_hz: f64, nfft: usize, taps: usize) -> Cir {
     // dominates the second moment, and the reported spread becomes a function
     // of how many taps were requested rather than of the channel. Thresholding
     // at −20 dB is the standard convention for this statistic.
-    let cutoff = peak_mag * 10f32.powf(RMS_THRESHOLD_DB / 20.0);
-    let power: Vec<f64> = mags
-        .iter()
-        .map(|&m| if m >= cutoff { (m as f64).powi(2) } else { 0.0 })
-        .collect();
-    let total: f64 = power.iter().sum();
-    let rms_delay_ns = if total > 0.0 {
-        let mean_tau: f64 = power
-            .iter()
-            .enumerate()
-            .map(|(i, p)| i as f64 * p)
-            .sum::<f64>()
-            / total;
-        let var: f64 = power
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i as f64 - mean_tau).powi(2) * p)
-            .sum::<f64>()
-            / total;
-        (var.sqrt() * bin_s * 1e9) as f32
+    //
+    // The cutoff is a *power* ratio here, so the dB threshold halves.
+    let cutoff = peak_power * 10f32.powf(RMS_THRESHOLD_DB / 10.0);
+    let (mut total, mut m1) = (0.0f64, 0.0f64);
+    for (i, &p) in out.mag_db.iter().enumerate() {
+        if p >= cutoff {
+            total += p as f64;
+            m1 += i as f64 * p as f64;
+        }
+    }
+    out.rms_delay_ns = if total > 0.0 {
+        // Two passes about the measured mean rather than one pass on raw
+        // moments: `E[i²] − E[i]²` cancels catastrophically when the profile is
+        // a narrow peak at a large tap index, which is precisely the common
+        // case indoors.
+        let mean = m1 / total;
+        let mut var = 0.0f64;
+        for (i, &p) in out.mag_db.iter().enumerate() {
+            if p >= cutoff {
+                var += (i as f64 - mean).powi(2) * p as f64;
+            }
+        }
+        ((var / total).sqrt() * bin_s * 1e9) as f32
     } else {
         0.0
     };
 
-    Cir {
-        mag_db: mags
-            .iter()
-            .map(|&m| 20.0 * (m.max(MAG_FLOOR) / peak_mag).log10())
-            .collect(),
-        bin_ns,
-        peak_bin: peak,
-        rms_delay_ns,
+    // Normalise to the strongest tap and convert in place.
+    for v in out.mag_db.iter_mut() {
+        *v = db_from_power(*v) - db_from_power(peak_power);
     }
 }
 
@@ -436,6 +781,7 @@ pub struct Doppler {
 }
 
 /// A time series ready for the STFT, with the timing metadata behind it.
+#[derive(Default)]
 pub struct Series {
     /// One complex scalar per record.
     pub values: Vec<Complex32>,
@@ -459,34 +805,60 @@ pub fn doppler_series(
     chain_a: usize,
     chain_b: Option<usize>,
 ) -> Series {
-    let mut values = Vec::with_capacity(samples.len());
-    let mut out_ticks = Vec::with_capacity(samples.len());
-    let mut used_pair = false;
+    let mut out = Series::default();
+    doppler_series_into(samples, ticks, chain_a, chain_b, &mut out);
+    out
+}
+
+/// [`doppler_series`], into a buffer the caller keeps.
+///
+/// The reduction reads the two chains' `i16` coefficients directly and
+/// accumulates the conjugate product as it goes, so neither chain is ever
+/// materialised as a `Vec<Complex32>`. On a 256-record window that removed 512
+/// allocations per frame.
+pub fn doppler_series_into(
+    samples: &[Arc<CsiRecord>],
+    ticks: &[u64],
+    chain_a: usize,
+    chain_b: Option<usize>,
+    out: &mut Series,
+) {
+    out.values.clear();
+    out.ticks.clear();
+    out.conjugate_pair = false;
 
     for (rec, &tick) in samples.iter().zip(ticks.iter()) {
-        let a = chain(rec, chain_a);
-        if a.is_empty() {
+        let Some(a) = chain_slice(rec, chain_a) else {
+            continue;
+        };
+        let n = a.len() / 2;
+        if n == 0 {
             continue;
         }
-        let v = match chain_b.map(|b| chain(rec, b)) {
-            Some(b) if b.len() == a.len() => {
-                used_pair = true;
-                let sum: Complex32 = a.iter().zip(b.iter()).map(|(x, y)| x * y.conj()).sum();
-                sum / a.len() as f32
-            }
-            _ => {
-                let sum: Complex32 = a.iter().sum();
-                sum / a.len() as f32
-            }
-        };
-        values.push(v);
-        out_ticks.push(tick);
-    }
+        let b = chain_b.and_then(|b| chain_slice(rec, b)).filter(|b| b.len() == a.len());
 
-    Series {
-        values,
-        ticks: out_ticks,
-        conjugate_pair: used_pair,
+        let (mut sre, mut sim) = (0.0f32, 0.0f32);
+        match b {
+            Some(b) => {
+                out.conjugate_pair = true;
+                // (ar + i·ai)·(br − i·bi)
+                for (x, y) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+                    let (ai, ar) = (x[0] as f32, x[1] as f32);
+                    let (bi, br) = (y[0] as f32, y[1] as f32);
+                    sre += ar * br + ai * bi;
+                    sim += ai * br - ar * bi;
+                }
+            }
+            None => {
+                for x in a.chunks_exact(2) {
+                    sim += x[0] as f32;
+                    sre += x[1] as f32;
+                }
+            }
+        }
+        let inv = 1.0 / n as f32;
+        out.values.push(Complex32::new(sre * inv, sim * inv));
+        out.ticks.push(tick);
     }
 }
 
@@ -502,34 +874,69 @@ pub fn doppler_series(
 /// `wavelength_m` comes from the tuned centre frequency and converts the
 /// Doppler axis into a speed axis.
 pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32) -> Doppler {
+    let mut out = Doppler::default();
+    LOCAL_TRANSFORMS.with(|t| {
+        doppler_into(
+            &mut t.borrow_mut(),
+            series,
+            nfft,
+            wavelength_m,
+            &mut Vec::new(),
+            &mut out,
+        )
+    });
+    out
+}
+
+/// [`doppler`], with cached plans and caller-owned buffers.
+pub fn doppler_into(
+    tf: &mut Transforms,
+    series: &Series,
+    nfft: usize,
+    wavelength_m: f32,
+    buf: &mut Vec<Complex32>,
+    out: &mut Doppler,
+) {
+    out.power_db.clear();
+    out.fs_hz = 0.0;
+    out.max_hz = 0.0;
+    out.max_speed_ms = 0.0;
+    out.arrival_cv = 0.0;
+    out.conjugate_pair = series.conjugate_pair;
+
     let n = series.values.len();
     if n < 8 || nfft < 8 {
-        return Doppler::default();
+        return;
     }
 
     let t0 = series.ticks[0];
     let t1 = *series.ticks.last().unwrap();
     let span_s = csiq::ftm_to_seconds(t1.saturating_sub(t0));
     if span_s <= 0.0 {
-        return Doppler::default();
+        return;
     }
     let fs = (n - 1) as f64 / span_s;
 
     // Inter-arrival dispersion: how far from uniform the sampling really was.
-    let mut deltas: Vec<f64> = Vec::with_capacity(n - 1);
+    // Accumulated in one pass rather than through an intermediate vector.
+    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
     for w in series.ticks.windows(2) {
-        deltas.push(csiq::ftm_to_seconds(w[1].saturating_sub(w[0])));
+        let d = csiq::ftm_to_seconds(w[1].saturating_sub(w[0]));
+        sum += d;
+        sum_sq += d * d;
     }
-    let mean_d = deltas.iter().sum::<f64>() / deltas.len() as f64;
-    let var_d = deltas.iter().map(|d| (d - mean_d).powi(2)).sum::<f64>() / deltas.len() as f64;
-    let cv = if mean_d > 0.0 {
+    let count = (n - 1) as f64;
+    let mean_d = sum / count;
+    let var_d = (sum_sq / count - mean_d * mean_d).max(0.0);
+    out.arrival_cv = if mean_d > 0.0 {
         (var_d.sqrt() / mean_d) as f32
     } else {
         0.0
     };
 
     // Nearest-neighbour resample onto a uniform grid of `nfft` points.
-    let mut buf = vec![Complex32::new(0.0, 0.0); nfft];
+    buf.clear();
+    buf.resize(nfft, Complex32::new(0.0, 0.0));
     let mut cursor = 0usize;
     for (i, slot) in buf.iter_mut().enumerate() {
         let want = t0 as f64 + (t1 - t0) as f64 * (i as f64 / (nfft - 1) as f64);
@@ -544,33 +951,38 @@ pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32) -> Doppler {
     let mean: Complex32 = buf.iter().sum::<Complex32>() / nfft as f32;
     // Hann window suppresses the leakage skirts that a rectangular window would
     // spread from that (never perfectly cancelled) DC term.
-    for (i, v) in buf.iter_mut().enumerate() {
-        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (nfft - 1) as f32).cos();
+    let window = tf.hann(nfft);
+    for (v, &w) in buf.iter_mut().zip(window.iter()) {
         *v = (*v - mean) * w;
     }
 
-    FftPlanner::new().plan_fft_forward(nfft).process(&mut buf);
+    tf.run(buf, false);
 
     // FFT-shift: negative frequencies first, so the axis reads −fs/2 … +fs/2.
     let half = nfft / 2;
-    let mut power: Vec<f32> = Vec::with_capacity(nfft);
-    power.extend(buf[half..].iter().map(|c| c.norm()));
-    power.extend(buf[..half].iter().map(|c| c.norm()));
-    let peak = power.iter().cloned().fold(MAG_FLOOR, f32::max);
+    out.power_db.resize(nfft, 0.0);
+    let mut peak = POWER_FLOOR;
+    for (o, c) in out
+        .power_db
+        .iter_mut()
+        .zip(buf[half..].iter().chain(buf[..half].iter()))
+    {
+        let p = c.re * c.re + c.im * c.im;
+        *o = p;
+        if p > peak {
+            peak = p;
+        }
+    }
+    let peak_db = db_from_power(peak);
+    for v in out.power_db.iter_mut() {
+        *v = db_from_power(*v) - peak_db;
+    }
 
     let max_hz = (fs / 2.0) as f32;
-    Doppler {
-        power_db: power
-            .iter()
-            .map(|&m| 20.0 * (m.max(MAG_FLOOR) / peak).log10())
-            .collect(),
-        fs_hz: fs as f32,
-        max_hz,
-        // v = λ·f_D/2 for a reflected (two-way) path.
-        max_speed_ms: wavelength_m * max_hz / 2.0,
-        arrival_cv: cv,
-        conjugate_pair: series.conjugate_pair,
-    }
+    out.fs_hz = fs as f32;
+    out.max_hz = max_hz;
+    // v = λ·f_D/2 for a reflected (two-way) path.
+    out.max_speed_ms = wavelength_m * max_hz / 2.0;
 }
 
 /// Free-space wavelength for a centre frequency in MHz.
@@ -629,13 +1041,20 @@ pub struct Validation {
 
 /// Compute the extraction-validation panel for one record.
 pub fn validate(rec: &CsiRecord) -> Validation {
+    let mut v = Validation::default();
+    validate_into(rec, &mut Vec::new(), &mut v);
+    v
+}
+
+/// [`validate`], with a caller-owned scratch buffer.
+pub fn validate_into(rec: &CsiRecord, amp: &mut Vec<f32>, v: &mut Validation) {
     let g = Geometry::of(rec);
-    let mut v = Validation {
+    *v = Validation {
         dimensions_ok: g.matches(rec),
         ..Default::default()
     };
     if !v.dimensions_ok || g.ntone < 20 {
-        return v;
+        return;
     }
 
     let zeros = rec
@@ -645,34 +1064,44 @@ pub fn validate(rec: &CsiRecord) -> Validation {
         .count();
     v.zero_fraction = zeros as f32 / (rec.iq.len() / 2).max(1) as f32;
 
-    let per_chain: Vec<Vec<f32>> = (0..g.nchain())
-        .map(|c| amp_db(&chain(rec, c)))
-        .filter(|a| !a.is_empty())
-        .collect();
-    if per_chain.is_empty() {
-        return v;
+    // Chain means, one chain at a time through the shared buffer — the old
+    // form built an `amp_db` vector per chain and kept them all alive to take
+    // two numbers from them.
+    let (mut hi, mut lo) = (f32::NEG_INFINITY, f32::INFINITY);
+    for c in 0..g.nchain() {
+        chain_amp_db_into(rec, c, amp);
+        if amp.is_empty() {
+            continue;
+        }
+        let mean = amp.iter().sum::<f32>() / amp.len() as f32;
+        hi = hi.max(mean);
+        lo = lo.min(mean);
     }
-
-    let means: Vec<f32> = per_chain
-        .iter()
-        .map(|a| a.iter().sum::<f32>() / a.len() as f32)
-        .collect();
-    let hi = means.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let lo = means.iter().cloned().fold(f32::INFINITY, f32::min);
+    if !hi.is_finite() {
+        return;
+    }
     v.chain_spread_db = hi - lo;
 
     if g.nchain() >= 2 {
-        let a = chain(rec, 0);
-        let b = chain(rec, 1);
-        if a.len() == b.len() && !a.is_empty() {
-            let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
-            v.chain_identical = Some(same as f32 / a.len() as f32);
+        if let (Some(a), Some(b)) = (chain_slice(rec, 0), chain_slice(rec, 1)) {
+            if a.len() == b.len() && !a.is_empty() {
+                let same = a
+                    .chunks_exact(2)
+                    .zip(b.chunks_exact(2))
+                    .filter(|(x, y)| x == y)
+                    .count();
+                v.chain_identical = Some(same as f32 / (a.len() / 2) as f32);
+            }
         }
     }
 
     // Shape checks run on chain 0; the others differ only by AGC and geometry.
-    let a = &per_chain[0];
+    chain_amp_db_into(rec, 0, amp);
+    let a = &amp[..];
     let n = a.len();
+    if n == 0 {
+        return;
+    }
     let whole = a.iter().sum::<f32>() / n as f32;
 
     let centre_half = (n / 40).max(1); // ±2.5% of the band
@@ -687,20 +1116,14 @@ pub fn validate(rec: &CsiRecord) -> Validation {
     // middle of the band: the middle contains the DC notch, and a deep notch
     // there would drag the reference down and hide a real roll-off.
     let shoulders = [(n / 4, (n * 2) / 5), ((n * 3) / 5, (n * 3) / 4)];
-    let reference: Vec<f32> = shoulders
-        .iter()
-        .flat_map(|&(lo, hi)| a[lo.min(n)..hi.min(n)].iter().copied())
-        .collect();
-    v.edge_rolloff_db = edges - mean_of(&reference);
-
-    v
-}
-
-fn mean_of(s: &[f32]) -> f32 {
-    if s.is_empty() {
-        return 0.0;
+    let (mut sum, mut count) = (0.0f32, 0usize);
+    for &(lo, hi) in &shoulders {
+        let s = &a[lo.min(n)..hi.min(n)];
+        sum += s.iter().sum::<f32>();
+        count += s.len();
     }
-    s.iter().sum::<f32>() / s.len() as f32
+    let reference = if count > 0 { sum / count as f32 } else { 0.0 };
+    v.edge_rolloff_db = edges - reference;
 }
 
 // -- timing -------------------------------------------------------------------
@@ -723,30 +1146,76 @@ pub struct Timing {
 
 /// Inter-arrival distribution from a monotonically increasing time series (ns).
 pub fn timing_ns(times_ns: &[u64]) -> Timing {
+    timing_ns_into(times_ns, &mut Vec::new())
+}
+
+/// [`timing_ns`], with a caller-owned scratch buffer.
+///
+/// Four ordered quantiles do not need a sort. Selecting them in increasing
+/// order lets each selection run on the partition the previous one left to its
+/// right, so the work is a few linear passes over a shrinking slice rather
+/// than `n log n` over the whole window — twice per frame, on both clocks.
+pub fn timing_ns_into(times_ns: &[u64], scratch: &mut Vec<f32>) -> Timing {
     if times_ns.len() < 3 {
         return Timing::default();
     }
-    let mut d: Vec<f32> = times_ns
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]) as f32 / 1000.0)
-        .collect();
+    scratch.clear();
+    scratch.reserve(times_ns.len() - 1);
+    scratch.extend(
+        times_ns
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]) as f32 / 1000.0),
+    );
+    let d = &mut scratch[..];
     let n = d.len();
+
     let mean = d.iter().sum::<f32>() / n as f32;
     let var = d.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
-    d.sort_by(f32::total_cmp);
+    let max = d.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-    let q = |p: f64| d[idx(n, p)];
-    Timing {
+    let mut out = Timing {
         n: times_ns.len(),
         rate_hz: if mean > 0.0 { 1e6 / mean } else { 0.0 },
         mean_us: mean,
-        p50_us: q(0.50),
-        p95_us: q(0.95),
-        p99_us: q(0.99),
-        p999_us: q(0.999),
-        max_us: d[n - 1],
+        max_us: max,
         cv: if mean > 0.0 { var.sqrt() / mean } else { 0.0 },
+        ..Default::default()
+    };
+
+    // Quantile indices into the fully sorted order, ascending.
+    let targets = [idx(n, 0.50), idx(n, 0.95), idx(n, 0.99), idx(n, 0.999)];
+    let mut values = [0.0f32; 4];
+    // `base` is the index, in the original array, of `rest[0]`.
+    let mut rest = &mut d[..];
+    let mut base = 0usize;
+    // The value most recently selected. When two quantile indices collide —
+    // which they do on short windows, where p95 and p999 land on the same
+    // element — the later one is that same element, already in hand.
+    let mut last = 0.0f32;
+    for i in 0..targets.len() {
+        let k = targets[i];
+        if k < base {
+            values[i] = last;
+            continue;
+        }
+        let local = k - base;
+        if local >= rest.len() {
+            last = rest.last().copied().unwrap_or(max);
+            values[i] = last;
+            continue;
+        }
+        let (_, mid, right) = rest.select_nth_unstable_by(local, f32::total_cmp);
+        last = *mid;
+        values[i] = last;
+        rest = right;
+        base = k + 1;
     }
+
+    out.p50_us = values[0];
+    out.p95_us = values[1];
+    out.p99_us = values[2];
+    out.p999_us = values[3];
+    out
 }
 
 #[cfg(test)]
@@ -783,6 +1252,53 @@ mod tests {
         }
     }
 
+    /// The approximation is only allowed to be invisible. The console
+    /// quantises the waterfall to 256 levels over a 60 dB range — a quarter of
+    /// a dB per level — and the numeric panels show one decimal, so the budget
+    /// is 1e-3 dB and the fit should sit orders of magnitude under it.
+    #[test]
+    fn the_fast_logarithm_is_indistinguishable_from_libm() {
+        let mut worst = 0.0f32;
+        // Sweep the whole range a power can take: one LSB squared up to the
+        // largest `|H|²` an i16 pair can produce, plus every binade between.
+        let mut p = POWER_FLOOR;
+        while p < 4.3e9 {
+            let exact = 10.0 * (p as f64).log10();
+            let err = (db_from_power(p) as f64 - exact).abs() as f32;
+            worst = worst.max(err);
+            p *= 1.000_37; // ~1900 points per binade
+        }
+        assert!(
+            worst < 1e-3,
+            "fast log10 worst error was {worst} dB over the i16 power range"
+        );
+
+        // And the identity the amplitude path relies on: 20·log10|H| computed
+        // through the power form must match the direct form.
+        for &(re, im) in &[(1.0f32, 0.0f32), (700.0, -300.0), (32767.0, 32767.0)] {
+            let direct = 20.0 * (re * re + im * im).sqrt().max(MAG_FLOOR).log10();
+            let viapower = db_from_power(re * re + im * im);
+            assert!(
+                (direct - viapower).abs() < 1e-3,
+                "({re},{im}): {direct} vs {viapower}"
+            );
+        }
+    }
+
+    /// A cached plan must produce exactly what a freshly built one did.
+    #[test]
+    fn cached_plans_do_not_change_the_transform() {
+        let h: Vec<Complex32> = (0..56)
+            .map(|i| Complex32::new((i as f32 * 0.3).cos(), (i as f32 * 0.3).sin()))
+            .collect();
+        let a = cir(&h, 312_500.0, 512, 64);
+        // Second call reuses the thread-local plan and window.
+        let b = cir(&h, 312_500.0, 512, 64);
+        assert_eq!(a.mag_db, b.mag_db);
+        assert_eq!(a.peak_bin, b.peak_bin);
+        assert_eq!(a.rms_delay_ns, b.rms_delay_ns);
+    }
+
     #[test]
     fn chain_extraction_reads_chain_major_storage() {
         // Encode the chain index in the real part so a transposed read — or a
@@ -796,6 +1312,24 @@ mod tests {
             }
         }
         assert!(chain(&r, 4).is_empty(), "out-of-range chain yields nothing");
+    }
+
+    /// The `i16`-direct amplitude path must agree with going through
+    /// `Complex32` — it is the same measurement, taken without the detour.
+    #[test]
+    fn the_direct_amplitude_path_matches_the_complex_one() {
+        let r = rec(64, 2, 1, |t, c| {
+            (((t * 7) as i16) - 200, ((c * 31 + t * 3) as i16) - 50)
+        });
+        for c in 0..2 {
+            let via_complex = amp_db(&chain(&r, c));
+            let mut direct = Vec::new();
+            chain_amp_db_into(&r, c, &mut direct);
+            assert_eq!(direct.len(), via_complex.len());
+            for (i, (d, v)) in direct.iter().zip(&via_complex).enumerate() {
+                assert!((d - v).abs() < 1e-3, "tone {i}: {d} vs {v}");
+            }
+        }
     }
 
     #[test]
@@ -907,6 +1441,35 @@ mod tests {
         assert!((d.max_hz - 200.0).abs() < 1.0);
     }
 
+    /// The conjugate product taken from the `i16` payload must equal the one
+    /// taken from materialised `Complex32` chains.
+    #[test]
+    fn the_direct_doppler_reduction_matches_the_complex_one() {
+        let r = Arc::new(rec(64, 2, 1, |t, c| {
+            ((t as i16 * 3 - 90), (c as i16 * 40 + t as i16 - 20))
+        }));
+        let recs = vec![r.clone()];
+        let ticks = vec![0u64];
+
+        for pair in [None, Some(1usize)] {
+            let s = doppler_series(&recs, &ticks, 0, pair);
+            let a = chain(&r, 0);
+            let expect = match pair {
+                Some(b) => {
+                    let b = chain(&r, b);
+                    let sum: Complex32 = a.iter().zip(&b).map(|(x, y)| x * y.conj()).sum();
+                    sum / a.len() as f32
+                }
+                None => a.iter().sum::<Complex32>() / a.len() as f32,
+            };
+            let got = s.values[0];
+            assert!(
+                (got.re - expect.re).abs() < 1e-2 && (got.im - expect.im).abs() < 1e-2,
+                "pair {pair:?}: {got} vs {expect}"
+            );
+        }
+    }
+
     #[test]
     fn bundle_width_grows_with_variability() {
         let steady: Vec<Vec<f32>> = (0..64).map(|_| vec![10.0, 10.0, 10.0]).collect();
@@ -919,6 +1482,30 @@ mod tests {
             })
             .collect();
         assert!(bundle(&jittery).width_db > 9.0);
+    }
+
+    /// Reusing the median's partitions must not change which values come out.
+    /// Checked against a plain sort, over sizes that exercise the degenerate
+    /// small-`n` cases where the three quantile indices collide.
+    #[test]
+    fn bundle_quantiles_match_a_full_sort() {
+        for n in [1usize, 2, 3, 5, 16, 127, 128] {
+            let columns: Vec<Vec<f32>> = (0..n)
+                .map(|i| {
+                    (0..7)
+                        .map(|t| ((i * 37 + t * 11) % 91) as f32 - 40.0)
+                        .collect()
+                })
+                .collect();
+            let got = bundle(&columns);
+            for t in 0..7 {
+                let mut col: Vec<f32> = columns.iter().map(|c| c[t]).collect();
+                col.sort_by(f32::total_cmp);
+                assert_eq!(got.p05[t], col[idx(n, 0.05)], "n={n} t={t} p05");
+                assert_eq!(got.p50[t], col[idx(n, 0.50)], "n={n} t={t} p50");
+                assert_eq!(got.p95[t], col[idx(n, 0.95)], "n={n} t={t} p95");
+            }
+        }
     }
 
     #[test]
@@ -970,5 +1557,32 @@ mod tests {
         assert!((s.p50_us - 1000.0).abs() < 1.0);
         assert!(s.max_us > 49_000.0);
         assert!(s.rate_hz > 900.0 && s.rate_hz < 1000.0);
+    }
+
+    /// The nested selection must give exactly what sorting would, including
+    /// on the short windows where the upper quantile indices collapse onto
+    /// one another.
+    #[test]
+    fn timing_quantiles_match_a_full_sort() {
+        for n in [3usize, 4, 10, 64, 257, 1000] {
+            let times: Vec<u64> = (0..n as u64)
+                .scan(0u64, |acc, i| {
+                    *acc += 1_000_000 + (i * 7919 % 3000) * 1000;
+                    Some(*acc)
+                })
+                .collect();
+            let got = timing_ns(&times);
+            let mut d: Vec<f32> = times
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as f32 / 1000.0)
+                .collect();
+            let m = d.len();
+            d.sort_by(f32::total_cmp);
+            assert_eq!(got.p50_us, d[idx(m, 0.50)], "n={n} p50");
+            assert_eq!(got.p95_us, d[idx(m, 0.95)], "n={n} p95");
+            assert_eq!(got.p99_us, d[idx(m, 0.99)], "n={n} p99");
+            assert_eq!(got.p999_us, d[idx(m, 0.999)], "n={n} p999");
+            assert_eq!(got.max_us, d[m - 1], "n={n} max");
+        }
     }
 }

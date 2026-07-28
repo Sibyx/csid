@@ -10,16 +10,35 @@
 //! windowed statistics run over a decimated subset ([`BUNDLE_COLUMNS`]) and the
 //! waterfall carries only what the frame rate can show, reporting the rest as
 //! `skipped` rather than pretending the display is complete.
+//!
+//! ## Two halves, because only one of them is per-client
+//!
+//! [`Analysis`] computes everything that depends on the window and the view
+//! settings. [`ClientView`] draws the waterfall, which depends on where *this*
+//! client's cursor sits in the ring. The server runs one [`Analysis`] per
+//! distinct view and hands the result to every [`ClientView`] watching it; the
+//! console used to run the whole thing once per connected browser.
+//!
+//! ## Buffers live across frames
+//!
+//! Every intermediate is a field of [`Scratch`], refilled rather than
+//! reallocated. This is not micro-optimisation for its own sake: profiling the
+//! deployed console put 17% of its CPU in `malloc`/`free` against 1.7% in the
+//! FFTs, and the single worst offender was a loop that extracted a full
+//! `Vec<Complex32>` of every subcarrier in order to read one of them.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use csiq::CsiRecord;
-use serde_json::json;
+use rustfft::num_complex::Complex32;
 
+use crate::class::{Census, ClassKey};
 use crate::dsp;
-use crate::frame::{quantise_db, Encoder, ViewSettings};
+use crate::frame::{quantise_db, F32Section, SharedFrame, ViewSettings, WaterfallPlan};
 use crate::state::{Hub, Sample};
+use crate::wire::{
+    ClassEntry, ClassInfo, ClientHeader, Mac, MixInfo, PhyInfo, SharedHeader, Talker, WidthKey,
+};
 
 /// Upper bound on records entering the percentile bundle. Percentiles converge
 /// long before the window does, and this keeps the per-frame cost flat.
@@ -28,60 +47,88 @@ const BUNDLE_COLUMNS: usize = 128;
 /// Inter-arrival histogram resolution.
 const HIST_BINS: usize = 48;
 
-/// The identity of a **record class**: tone count and modulation family.
-///
-/// This is the load-bearing abstraction for real captures. `csid caps` puts it
-/// plainly — *CSI type follows the received frame* — so an ambient stream on a
-/// busy channel is not one signal but several interleaved ones: legacy 52-tone
-/// beacons, HT 56-tone data, HE 242-tone bursts, all arriving in the same
-/// second from different transmitters.
-///
-/// A console that renders "the newest record" therefore flickers between
-/// incompatible geometries: the PHY label blinks, the spectrum changes width,
-/// and the waterfall has no stable number of columns. Worse, a time series
-/// built across the mix is meaningless, because consecutive samples describe
-/// different measurements.
-///
-/// So every view is scoped to exactly one class. The operator picks it; the
-/// default is whichever class dominates the window. The full mix stays visible
-/// in its own panel, because *what else is on the channel* is real information.
-fn class_of(rec: &CsiRecord) -> String {
-    let modulation = match rec.phy.map(|p| p.modulation) {
-        Some(m) => format!("{m:?}").to_lowercase(),
-        None => "unlabelled".to_string(),
-    };
-    format!("{}:{}", rec.ntone, modulation)
+/// Every buffer one analysis reuses between frames.
+#[derive(Default)]
+struct Scratch {
+    all: Vec<Sample>,
+    window: Vec<Sample>,
+    recs: Vec<Arc<CsiRecord>>,
+    ticks: Vec<u64>,
+
+    h: Vec<Complex32>,
+    amp: Vec<f32>,
+    phase_raw: Vec<f32>,
+    phase_unwrapped: Vec<f32>,
+    phase_detrended: Vec<f32>,
+    iq: Vec<f32>,
+    chain_amp: Vec<f32>,
+
+    picks: Vec<usize>,
+    columns: Vec<f32>,
+    bundle_scratch: Vec<f32>,
+    bundle: dsp::Bundle,
+
+    cir: dsp::Cir,
+    cir_buf: Vec<Complex32>,
+
+    series: dsp::Series,
+    doppler: dsp::Doppler,
+    dop_buf: Vec<Complex32>,
+
+    tones: Vec<usize>,
+    tone_series: Vec<f32>,
+    rssi_series: Vec<f32>,
+    host_us: Vec<f32>,
+    fw_us: Vec<f32>,
+    ftm_ns: Vec<u64>,
+    host_ns: Vec<u64>,
+    timing_scratch: Vec<f32>,
+    hist: Vec<f32>,
+    talkers: Vec<(Mac, TalkerAcc)>,
+
+    census: Census,
+    section: F32Section,
+    header: SharedHeader,
+    /// One planner for the impulse response and one for the Doppler column, so
+    /// the two can run on different threads without sharing mutable state.
+    tf_cir: dsp::Transforms,
+    tf_doppler: dsp::Transforms,
 }
 
-/// Human label for a class key, e.g. `56-tone ht`.
-fn class_label(key: &str) -> String {
-    match key.split_once(':') {
-        Some((tones, modulation)) => format!("{tones}-tone {modulation}"),
-        None => key.to_string(),
+#[derive(Debug, Clone, Copy, Default)]
+struct TalkerAcc {
+    count: u64,
+    rssi_sum: i64,
+    rssi_n: u64,
+    last_ns: u64,
+    first_ticks: u64,
+    last_ticks: u64,
+}
+
+/// The shared half of a frame: everything derived from the window.
+pub struct Analysis {
+    scratch: Box<Scratch>,
+}
+
+impl Default for Analysis {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Per-connection analysis state: just where in the stream this client is.
-///
-/// `Copy` on purpose — the WebSocket loop hands it to a blocking task and takes
-/// it back each frame, and a one-word cursor is not worth an `Option` dance.
-#[derive(Debug, Clone, Copy)]
-pub struct Analyzer {
-    cursor: u64,
-}
-
-impl Analyzer {
-    /// Start a client at the live edge, so it does not open on stale history.
-    pub fn at_live_edge(hub: &Hub) -> Self {
-        Analyzer {
-            cursor: hub.total(),
+impl Analysis {
+    pub fn new() -> Self {
+        Analysis {
+            scratch: Box::default(),
         }
     }
 
-    /// Build one frame. Returns `None` when nothing has been received yet.
-    pub fn frame(&mut self, hub: &Hub, s: &ViewSettings) -> Option<Vec<u8>> {
-        let all = hub.tail(s.window);
-        if all.is_empty() {
+    /// Compute one tick's shared analysis. `None` when nothing has arrived.
+    pub fn compute(&mut self, hub: &Hub, s: &ViewSettings) -> Option<SharedFrame> {
+        let sc = &mut *self.scratch;
+
+        hub.tail_into(s.window, &mut sc.all);
+        if sc.all.is_empty() {
             return None;
         }
 
@@ -89,168 +136,222 @@ impl Analyzer {
         // looking at? The requested class wins if it is still present;
         // otherwise fall back to the most common, so the console recovers on
         // its own when a transmitter goes quiet.
-        let mut census: HashMap<String, u64> = HashMap::new();
-        for smp in &all {
-            *census.entry(class_of(&smp.rec)).or_default() += 1;
+        sc.census.clear();
+        for smp in &sc.all {
+            sc.census.add(ClassKey::of(&smp.rec));
         }
-        // Ties break on the key so the default class cannot oscillate between
-        // two equally common PHY types frame to frame.
-        let dominant = census
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-            .map(|(k, _)| k.clone())?;
-        let class = match &s.class {
-            Some(want) if census.contains_key(want) => want.clone(),
-            _ => dominant.clone(),
+        let dominant = sc.census.dominant()?;
+        let requested = s.class_key();
+        let class = match requested {
+            Some(want) if sc.census.contains(want) => want,
+            _ => dominant,
         };
 
         // Every view below sees only this class. Mixing geometries into one
         // series would produce arrays of changing width and a time series
         // whose consecutive samples are not comparable.
-        let window: Vec<Sample> = all
-            .iter()
-            .filter(|smp| class_of(&smp.rec) == class)
-            .cloned()
-            .collect();
-        let latest = window.last()?.clone();
+        sc.window.clear();
+        sc.window
+            .extend(sc.all.iter().filter(|smp| ClassKey::of(&smp.rec) == class).cloned());
+        let latest = sc.window.last()?.clone();
         let rec = &latest.rec;
         let geom = dsp::Geometry::of(rec);
         let nchain = geom.nchain();
         let chain_idx = s.chain.min(nchain.saturating_sub(1));
+        let spacing = dsp::spacing_hz(rec);
+        let window_len = sc.window.len();
 
-        // New records since this client's last frame, for the waterfall. Ask
-        // for more than the row budget, because part of what arrives belongs
-        // to other classes and will not be drawn.
-        let (cursor, arrived, ring_skipped) = hub.since(self.cursor, s.wf_rows * 8);
-        self.cursor = cursor;
-        let mut fresh: Vec<Sample> = arrived
-            .iter()
-            .filter(|smp| class_of(&smp.rec) == class)
-            .cloned()
-            .collect();
-        let other_class = (arrived.len() - fresh.len()) as u64;
-        // Records of this class the row budget could not carry are skipped
-        // just as surely as the ones the ring never handed over; both belong
-        // in the same honest count.
-        let over_budget = fresh.len().saturating_sub(s.wf_rows) as u64;
-        if over_budget > 0 {
-            fresh.drain(..over_budget as usize);
-        }
-        let skipped = ring_skipped + over_budget;
-
-        let mut enc = Encoder::new();
+        sc.section.clear();
 
         // -- the selected chain, right now ---------------------------------
-        let h = dsp::chain(rec, chain_idx);
-        let spacing = dsp::spacing_hz(rec);
-        let amp = dsp::amp_db(&h);
-        let phase_raw = dsp::phase(&h);
-        let phase_unwrapped = dsp::unwrap(&phase_raw);
-        let (phase_detrended, fit) = dsp::detrend(&phase_unwrapped, spacing);
+        dsp::chain_into(rec, chain_idx, &mut sc.h);
+        dsp::amp_db_into(&sc.h, &mut sc.amp);
+        dsp::phase_into(&sc.h, &mut sc.phase_raw);
+        dsp::unwrap_into(&sc.phase_raw, &mut sc.phase_unwrapped);
+        let fit = dsp::detrend_into(&sc.phase_unwrapped, spacing, &mut sc.phase_detrended);
 
-        enc.f32s("amp_db", &amp);
-        enc.f32s("phase_raw", &phase_raw);
-        enc.f32s("phase_unwrapped", &phase_unwrapped);
-        enc.f32s("phase_detrended", &phase_detrended);
+        sc.section.push("amp_db", &sc.amp);
+        sc.section.push("phase_raw", &sc.phase_raw);
+        sc.section.push("phase_unwrapped", &sc.phase_unwrapped);
+        sc.section.push("phase_detrended", &sc.phase_detrended);
 
         // Interleaved re/im for the complex-plane view.
-        let mut iq = Vec::with_capacity(h.len() * 2);
-        for c in &h {
-            iq.push(c.re);
-            iq.push(c.im);
+        sc.iq.clear();
+        sc.iq.reserve(sc.h.len() * 2);
+        for c in &sc.h {
+            sc.iq.push(c.re);
+            sc.iq.push(c.im);
         }
-        enc.f32s("iq", &iq);
+        sc.section.push("iq", &sc.iq);
 
         // -- per-chain spectra, for the small-multiple comparison ----------
-        let mut chain_amp = Vec::with_capacity(nchain * geom.ntone);
-        for c in 0..nchain {
-            let a = dsp::amp_db(&dsp::chain(rec, c));
-            if a.len() == geom.ntone {
-                chain_amp.extend_from_slice(&a);
-            } else {
-                chain_amp.extend(std::iter::repeat_n(f32::NAN, geom.ntone));
-            }
-        }
-        enc.f32s("chain_amp_db", &chain_amp);
-
-        // -- impulse response ----------------------------------------------
-        let cir = dsp::cir(&h, spacing, s.cir_nfft, s.cir_taps);
-        enc.f32s("cir_db", &cir.mag_db);
+        //
+        // Each chain writes its own slice of the output, so this parallelises
+        // without any shared mutable state at all.
+        sc.chain_amp.clear();
+        sc.chain_amp.resize(nchain * geom.ntone, f32::NAN);
+        crate::pipeline::for_each_chunk_mut(&mut sc.chain_amp, geom.ntone, |c, out| {
+            dsp::chain_amp_db_into_slice(rec, c, out);
+        });
+        sc.section.push("chain_amp_db", &sc.chain_amp);
 
         // -- windowed views -------------------------------------------------
-        let columns = decimate(&window, BUNDLE_COLUMNS)
-            .iter()
-            .map(|s| dsp::amp_db(&dsp::chain(&s.rec, chain_idx)))
-            .filter(|a| a.len() == geom.ntone)
-            .collect::<Vec<_>>();
-        let bundle = dsp::bundle(&columns);
-        if !bundle.p50.is_empty() {
-            enc.f32s("bundle_p05", &bundle.p05);
-            enc.f32s("bundle_p50", &bundle.p50);
-            enc.f32s("bundle_p95", &bundle.p95);
+        //
+        // A decimated subset, always including the newest record. The columns
+        // land in one contiguous buffer rather than in `BUNDLE_COLUMNS`
+        // separate vectors.
+        //
+        // Records whose payload does not match the geometry this class
+        // promises are excluded up front rather than written as `NaN` columns:
+        // a `NaN` would sort to one end of every percentile selection and
+        // silently bias p95.
+        sc.picks.clear();
+        for (i, smp) in sc.window.iter().enumerate() {
+            let g = dsp::Geometry::of(&smp.rec);
+            if g.ntone == geom.ntone && chain_idx < g.nchain() && g.matches(&smp.rec) {
+                sc.picks.push(i);
+            }
+        }
+        let usable = sc.picks.len();
+        let cols = usable.min(BUNDLE_COLUMNS);
+        sc.columns.clear();
+        sc.columns.resize(cols * geom.ntone, f32::NAN);
+        if cols > 0 {
+            let step = usable as f64 / cols as f64;
+            let (window, picks) = (&sc.window, &sc.picks);
+            crate::pipeline::for_each_chunk_mut(&mut sc.columns, geom.ntone, |i, out| {
+                let k = picks[((i as f64 * step) as usize).min(usable - 1)];
+                dsp::chain_amp_db_into_slice(&window[k].rec, chain_idx, out);
+            });
         }
 
         // -- Doppler ---------------------------------------------------------
-        let recs: Vec<Arc<CsiRecord>> = window.iter().map(|s| s.rec.clone()).collect();
-        let ticks: Vec<u64> = window.iter().map(|s| s.ftm_ticks).collect();
+        sc.recs.clear();
+        sc.ticks.clear();
+        sc.recs.extend(sc.window.iter().map(|s| s.rec.clone()));
+        sc.ticks.extend(sc.window.iter().map(|s| s.ftm_ticks));
         let chain_b = s.chain_b.filter(|&b| b < nchain && b != chain_idx);
-        let series = dsp::doppler_series(&recs, &ticks, chain_idx, chain_b);
         let freq_mhz = s
             .freq_mhz
             .or_else(|| control_freq_mhz(rec))
             .unwrap_or(5180.0);
-        let dop = dsp::doppler(&series, s.doppler_nfft, dsp::wavelength_m(freq_mhz));
-        enc.f32s("doppler_db", &dop.power_db);
+
+        // The two heaviest remaining pieces are independent: the percentile
+        // bundle reads `columns`, the Doppler column reads `recs`/`ticks`.
+        // Running them as a pair is what the second core is for.
+        {
+            let Scratch {
+                columns,
+                bundle,
+                bundle_scratch,
+                recs,
+                ticks,
+                series,
+                doppler,
+                dop_buf,
+                tf_doppler,
+                ..
+            } = sc;
+            let ntone = geom.ntone;
+            crate::pipeline::join(
+                || dsp::bundle_flat(columns, ntone, bundle, bundle_scratch),
+                || {
+                    dsp::doppler_series_into(recs, ticks, chain_idx, chain_b, series);
+                    dsp::doppler_into(
+                        tf_doppler,
+                        series,
+                        s.doppler_nfft,
+                        dsp::wavelength_m(freq_mhz),
+                        dop_buf,
+                        doppler,
+                    );
+                },
+            );
+        }
+
+        if !sc.bundle.p50.is_empty() {
+            sc.section.push("bundle_p05", &sc.bundle.p05);
+            sc.section.push("bundle_p50", &sc.bundle.p50);
+            sc.section.push("bundle_p95", &sc.bundle.p95);
+        }
+        sc.section.push("doppler_db", &sc.doppler.power_db);
+
+        // -- impulse response ----------------------------------------------
+        dsp::cir_into(
+            &mut sc.tf_cir,
+            &sc.h,
+            spacing,
+            s.cir_nfft,
+            s.cir_taps,
+            &mut sc.cir_buf,
+            &mut sc.cir,
+        );
+        sc.section.push("cir_db", &sc.cir.mag_db);
 
         // -- amplitude time series ------------------------------------------
-        let tones = if s.series_tones.is_empty() {
-            default_tones(geom.ntone)
+        //
+        // One pass over the window, reading only the subcarriers asked for.
+        // The previous form nested the loops the other way round and called a
+        // full chain extraction inside the inner one, so watching three tones
+        // over a 256-record window rebuilt 768 complete spectra — 765,000
+        // complex conversions and six megabytes of allocation per frame at
+        // 996 tones — to read 768 numbers.
+        sc.tones.clear();
+        if s.series_tones.is_empty() {
+            default_tones(geom.ntone, &mut sc.tones);
         } else {
-            s.series_tones
-                .iter()
-                .copied()
-                .filter(|&t| t < geom.ntone)
-                .collect()
-        };
-        let mut series_flat = Vec::with_capacity(tones.len() * window.len());
-        for &t in &tones {
-            for smp in &window {
-                let h = dsp::chain(&smp.rec, chain_idx);
-                series_flat.push(match h.get(t) {
-                    Some(c) => 20.0 * c.norm().max(1e-6).log10(),
-                    None => f32::NAN,
-                });
+            sc.tones
+                .extend(s.series_tones.iter().copied().filter(|&t| t < geom.ntone));
+        }
+        sc.tone_series.clear();
+        sc.tone_series
+            .resize(sc.tones.len() * window_len, f32::NAN);
+        for (j, smp) in sc.window.iter().enumerate() {
+            let Some(iq) = dsp::chain_slice(&smp.rec, chain_idx) else {
+                continue;
+            };
+            for (i, &t) in sc.tones.iter().enumerate() {
+                if 2 * t + 1 < iq.len() {
+                    let im = iq[2 * t] as f32;
+                    let re = iq[2 * t + 1] as f32;
+                    sc.tone_series[i * window_len + j] = dsp::db_from_power(re * re + im * im);
+                }
             }
         }
-        enc.f32s("tone_series", &series_flat);
+        sc.section.push("tone_series", &sc.tone_series);
 
         // -- RSSI, the only absolute amplitude anchor ------------------------
         let rssi_chains = rec.rssi.len().max(1);
-        let mut rssi_flat = Vec::with_capacity(rssi_chains * window.len());
+        sc.rssi_series.clear();
+        sc.rssi_series.reserve(rssi_chains * window_len);
         for c in 0..rssi_chains {
-            for smp in &window {
-                rssi_flat.push(smp.rec.rssi.get(c).copied().unwrap_or(0) as f32);
+            for smp in &sc.window {
+                sc.rssi_series
+                    .push(smp.rec.rssi.get(c).copied().unwrap_or(0) as f32);
             }
         }
-        enc.f32s("rssi_series", &rssi_flat);
+        sc.section.push("rssi_series", &sc.rssi_series);
 
         // -- clocks ----------------------------------------------------------
-        let clocks = clock_series(&window);
-        enc.f32s("drift_host_us", &clocks.host_us);
-        enc.f32s("drift_fw_us", &clocks.fw_us);
+        let clocks = clock_series(&sc.window, &mut sc.host_us, &mut sc.fw_us);
+        sc.section.push("drift_host_us", &sc.host_us);
+        sc.section.push("drift_fw_us", &sc.fw_us);
 
         // -- timing ----------------------------------------------------------
-        let ftm_ns: Vec<u64> = window
-            .iter()
-            .map(|s| (s.ftm_ticks as f64 * 1e9 / csiq::FTM_HZ as f64) as u64)
-            .collect();
-        let host_ns: Vec<u64> = window.iter().map(|s| s.recv_ns).collect();
-        let t_ftm = dsp::timing_ns(&ftm_ns);
-        let t_host = dsp::timing_ns(&host_ns);
-        let (hist, hist_max_us) = histogram(&ftm_ns, t_ftm.p999_us);
-        enc.f32s("interarrival_hist", &hist);
+        sc.ftm_ns.clear();
+        sc.ftm_ns.extend(
+            sc.window
+                .iter()
+                .map(|s| (s.ftm_ticks as f64 * 1e9 / csiq::FTM_HZ as f64) as u64),
+        );
+        sc.host_ns.clear();
+        sc.host_ns.extend(sc.window.iter().map(|s| s.recv_ns));
+        let t_ftm = dsp::timing_ns_into(&sc.ftm_ns, &mut sc.timing_scratch);
+        let t_host = dsp::timing_ns_into(&sc.host_ns, &mut sc.timing_scratch);
+        let hist_max_us = histogram(&sc.ftm_ns, t_ftm.p999_us, &mut sc.hist);
+        sc.section.push("interarrival_hist", &sc.hist);
 
-        // -- waterfall --------------------------------------------------------
+        // -- the waterfall's plan (its pixels are drawn per client) -----------
         //
         // Two scopes, because the waterfall answers two different questions.
         // Scoped to the class it is a measurement of one signal at its native
@@ -260,7 +361,8 @@ impl Analyzer {
         // only which records reach the display.
         let all_scope = s.wf_scope == "all";
         let (wf_bins, wf_span_hz) = if all_scope {
-            let span = all
+            let span = sc
+                .all
                 .iter()
                 .map(|smp| smp.rec.ntone as f64 * dsp::spacing_hz(&smp.rec))
                 .fold(0.0f64, f64::max);
@@ -269,157 +371,279 @@ impl Analyzer {
             (geom.ntone, geom.ntone as f64 * spacing)
         };
 
-        let wf_source: &[Sample] = if all_scope { &arrived } else { &fresh };
-        let mut wf = Vec::with_capacity(wf_source.len() * wf_bins);
+        // -- mixes and the talker table ---------------------------------------
+        let mut mix = std::mem::take(&mut sc.header.mix);
+        phy_mix(&sc.window, &mut mix);
+        let talkers = talkers(&sc.window, &mut sc.talkers);
+
+        let counters = &hub.counters;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let total_all = sc.census.total() as f64;
+        let available: Vec<ClassEntry> = sc
+            .census
+            .ranked()
+            .into_iter()
+            .map(|(k, v)| ClassEntry {
+                key: k,
+                label: k.label(),
+                count: v,
+                share: v as f64 / total_all,
+            })
+            .collect();
+
+        let h = &mut sc.header;
+        h.waterfall.scope = if all_scope { "all" } else { "class" };
+        h.waterfall.bins = wf_bins;
+        h.waterfall.span_mhz = wf_span_hz / 1e6;
+
+        h.class = ClassInfo {
+            key: class,
+            label: class.label(),
+            pinned: s.class.is_some(),
+            share: sc.census.count(class) as f64 / total_all,
+            count: sc.census.count(class),
+            available,
+        };
+
+        h.geometry.ntone = geom.ntone;
+        h.geometry.nrx = geom.nrx;
+        h.geometry.ntx = geom.ntx;
+        h.geometry.nchain = nchain;
+        h.geometry.chain = chain_idx;
+        h.geometry.chain_b = chain_b;
+        h.geometry.chain_labels.clear();
+        h.geometry
+            .chain_labels
+            .extend((0..nchain).map(|c| geom.chain_label(c)));
+        h.geometry.dimensions_ok = geom.matches(rec);
+
+        h.radio.channel = rec.channel;
+        h.radio.width.clear();
+        use std::fmt::Write as _;
+        let _ = write!(h.radio.width, "{}", rec.width);
+        h.radio.freq_mhz = freq_mhz;
+        h.radio.freq_assumed = s.freq_mhz.is_none();
+        h.radio.spacing_hz = spacing;
+        h.radio.bw_mhz = dsp::occupied_bw_mhz(rec);
+
+        h.record.session_uid = latest.session_uid;
+        h.record.seq = latest.seq;
+        h.record.ftm = rec.ftm;
+        h.record.ftm_ticks = latest.ftm_ticks;
+        h.record.us = rec.us;
+        h.record.unix_ts_ns = rec.unix_ts_ns;
+        h.record.recv_ns = latest.recv_ns;
+        h.record.rssi.clear();
+        h.record.rssi.extend_from_slice(&rec.rssi);
+        h.record.src_mac = Mac(rec.src_mac);
+        h.record.rnf = rec.rnf;
+        h.record.phy = rec.phy.map(|p| PhyInfo {
+            modulation: crate::class::Phy::of(Some(p.modulation)).to_string(),
+            mcs: p.mcs,
+            nss: p.nss,
+        });
+
+        h.phase_fit.slope_rad_per_tone = fit.slope;
+        h.phase_fit.intercept_rad = fit.intercept;
+        h.phase_fit.tau_ns = fit.tau_ns;
+
+        h.bundle.width_db = sc.bundle.width_db;
+        h.bundle.n = sc.bundle.n;
+
+        h.cir.bin_ns = sc.cir.bin_ns;
+        h.cir.peak_bin = sc.cir.peak_bin;
+        h.cir.rms_delay_ns = sc.cir.rms_delay_ns;
+        h.cir.taps = sc.cir.mag_db.len();
+
+        h.doppler.fs_hz = sc.doppler.fs_hz;
+        h.doppler.max_hz = sc.doppler.max_hz;
+        h.doppler.max_speed_ms = sc.doppler.max_speed_ms;
+        h.doppler.arrival_cv = sc.doppler.arrival_cv;
+        h.doppler.conjugate_pair = sc.doppler.conjugate_pair;
+        h.doppler.nfft = s.doppler_nfft;
+
+        h.timing.ftm = t_ftm;
+        h.timing.host = t_host;
+        h.timing.hist_max_us = hist_max_us;
+
+        h.clocks.host_span_us = clocks.host_span_us;
+        h.clocks.fw_span_us = clocks.fw_span_us;
+        h.clocks.ftm_span_us = clocks.ftm_span_us;
+
+        h.series.tones.clear();
+        h.series.tones.extend_from_slice(&sc.tones);
+        h.series.len = window_len;
+        h.series.rssi_chains = rssi_chains;
+
+        dsp::validate_into(rec, &mut sc.amp, &mut h.validation);
+        h.mix = mix;
+        h.talkers = talkers;
+
+        h.stream.window = window_len;
+        h.stream.window_all = sc.all.len();
+        h.stream.depth = hub.depth();
+        h.stream.total = hub.total();
+        h.stream.received = counters.received.load(Relaxed);
+        h.stream.decode_errors = counters.decode_errors.load(Relaxed);
+        h.stream.sender_gaps = counters.sender_gaps.load(Relaxed);
+        h.stream.session_changes = counters.session_changes.load(Relaxed);
+        h.stream.bytes = counters.bytes.load(Relaxed);
+        if h.stream.source.is_empty() {
+            h.stream.source.push_str(&hub.source);
+        }
+        h.stream.uptime_s = hub.started.elapsed().as_secs();
+
+        h.f32 = sc.section.map().clone();
+        h.n_f32 = sc.section.len();
+
+        Some(SharedFrame {
+            header_body: crate::wire::shared_body(h),
+            f32_bytes: sc.section.bytes().to_vec(),
+            n_f32: sc.section.len(),
+            plan: WaterfallPlan {
+                all_scope,
+                bins: wf_bins,
+                span_hz: wf_span_hz,
+                class,
+                ntone: geom.ntone,
+                chain: s.chain,
+                db_min: s.db_min,
+                db_max: s.db_max,
+                rows: s.wf_rows,
+            },
+        })
+    }
+}
+
+/// One connection: where it has read up to, and the waterfall it draws.
+pub struct ClientView {
+    cursor: u64,
+    arrived: Vec<Sample>,
+    wf: Vec<u8>,
+    row: Vec<f32>,
+    amp: Vec<f32>,
+    out: Vec<u8>,
+}
+
+impl ClientView {
+    /// Start a client at the live edge, so it does not open on stale history.
+    pub fn at_live_edge(hub: &Hub) -> Self {
+        ClientView {
+            cursor: hub.total(),
+            arrived: Vec::new(),
+            wf: Vec::new(),
+            row: Vec::new(),
+            amp: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Draw this client's waterfall rows and assemble its frame.
+    pub fn render(&mut self, hub: &Hub, shared: &SharedFrame) -> &[u8] {
+        let plan = &shared.plan;
+
+        // New records since this client's last frame. Ask for more than the
+        // row budget, because part of what arrives belongs to other classes
+        // and will not be drawn.
+        let (cursor, ring_skipped) =
+            hub.since_into(self.cursor, plan.rows * 8, &mut self.arrived);
+        self.cursor = cursor;
+
+        let of_class = self
+            .arrived
+            .iter()
+            .filter(|smp| ClassKey::of(&smp.rec) == plan.class)
+            .count();
+        let other_class = (self.arrived.len() - of_class) as u64;
+        // Records of this class the row budget could not carry are skipped
+        // just as surely as the ones the ring never handed over; both belong
+        // in the same honest count.
+        let over_budget = of_class.saturating_sub(plan.rows) as u64;
+        let skipped = ring_skipped + over_budget;
+
+        self.wf.clear();
         let mut wf_rows = 0usize;
-        for smp in wf_source {
+
+        // In `class` scope only records of the selected class are drawn, and
+        // the oldest beyond the row budget are dropped. In `all` scope every
+        // arrived record is placed by frequency instead.
+        let mut remaining_drop = over_budget as usize;
+        for smp in &self.arrived {
+            let same_class = ClassKey::of(&smp.rec) == plan.class;
+            if !plan.all_scope {
+                if !same_class {
+                    continue;
+                }
+                if remaining_drop > 0 {
+                    remaining_drop -= 1;
+                    continue;
+                }
+            }
+
             let g = dsp::Geometry::of(&smp.rec);
-            let c = s.chain.min(g.nchain().saturating_sub(1));
-            let a = dsp::amp_db(&dsp::chain(&smp.rec, c));
-            if a.is_empty() {
+            let c = plan.chain.min(g.nchain().saturating_sub(1));
+            dsp::chain_amp_db_into(&smp.rec, c, &mut self.amp);
+            if self.amp.is_empty() {
                 continue;
             }
-            if all_scope {
-                let row = onto_shared_grid(&a, dsp::spacing_hz(&smp.rec), wf_span_hz, wf_bins);
-                let floored: Vec<f32> = row
-                    .iter()
-                    .map(|v| if v.is_finite() { *v } else { s.db_min })
-                    .collect();
-                quantise_db(&floored, s.db_min, s.db_max, &mut wf);
-            } else if a.len() == geom.ntone {
-                quantise_db(&a, s.db_min, s.db_max, &mut wf);
+            if plan.all_scope {
+                onto_shared_grid(
+                    &self.amp,
+                    dsp::spacing_hz(&smp.rec),
+                    plan.span_hz,
+                    plan.bins,
+                    plan.db_min,
+                    &mut self.row,
+                );
+                quantise_db(&self.row, plan.db_min, plan.db_max, &mut self.wf);
+            } else if self.amp.len() == plan.ntone {
+                quantise_db(&self.amp, plan.db_min, plan.db_max, &mut self.wf);
             } else {
                 continue;
             }
             wf_rows += 1;
         }
-        enc.u8s("waterfall", &wf);
 
-        // -- mixes and the talker table ---------------------------------------
-        let mix = phy_mix(&window);
-        let talkers = talkers(&window);
+        let mut header = ClientHeader {
+            t: "frame",
+            cursor,
+            skipped,
+            other_class,
+            wf_rows,
+            n_u8: self.wf.len(),
+            ..Default::default()
+        };
+        header.u8.push("waterfall", 0, self.wf.len());
 
-        let counters = &hub.counters;
-        use std::sync::atomic::Ordering::Relaxed;
+        crate::frame::encode(&header, shared, &self.wf, &mut self.out);
+        &self.out
+    }
+}
 
-        let mut classes: Vec<_> = census
-            .iter()
-            .map(|(k, v)| {
-                json!({
-                    "key": k,
-                    "label": class_label(k),
-                    "count": v,
-                    "share": *v as f64 / all.len() as f64,
-                })
-            })
-            .collect();
-        classes.sort_by(|a, b| {
-            b["count"]
-                .as_u64()
-                .cmp(&a["count"].as_u64())
-                .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
-        });
+/// One client and its own analysis, in one call.
+///
+/// This is the shape the tests and the bench use, and the shape the server
+/// used to have. The server now runs [`Analysis`] once per distinct view and
+/// fans the result out to every [`ClientView`], so two browsers on the same
+/// settings cost one analysis rather than two.
+pub struct Analyzer {
+    analysis: Analysis,
+    client: ClientView,
+}
 
-        let meta = json!({
-            "t": "frame",
-            "cursor": cursor,
-            "skipped": skipped,
-            "other_class": other_class,
-            "wf_rows": wf_rows,
-            "waterfall": {
-                "scope": if all_scope { "all" } else { "class" },
-                "bins": wf_bins,
-                "span_mhz": wf_span_hz / 1e6,
-            },
-            "class": {
-                "key": class,
-                "label": class_label(&class),
-                "pinned": s.class.is_some(),
-                "share": census.get(&class).copied().unwrap_or(0) as f64 / all.len() as f64,
-                "count": census.get(&class).copied().unwrap_or(0),
-                "available": classes,
-            },
-            "geometry": {
-                "ntone": geom.ntone,
-                "nrx": geom.nrx,
-                "ntx": geom.ntx,
-                "nchain": nchain,
-                "chain": chain_idx,
-                "chain_b": chain_b,
-                "chain_labels": (0..nchain).map(|c| geom.chain_label(c)).collect::<Vec<_>>(),
-                "dimensions_ok": geom.matches(rec),
-            },
-            "radio": {
-                "channel": rec.channel,
-                "width": rec.width.to_string(),
-                "freq_mhz": freq_mhz,
-                "freq_assumed": s.freq_mhz.is_none(),
-                "spacing_hz": spacing,
-                "bw_mhz": dsp::occupied_bw_mhz(rec),
-            },
-            "record": {
-                "session_uid": latest.session_uid,
-                "seq": latest.seq,
-                "ftm": rec.ftm,
-                "ftm_ticks": latest.ftm_ticks,
-                "us": rec.us,
-                "unix_ts_ns": rec.unix_ts_ns,
-                "recv_ns": latest.recv_ns,
-                "rssi": rec.rssi,
-                "src_mac": mac(&rec.src_mac),
-                "rnf": rec.rnf,
-                "phy": rec.phy.map(|p| json!({
-                    "modulation": format!("{:?}", p.modulation).to_lowercase(),
-                    "mcs": p.mcs,
-                    "nss": p.nss,
-                })),
-            },
-            "phase_fit": {
-                "slope_rad_per_tone": fit.slope,
-                "intercept_rad": fit.intercept,
-                "tau_ns": fit.tau_ns,
-            },
-            "bundle": { "width_db": bundle.width_db, "n": bundle.n },
-            "cir": {
-                "bin_ns": cir.bin_ns,
-                "peak_bin": cir.peak_bin,
-                "rms_delay_ns": cir.rms_delay_ns,
-                "taps": cir.mag_db.len(),
-            },
-            "doppler": {
-                "fs_hz": dop.fs_hz,
-                "max_hz": dop.max_hz,
-                "max_speed_ms": dop.max_speed_ms,
-                "arrival_cv": dop.arrival_cv,
-                "conjugate_pair": dop.conjugate_pair,
-                "nfft": s.doppler_nfft,
-            },
-            "timing": { "ftm": t_ftm, "host": t_host, "hist_max_us": hist_max_us },
-            "clocks": {
-                "host_span_us": clocks.host_span_us,
-                "fw_span_us": clocks.fw_span_us,
-                "ftm_span_us": clocks.ftm_span_us,
-            },
-            "series": { "tones": tones, "len": window.len(), "rssi_chains": rssi_chains },
-            "validation": dsp::validate(rec),
-            "mix": mix,
-            "talkers": talkers,
-            "stream": {
-                "window": window.len(),
-                "window_all": all.len(),
-                "depth": hub.depth(),
-                "total": cursor,
-                "received": counters.received.load(Relaxed),
-                "decode_errors": counters.decode_errors.load(Relaxed),
-                "sender_gaps": counters.sender_gaps.load(Relaxed),
-                "session_changes": counters.session_changes.load(Relaxed),
-                "bytes": counters.bytes.load(Relaxed),
-                "source": hub.source,
-                "uptime_s": hub.started.elapsed().as_secs(),
-            },
-        });
+impl Analyzer {
+    pub fn at_live_edge(hub: &Hub) -> Self {
+        Analyzer {
+            analysis: Analysis::new(),
+            client: ClientView::at_live_edge(hub),
+        }
+    }
 
-        Some(enc.finish(meta))
+    /// Build one frame. Returns `None` when nothing has been received yet.
+    pub fn frame(&mut self, hub: &Hub, s: &ViewSettings) -> Option<Vec<u8>> {
+        let shared = self.analysis.compute(hub, s)?;
+        Some(self.client.render(hub, &shared).to_vec())
     }
 }
 
@@ -428,13 +652,21 @@ impl Analyzer {
 /// The grid spans `span_hz` centred on the channel's centre frequency, so a
 /// 52-tone legacy row and a 242-tone HE row land on the *same frequencies*
 /// rather than both being stretched to the full width. Bins the record does
-/// not reach keep `None`, and the caller paints them at the floor — an HE20
-/// burst genuinely occupies more of the channel than a legacy frame, and the
-/// picture should show that.
-fn onto_shared_grid(amp: &[f32], spacing_hz: f64, span_hz: f64, bins: usize) -> Vec<f32> {
-    let mut out = vec![f32::NEG_INFINITY; bins];
+/// not reach are painted at `floor_db` — an HE20 burst genuinely occupies more
+/// of the channel than a legacy frame, and the picture should show that.
+fn onto_shared_grid(
+    amp: &[f32],
+    spacing_hz: f64,
+    span_hz: f64,
+    bins: usize,
+    floor_db: f32,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.resize(bins, f32::NEG_INFINITY);
     if amp.is_empty() || span_hz <= 0.0 {
-        return out;
+        out.iter_mut().for_each(|v| *v = floor_db);
+        return;
     }
     let n = amp.len();
     let (mut lo, mut hi) = (bins, 0usize);
@@ -467,18 +699,11 @@ fn onto_shared_grid(amp: &[f32], spacing_hz: f64, span_hz: f64, bins: usize) -> 
             }
         }
     }
-    out
-}
-
-/// Evenly spaced subset of `items`, always including the newest.
-fn decimate(items: &[Sample], max: usize) -> Vec<Sample> {
-    if items.len() <= max {
-        return items.to_vec();
+    for v in out.iter_mut() {
+        if !v.is_finite() {
+            *v = floor_db;
+        }
     }
-    let step = items.len() as f64 / max as f64;
-    (0..max)
-        .map(|i| items[((i as f64 * step) as usize).min(items.len() - 1)].clone())
-        .collect()
 }
 
 /// Three subcarriers spread across the band, used when the client has not
@@ -487,16 +712,15 @@ fn decimate(items: &[Sample], max: usize) -> Vec<Sample> {
 /// Deliberately **not** including the band centre: 802.11 nulls the DC
 /// subcarriers, so a centre tone traces the noise floor and looks like a
 /// violently unstable channel next to its neighbours.
-fn default_tones(ntone: usize) -> Vec<usize> {
+fn default_tones(ntone: usize, out: &mut Vec<usize>) {
     if ntone < 8 {
-        return vec![0];
+        out.push(0);
+        return;
     }
-    vec![ntone / 8, ntone / 3, ntone * 7 / 8]
+    out.extend([ntone / 8, ntone / 3, ntone * 7 / 8]);
 }
 
 struct Clocks {
-    host_us: Vec<f32>,
-    fw_us: Vec<f32>,
     host_span_us: f64,
     fw_span_us: f64,
     ftm_span_us: f64,
@@ -509,15 +733,17 @@ struct Clocks {
 /// how far the host (or firmware) clock has wandered from the RF-plane clock
 /// since the start of the window, in microseconds. A flat trace means the
 /// anchor is sound; a ramp is clock drift; spikes are delivery jitter.
-fn clock_series(window: &[Sample]) -> Clocks {
-    let mut host_us = Vec::with_capacity(window.len());
-    let mut fw_us = Vec::with_capacity(window.len());
+fn clock_series(window: &[Sample], host_us: &mut Vec<f32>, fw_us: &mut Vec<f32>) -> Clocks {
+    host_us.clear();
+    fw_us.clear();
     let (mut host_span, mut fw_span, mut ftm_span) = (0.0, 0.0, 0.0);
 
     if let Some(first) = window.first() {
         let t0 = first.ftm_ticks;
         let h0 = first.rec.unix_ts_ns;
         let f0 = first.rec.us;
+        host_us.reserve(window.len());
+        fw_us.reserve(window.len());
         for s in window {
             let ftm_us = csiq::ftm_to_seconds(s.ftm_ticks.saturating_sub(t0)) * 1e6;
             let h = if h0 > 0 && s.rec.unix_ts_ns >= h0 {
@@ -543,8 +769,6 @@ fn clock_series(window: &[Sample]) -> Clocks {
     }
 
     Clocks {
-        host_us,
-        fw_us,
         host_span_us: host_span,
         fw_span_us: fw_span,
         ftm_span_us: ftm_span,
@@ -552,11 +776,13 @@ fn clock_series(window: &[Sample]) -> Clocks {
 }
 
 /// Linear histogram of inter-arrival times up to `max_us`, so the long tail
-/// does not compress the bulk of the distribution into one bin.
-fn histogram(times_ns: &[u64], max_us: f32) -> (Vec<f32>, f32) {
-    let mut bins = vec![0.0f32; HIST_BINS];
+/// does not compress the bulk of the distribution into one bin. Returns the
+/// top of the range.
+fn histogram(times_ns: &[u64], max_us: f32, bins: &mut Vec<f32>) -> f32 {
+    bins.clear();
+    bins.resize(HIST_BINS, 0.0);
     if times_ns.len() < 3 {
-        return (bins, 1.0);
+        return 1.0;
     }
     let top = if max_us.is_finite() && max_us > 0.0 {
         max_us * 1.2
@@ -568,34 +794,25 @@ fn histogram(times_ns: &[u64], max_us: f32) -> (Vec<f32>, f32) {
         let b = ((d / top) * HIST_BINS as f32) as usize;
         bins[b.min(HIST_BINS - 1)] += 1.0;
     }
-    (bins, top)
+    top
 }
 
-/// Distribution of PHY labels, tone counts and widths over the window — the
-/// live version of the "CSI mix" column `csid bench` reports per run.
-fn phy_mix(window: &[Sample]) -> serde_json::Value {
-    let mut modulation: HashMap<String, u64> = HashMap::new();
-    let mut ntone: HashMap<String, u64> = HashMap::new();
-    let mut nss: HashMap<String, u64> = HashMap::new();
-    let mut mcs: HashMap<String, u64> = HashMap::new();
-    let mut width: HashMap<String, u64> = HashMap::new();
-
+/// Distribution of PHY labels, tone counts and widths over the window.
+fn phy_mix(window: &[Sample], mix: &mut MixInfo) {
+    mix.clear();
     for s in window {
         let r = &s.rec;
-        *ntone.entry(r.ntone.to_string()).or_default() += 1;
-        *width.entry(r.width.to_string()).or_default() += 1;
+        mix.ntone.add(r.ntone);
+        mix.width.add(WidthKey(r.width));
         match r.phy {
             Some(p) => {
-                *modulation
-                    .entry(format!("{:?}", p.modulation).to_lowercase())
-                    .or_default() += 1;
-                *nss.entry(p.nss.to_string()).or_default() += 1;
-                *mcs.entry(p.mcs.to_string()).or_default() += 1;
+                mix.modulation.add(crate::class::Phy::of(Some(p.modulation)));
+                mix.nss.add(p.nss);
+                mix.mcs.add(p.mcs);
             }
-            None => *modulation.entry("unlabelled".into()).or_default() += 1,
+            None => mix.modulation.add(crate::class::Phy::Unlabelled),
         }
     }
-    json!({ "modulation": modulation, "ntone": ntone, "nss": nss, "mcs": mcs, "width": width })
 }
 
 /// Who is actually sounding the channel.
@@ -604,25 +821,27 @@ fn phy_mix(window: &[Sample]) -> serde_json::Value {
 /// "why is my rate low" is usually answered here rather than in the config. The
 /// table also feeds the `radio.mac_filter` editor: pick a talker, pin the
 /// capture to it.
-fn talkers(window: &[Sample]) -> serde_json::Value {
-    struct Acc {
-        count: u64,
-        rssi_sum: i64,
-        rssi_n: u64,
-        last_ns: u64,
-        first_ticks: u64,
-        last_ticks: u64,
-    }
-    let mut by_mac: HashMap<[u8; 6], Acc> = HashMap::new();
+fn talkers(window: &[Sample], acc: &mut Vec<(Mac, TalkerAcc)>) -> Vec<Talker> {
+    acc.clear();
     for s in window {
-        let e = by_mac.entry(s.rec.src_mac).or_insert(Acc {
-            count: 0,
-            rssi_sum: 0,
-            rssi_n: 0,
-            last_ns: 0,
-            first_ticks: s.ftm_ticks,
-            last_ticks: s.ftm_ticks,
-        });
+        let mac = Mac(s.rec.src_mac);
+        // A busy channel carries a few dozen transmitters at most, and a
+        // six-byte compare against a value already in a register beats hashing
+        // one at that cardinality.
+        let e = match acc.iter_mut().find(|(m, _)| *m == mac) {
+            Some((_, e)) => e,
+            None => {
+                acc.push((
+                    mac,
+                    TalkerAcc {
+                        first_ticks: s.ftm_ticks,
+                        last_ticks: s.ftm_ticks,
+                        ..Default::default()
+                    },
+                ));
+                &mut acc.last_mut().unwrap().1
+            }
+        };
         e.count += 1;
         if let Some(&r) = s.rec.rssi.first() {
             e.rssi_sum += r as i64;
@@ -632,22 +851,30 @@ fn talkers(window: &[Sample]) -> serde_json::Value {
         e.last_ticks = e.last_ticks.max(s.ftm_ticks);
     }
 
-    let mut rows: Vec<_> = by_mac
-        .into_iter()
-        .map(|(m, a)| {
+    let mut rows: Vec<Talker> = acc
+        .iter()
+        .map(|&(mac, a)| {
             let span = csiq::ftm_to_seconds(a.last_ticks.saturating_sub(a.first_ticks));
-            json!({
-                "mac": mac(&m),
-                "count": a.count,
-                "rate_hz": if span > 0.0 { a.count as f64 / span } else { 0.0 },
-                "rssi": if a.rssi_n > 0 { Some(a.rssi_sum as f64 / a.rssi_n as f64) } else { None },
-                "last_ns": a.last_ns,
-            })
+            Talker {
+                mac,
+                count: a.count,
+                rate_hz: if span > 0.0 {
+                    a.count as f64 / span
+                } else {
+                    0.0
+                },
+                rssi: if a.rssi_n > 0 {
+                    Some(a.rssi_sum as f64 / a.rssi_n as f64)
+                } else {
+                    None
+                },
+                last_ns: a.last_ns,
+            }
         })
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r["count"].as_u64().unwrap_or(0)));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.count));
     rows.truncate(12);
-    json!(rows)
+    rows
 }
 
 /// Control-channel frequency implied by the record, when the band is inferable.
@@ -658,13 +885,6 @@ fn talkers(window: &[Sample]) -> serde_json::Value {
 fn control_freq_mhz(rec: &CsiRecord) -> Option<f64> {
     let band = csid::caps::infer_band(rec.channel)?;
     csid::caps::channel_to_freq(band, rec.channel).map(|f| f as f64)
-}
-
-fn mac(m: &[u8; 6]) -> String {
-    m.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 #[cfg(test)]
@@ -729,7 +949,7 @@ mod tests {
             hub.push(sample(i, 242, 2));
         }
         let mut a = Analyzer::at_live_edge(&hub);
-        a.cursor = 0; // pretend the client has drawn nothing yet
+        a.client.cursor = 0; // pretend the client has drawn nothing yet
         let buf = a.frame(&hub, &ViewSettings::default()).unwrap();
         let h = header(&buf);
 
@@ -822,7 +1042,7 @@ mod tests {
             }
         }
         let mut a = Analyzer::at_live_edge(&hub);
-        a.cursor = 0;
+        a.client.cursor = 0;
 
         // Unpinned: follow the dominant class.
         let h = header(&a.frame(&hub, &ViewSettings::default()).unwrap());
@@ -884,7 +1104,7 @@ mod tests {
 
         // Scoped: native tone grid, one class only.
         let mut a = Analyzer::at_live_edge(&hub);
-        a.cursor = 0;
+        a.client.cursor = 0;
         let h = header(&a.frame(&hub, &ViewSettings::default()).unwrap());
         assert_eq!(h["waterfall"]["scope"], "class");
         assert_eq!(h["waterfall"]["bins"], 52);
@@ -894,7 +1114,7 @@ mod tests {
         // All classes: one fixed-width grid spanning the widest occupancy,
         // and every arrived record drawn rather than two thirds of them.
         let mut a = Analyzer::at_live_edge(&hub);
-        a.cursor = 0;
+        a.client.cursor = 0;
         let s = ViewSettings {
             wf_scope: "all".into(),
             wf_bins: 128,
@@ -923,11 +1143,12 @@ mod tests {
     fn the_shared_grid_places_rows_by_frequency() {
         // 8 tones at 312.5 kHz = 2.5 MHz, on a 10 MHz grid of 100 bins.
         let amp: Vec<f32> = vec![40.0; 8];
-        let row = onto_shared_grid(&amp, 312_500.0, 10e6, 100);
+        let mut row = Vec::new();
+        onto_shared_grid(&amp, 312_500.0, 10e6, 100, -999.0, &mut row);
         let occupied: Vec<usize> = row
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.is_finite())
+            .filter(|(_, v)| **v > -900.0)
             .map(|(i, _)| i)
             .collect();
         assert!(!occupied.is_empty());
@@ -937,8 +1158,8 @@ mod tests {
 
         // A row as wide as the grid fills it end to end.
         let wide: Vec<f32> = vec![40.0; 32];
-        let row = onto_shared_grid(&wide, 312_500.0, 10e6, 100);
-        assert!(row.iter().filter(|v| v.is_finite()).count() >= 95);
+        onto_shared_grid(&wide, 312_500.0, 10e6, 100, -999.0, &mut row);
+        assert!(row.iter().filter(|v| **v > -900.0).count() >= 95);
     }
 
     #[test]
@@ -994,12 +1215,252 @@ mod tests {
         assert_eq!(h["radio"]["freq_assumed"], false);
     }
 
+    /// The point of the split: one analysis, many clients, identical numbers.
+    /// Two views that differ only in frame rate must produce byte-identical
+    /// shared halves, and each client's own waterfall must still track its own
+    /// cursor.
+    #[test]
+    fn one_analysis_serves_many_clients() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..600 {
+            hub.push(sample(i, 242, 2));
+        }
+        let s = ViewSettings::default();
+        let mut analysis = Analysis::new();
+        let shared = analysis.compute(&hub, &s).unwrap();
+
+        // A client that has seen nothing draws rows; one at the live edge does
+        // not. Both read the same shared analysis.
+        let mut behind = ClientView::at_live_edge(&hub);
+        behind.cursor = 0;
+        let mut caught_up = ClientView::at_live_edge(&hub);
+
+        let a = header(behind.render(&hub, &shared));
+        let b = header(caught_up.render(&hub, &shared));
+
+        assert!(a["wf_rows"].as_u64().unwrap() > 0);
+        assert_eq!(b["wf_rows"], 0);
+        // Every windowed view is the same measurement for both.
+        for field in ["class", "geometry", "radio", "timing", "bundle", "doppler"] {
+            assert_eq!(a[field], b[field], "{field} must be shared verbatim");
+        }
+    }
+
+    /// Reusing every buffer across frames must not leak state from one frame
+    /// into the next: a second frame over an unchanged ring has to be
+    /// identical to the first, apart from the client's own cursor fields.
+    #[test]
+    fn repeated_frames_over_an_unchanged_ring_are_identical() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..600 {
+            hub.push(sample(i, 242, 2));
+        }
+        let s = ViewSettings::default();
+        let mut analysis = Analysis::new();
+
+        let first = analysis.compute(&hub, &s).unwrap();
+        let second = analysis.compute(&hub, &s).unwrap();
+        assert_eq!(
+            first.f32_bytes, second.f32_bytes,
+            "a reused scratch buffer must not change the numbers"
+        );
+
+        // `uptime_s` is the only field allowed to move, and only once a second.
+        let a: serde_json::Value =
+            serde_json::from_str(&format!("{{{}}}", first.header_body)).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(&format!("{{{}}}", second.header_body)).unwrap();
+        for field in [
+            "class",
+            "geometry",
+            "radio",
+            "record",
+            "phase_fit",
+            "bundle",
+            "cir",
+            "doppler",
+            "timing",
+            "clocks",
+            "series",
+            "validation",
+            "mix",
+            "talkers",
+            "f32",
+        ] {
+            assert_eq!(a[field], b[field], "{field} drifted between frames");
+        }
+    }
+
+    /// Switching the pinned class and switching back must land exactly where
+    /// it started — the class-scoped buffers are reused across both.
+    #[test]
+    fn switching_class_does_not_contaminate_the_previous_one() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..600 {
+            if i % 6 == 0 {
+                hub.push(classed(i, 56, csiq::Modulation::Ht));
+            } else {
+                hub.push(classed(i, 52, csiq::Modulation::LegacyOfdm));
+            }
+        }
+        let mut analysis = Analysis::new();
+        let legacy = ViewSettings::default();
+        let ht = ViewSettings {
+            class: Some("56:ht".into()),
+            ..Default::default()
+        };
+
+        let a = analysis.compute(&hub, &legacy).unwrap();
+        let _ = analysis.compute(&hub, &ht).unwrap();
+        let c = analysis.compute(&hub, &legacy).unwrap();
+        assert_eq!(a.f32_bytes, c.f32_bytes);
+        assert_eq!(a.header_body, c.header_body);
+    }
+
+    /// The header is a contract with `ui/app.js`, and the browser reads it by
+    /// path with no schema in between — a renamed or dropped field shows up as
+    /// `undefined` in a readout rather than as an error anybody notices.
+    ///
+    /// This is the list of every path the shipped console dereferences. It was
+    /// extracted from `app.js`/`plot.js`; if a panel starts reading something
+    /// new, it belongs here too.
+    #[test]
+    fn the_header_carries_every_field_the_console_reads() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..600 {
+            hub.push(sample(i, 242, 2));
+        }
+        let mut a = Analyzer::at_live_edge(&hub);
+        a.client.cursor = 0;
+        let h = header(&a.frame(&hub, &ViewSettings::default()).unwrap());
+
+        for path in [
+            "t",
+            "cursor",
+            "skipped",
+            "other_class",
+            "wf_rows",
+            "n_f32",
+            "n_u8",
+            "waterfall.scope",
+            "waterfall.bins",
+            "waterfall.span_mhz",
+            "class.key",
+            "class.label",
+            "class.pinned",
+            "class.share",
+            "class.count",
+            "geometry.ntone",
+            "geometry.nrx",
+            "geometry.ntx",
+            "geometry.nchain",
+            "geometry.chain",
+            "geometry.chain_labels",
+            "geometry.dimensions_ok",
+            "radio.channel",
+            "radio.width",
+            "radio.freq_mhz",
+            "radio.freq_assumed",
+            "radio.spacing_hz",
+            "radio.bw_mhz",
+            "record.session_uid",
+            "record.rssi",
+            "record.src_mac",
+            "record.phy.mcs",
+            "record.phy.nss",
+            "record.phy.modulation",
+            "phase_fit.tau_ns",
+            "phase_fit.slope_rad_per_tone",
+            "bundle.n",
+            "bundle.width_db",
+            "cir.bin_ns",
+            "cir.peak_bin",
+            "cir.rms_delay_ns",
+            "doppler.nfft",
+            "doppler.fs_hz",
+            "doppler.max_hz",
+            "doppler.max_speed_ms",
+            "doppler.arrival_cv",
+            "doppler.conjugate_pair",
+            "timing.ftm.rate_hz",
+            "timing.host.p50_us",
+            "timing.host.p999_us",
+            "timing.hist_max_us",
+            "clocks.ftm_span_us",
+            "clocks.host_span_us",
+            "clocks.fw_span_us",
+            "series.len",
+            "series.tones",
+            "series.rssi_chains",
+            "validation.dimensions_ok",
+            "validation.dc_notch_db",
+            "validation.edge_rolloff_db",
+            "validation.chain_spread_db",
+            "validation.zero_fraction",
+            "mix.modulation",
+            "mix.ntone",
+            "mix.nss",
+            "mix.mcs",
+            "mix.width",
+            "stream.source",
+            "stream.received",
+            "stream.sender_gaps",
+            "stream.decode_errors",
+            "stream.session_changes",
+            "stream.bytes",
+            "stream.depth",
+            "stream.window",
+            "stream.window_all",
+            "stream.uptime_s",
+            "stream.total",
+        ] {
+            let mut node = &h;
+            for part in path.split('.') {
+                node = &node[part];
+                assert!(
+                    !node.is_null(),
+                    "the console reads `h.{path}`, and the header does not carry it"
+                );
+            }
+        }
+
+        // `chain_identical` is legitimately null on a single-chain record, so
+        // it is checked for presence rather than for a value.
+        assert!(h["validation"].as_object().unwrap().contains_key("chain_identical"));
+
+        // The two arrays the console iterates as tables.
+        let avail = h["class"]["available"].as_array().expect("class.available");
+        for e in avail {
+            for k in ["key", "label", "count", "share"] {
+                assert!(!e[k].is_null(), "class.available[].{k}");
+            }
+        }
+        let talkers = h["talkers"].as_array().expect("talkers");
+        assert!(!talkers.is_empty());
+        for t in talkers {
+            for k in ["mac", "count", "rate_hz"] {
+                assert!(!t[k].is_null(), "talkers[].{k}");
+            }
+            assert!(t.as_object().unwrap().contains_key("rssi"));
+        }
+    }
+
     #[test]
     fn decimation_keeps_the_newest_sample() {
-        let items: Vec<Sample> = (0..1000).map(|i| sample(i, 52, 1)).collect();
-        let d = decimate(&items, 10);
-        assert_eq!(d.len(), 10);
-        assert_eq!(d[0].seq, 0);
-        assert!(d.windows(2).all(|w| w[0].seq < w[1].seq));
+        // The bundle's decimation is now an index walk inside `compute`; this
+        // pins the property it has to keep — the newest record is always in.
+        let n = 1000usize;
+        let cols = BUNDLE_COLUMNS;
+        let step = n as f64 / cols as f64;
+        let picks: Vec<usize> = (0..cols)
+            .map(|i| ((i as f64 * step) as usize).min(n - 1))
+            .collect();
+        assert_eq!(picks.len(), cols);
+        assert_eq!(picks[0], 0);
+        assert!(picks.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            n - 1 - picks[cols - 1] < step.ceil() as usize,
+            "the newest record must be within one decimation step"
+        );
     }
 }

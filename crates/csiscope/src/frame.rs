@@ -16,11 +16,27 @@
 //!
 //! Adding a field is backwards compatible in both directions: an old client
 //! ignores an unknown array, and a new client checks for absence.
-
-use std::collections::HashMap;
+//!
+//! ## The f32 section is shared, the u8 section is not
+//!
+//! Every `f32` array in a frame — spectra, phase, bundle, impulse response,
+//! Doppler, time series — is a function of the window and the view settings
+//! alone. The one `u8` array is the waterfall, which is a function of *this
+//! client's cursor*. So the f32 section is built once per tick per distinct
+//! view and memcpy'd into every client's frame, and only the waterfall is
+//! drawn per client.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+
+use crate::class::ClassKey;
+use crate::wire::{ArrayMap, ClientHeader};
+
+// The f32 section is written by casting the buffer, which assumes the wire's
+// declared little-endian layout is the host's. Every target this runs on is
+// little-endian; saying so here means a port fails to build rather than
+// silently serving byte-swapped spectra.
+#[cfg(target_endian = "big")]
+compile_error!("the csiscope frame format is little-endian; this target is not");
 
 /// What the client wants to see. Sent as JSON on the same socket; every field
 /// is optional so a client can PATCH one knob.
@@ -138,60 +154,155 @@ impl ViewSettings {
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f32(1.0 / self.fps.max(1.0))
     }
+
+    /// The pinned class, if the client sent one this build understands.
+    ///
+    /// An unparseable class is treated as unpinned rather than as an error:
+    /// the console's job is to keep showing the channel, and falling back to
+    /// the dominant class is what it does when a pinned one leaves the air.
+    pub fn class_key(&self) -> Option<ClassKey> {
+        self.class.as_deref().and_then(|s| s.parse().ok())
+    }
+
+    /// The subset of settings the shared analysis depends on.
+    ///
+    /// Two clients whose views agree here get the same numbers, so they can
+    /// share one analysis. `fps` and `paused` are deliberately absent: they
+    /// govern *when* a client is served, not *what* it is served.
+    pub fn view_key(&self) -> ViewKey {
+        ViewKey {
+            chain: self.chain,
+            chain_b: self.chain_b,
+            window: self.window,
+            cir_nfft: self.cir_nfft,
+            cir_taps: self.cir_taps,
+            doppler_nfft: self.doppler_nfft,
+            db_min: self.db_min.to_bits(),
+            db_max: self.db_max.to_bits(),
+            series_tones: self.series_tones.clone(),
+            class: self.class.clone(),
+            wf_scope: self.wf_scope.clone(),
+            wf_bins: self.wf_bins,
+            freq_mhz: self.freq_mhz.map(f64::to_bits),
+        }
+    }
 }
 
-/// Accumulates named typed arrays and emits the binary frame.
-#[derive(Default)]
-pub struct Encoder {
-    f32s: Vec<f32>,
-    u8s: Vec<u8>,
-    map32: HashMap<String, [usize; 2]>,
-    map8: HashMap<String, [usize; 2]>,
+/// Identity of a shared analysis. See [`ViewSettings::view_key`].
+///
+/// The float fields are compared by bit pattern: these are knob positions
+/// echoed back from the browser, not measurements, so "the same slider value"
+/// is exactly bitwise equality and `NaN` never needs to compare equal to
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ViewKey {
+    pub chain: usize,
+    pub chain_b: Option<usize>,
+    pub window: usize,
+    pub cir_nfft: usize,
+    pub cir_taps: usize,
+    pub doppler_nfft: usize,
+    pub db_min: u32,
+    pub db_max: u32,
+    pub series_tones: Vec<usize>,
+    pub class: Option<String>,
+    pub wf_scope: String,
+    pub wf_bins: usize,
+    pub freq_mhz: Option<u64>,
 }
 
-impl Encoder {
-    pub fn new() -> Self {
-        Self::default()
+/// What a client needs in order to draw waterfall rows that line up with the
+/// shared analysis around them.
+#[derive(Debug, Clone, Default)]
+pub struct WaterfallPlan {
+    /// `true` when rows of every class share one frequency axis.
+    pub all_scope: bool,
+    pub bins: usize,
+    pub span_hz: f64,
+    /// The class every other view is scoped to.
+    pub class: ClassKey,
+    /// Tone count of that class, i.e. the row width in `class` scope.
+    pub ntone: usize,
+    pub chain: usize,
+    pub db_min: f32,
+    pub db_max: f32,
+    /// Row budget per frame.
+    pub rows: usize,
+}
+
+/// One tick's shared analysis, ready to be spliced into any number of frames.
+#[derive(Debug, Clone, Default)]
+pub struct SharedFrame {
+    /// The shared header fields, serialised as a JSON object body without its
+    /// enclosing braces.
+    pub header_body: String,
+    /// The f32 section, already in wire order.
+    pub f32_bytes: Vec<u8>,
+    pub n_f32: usize,
+    pub plan: WaterfallPlan,
+}
+
+/// Accumulates the named `f32` arrays of one frame.
+///
+/// Values land in a single contiguous buffer as they are produced, and the
+/// buffer is cast to bytes once. The previous encoder appended each value with
+/// `to_le_bytes`, four bytes at a time, over arrays that reach a quarter of a
+/// million elements at 996 tones.
+#[derive(Default, Debug)]
+pub struct F32Section {
+    data: Vec<f32>,
+    map: ArrayMap,
+}
+
+impl F32Section {
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.map.clear();
     }
 
     /// Append an `f32` array under `name`.
-    pub fn f32s(&mut self, name: &str, data: &[f32]) {
-        self.map32
-            .insert(name.to_string(), [self.f32s.len(), data.len()]);
-        self.f32s.extend_from_slice(data);
+    pub fn push(&mut self, name: &'static str, data: &[f32]) {
+        self.map.push(name, self.data.len(), data.len());
+        self.data.extend_from_slice(data);
     }
 
-    /// Append a `u8` array under `name`.
-    pub fn u8s(&mut self, name: &str, data: &[u8]) {
-        self.map8
-            .insert(name.to_string(), [self.u8s.len(), data.len()]);
-        self.u8s.extend_from_slice(data);
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 
-    /// Serialise. `meta` is merged into the header object.
-    pub fn finish(self, mut meta: Value) -> Vec<u8> {
-        if let Some(obj) = meta.as_object_mut() {
-            obj.insert("f32".into(), json!(self.map32));
-            obj.insert("u8".into(), json!(self.map8));
-            obj.insert("n_f32".into(), json!(self.f32s.len()));
-            obj.insert("n_u8".into(), json!(self.u8s.len()));
-        }
-        let mut header = serde_json::to_vec(&meta).unwrap_or_else(|_| b"{}".to_vec());
-        // Pad so the f32 section is 4-byte aligned for the browser's typed-array
-        // view. JSON tolerates trailing whitespace, so spaces are free padding.
-        while (4 + header.len()) % 4 != 0 {
-            header.push(b' ');
-        }
-
-        let mut out = Vec::with_capacity(4 + header.len() + self.f32s.len() * 4 + self.u8s.len());
-        out.extend_from_slice(&(header.len() as u32).to_le_bytes());
-        out.extend_from_slice(&header);
-        for v in &self.f32s {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&self.u8s);
-        out
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
+
+    pub fn map(&self) -> &ArrayMap {
+        &self.map
+    }
+
+    /// The section as wire bytes.
+    pub fn bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.data)
+    }
+}
+
+/// Assemble one client's frame.
+///
+/// `u8s` is that client's waterfall; everything else comes from the shared
+/// analysis and is copied, not recomputed.
+pub fn encode(client: &ClientHeader, shared: &SharedFrame, u8s: &[u8], out: &mut Vec<u8>) {
+    let mut header = Vec::new();
+    crate::wire::header_bytes(client, &shared.header_body, &mut header);
+    // Pad so the f32 section is 4-byte aligned for the browser's typed-array
+    // view. JSON tolerates trailing whitespace, so spaces are free padding.
+    while (4 + header.len()) % 4 != 0 {
+        header.push(b' ');
+    }
+
+    out.clear();
+    out.reserve(4 + header.len() + shared.f32_bytes.len() + u8s.len());
+    out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&shared.f32_bytes);
+    out.extend_from_slice(u8s);
 }
 
 /// Quantise dB values into the `[db_min, db_max]` byte range used by the
@@ -199,8 +310,9 @@ impl Encoder {
 /// channel stays legible instead of aliasing into the dark end of the colormap.
 pub fn quantise_db(values: &[f32], db_min: f32, db_max: f32, out: &mut Vec<u8>) {
     let span = (db_max - db_min).max(1e-6);
+    let scale = 255.0 / span;
     out.extend(values.iter().map(|&v| {
-        let n = ((v - db_min) / span * 255.0).round();
+        let n = ((v - db_min) * scale).round();
         n.clamp(0.0, 255.0) as u8
     }));
 }
@@ -208,12 +320,13 @@ pub fn quantise_db(values: &[f32], db_min: f32, db_max: f32, out: &mut Vec<u8>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::SharedHeader;
 
     /// Mirrors what the browser does, so the layout contract is tested rather
     /// than asserted in a comment.
-    fn decode(buf: &[u8]) -> (Value, Vec<f32>, Vec<u8>) {
+    fn decode(buf: &[u8]) -> (serde_json::Value, Vec<f32>, Vec<u8>) {
         let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-        let header: Value = serde_json::from_slice(&buf[4..4 + hlen]).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&buf[4..4 + hlen]).unwrap();
         let f32_start = 4 + hlen;
         assert_eq!(f32_start % 4, 0, "f32 section must be 4-byte aligned");
         let n32 = header["n_f32"].as_u64().unwrap() as usize;
@@ -227,19 +340,44 @@ mod tests {
         (header, f, u)
     }
 
+    fn shared_with(section: &F32Section) -> SharedFrame {
+        let mut h = SharedHeader {
+            n_f32: section.len(),
+            f32: section.map().clone(),
+            ..Default::default()
+        };
+        h.stream.source = "test".into();
+        SharedFrame {
+            header_body: crate::wire::shared_body(&h),
+            f32_bytes: section.bytes().to_vec(),
+            n_f32: section.len(),
+            plan: WaterfallPlan::default(),
+        }
+    }
+
     #[test]
     fn frame_roundtrips_through_the_documented_layout() {
-        let mut e = Encoder::new();
-        e.f32s("amp_db", &[1.0, 2.0, 3.0]);
-        e.f32s("phase", &[-0.5, 0.5]);
-        e.u8s("wf", &[10, 20, 30, 40]);
-        let buf = e.finish(json!({"t": "frame", "cursor": 42}));
+        let mut section = F32Section::default();
+        section.push("amp_db", &[1.0, 2.0, 3.0]);
+        section.push("phase", &[-0.5, 0.5]);
+        let shared = shared_with(&section);
+
+        let mut client = ClientHeader {
+            t: "frame",
+            cursor: 42,
+            n_u8: 4,
+            ..Default::default()
+        };
+        client.u8.push("wf", 0, 4);
+
+        let mut buf = Vec::new();
+        encode(&client, &shared, &[10, 20, 30, 40], &mut buf);
 
         let (header, f, u) = decode(&buf);
         assert_eq!(header["cursor"], 42);
-        assert_eq!(header["f32"]["amp_db"], json!([0, 3]));
-        assert_eq!(header["f32"]["phase"], json!([3, 2]));
-        assert_eq!(header["u8"]["wf"], json!([0, 4]));
+        assert_eq!(header["f32"]["amp_db"], serde_json::json!([0, 3]));
+        assert_eq!(header["f32"]["phase"], serde_json::json!([3, 2]));
+        assert_eq!(header["u8"]["wf"], serde_json::json!([0, 4]));
         assert_eq!(f, vec![1.0, 2.0, 3.0, -0.5, 0.5]);
         assert_eq!(u, vec![10, 20, 30, 40]);
     }
@@ -249,14 +387,46 @@ mod tests {
         // Sweep header lengths by varying a string field, and check alignment
         // holds for all four residues.
         for pad in 0..8 {
-            let mut e = Encoder::new();
-            e.f32s("x", &[1.0]);
-            let buf = e.finish(json!({"note": "x".repeat(pad)}));
+            let mut section = F32Section::default();
+            section.push("x", &[1.0]);
+            let mut h = SharedHeader {
+                n_f32: section.len(),
+                f32: section.map().clone(),
+                ..Default::default()
+            };
+            h.stream.source = "x".repeat(pad);
+            let shared = SharedFrame {
+                header_body: crate::wire::shared_body(&h),
+                f32_bytes: section.bytes().to_vec(),
+                n_f32: section.len(),
+                plan: WaterfallPlan::default(),
+            };
+            let mut buf = Vec::new();
+            encode(
+                &ClientHeader {
+                    t: "frame",
+                    ..Default::default()
+                },
+                &shared,
+                &[],
+                &mut buf,
+            );
             let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
             assert_eq!((4 + hlen) % 4, 0, "pad {pad}");
             let (_, f, _) = decode(&buf);
             assert_eq!(f, vec![1.0]);
         }
+    }
+
+    /// The f32 section is memcpy'd rather than encoded element by element;
+    /// the byte order must still be exactly what the old encoder wrote.
+    #[test]
+    fn the_cast_section_matches_element_wise_encoding() {
+        let values: Vec<f32> = (0..64).map(|i| i as f32 * -3.25 + 0.5).collect();
+        let mut section = F32Section::default();
+        section.push("v", &values);
+        let expect: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(section.bytes(), &expect[..]);
     }
 
     #[test]
@@ -290,5 +460,47 @@ mod tests {
         assert!(s.db_max > s.db_min);
         assert_eq!(s.chain_b, None, "a chain cannot pair with itself");
         assert_eq!(s.series_tones.len(), 8);
+    }
+
+    /// Two clients differing only in frame rate must share one analysis;
+    /// anything that changes the numbers must not.
+    #[test]
+    fn the_view_key_separates_presentation_from_measurement() {
+        let base = ViewSettings::default();
+        let faster = ViewSettings {
+            fps: 5.0,
+            paused: true,
+            ..base.clone()
+        };
+        assert_eq!(base.view_key(), faster.view_key());
+
+        for different in [
+            ViewSettings {
+                chain: 1,
+                ..base.clone()
+            },
+            ViewSettings {
+                window: 512,
+                ..base.clone()
+            },
+            ViewSettings {
+                db_max: 61.0,
+                ..base.clone()
+            },
+            ViewSettings {
+                class: Some("56:ht".into()),
+                ..base.clone()
+            },
+            ViewSettings {
+                wf_scope: "all".into(),
+                ..base.clone()
+            },
+            ViewSettings {
+                series_tones: vec![3],
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(base.view_key(), different.view_key());
+        }
     }
 }
