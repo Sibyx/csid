@@ -257,7 +257,13 @@ impl DeviceHasher {
     /// made that false everywhere but Linux.
     pub fn new_random(bytes: usize) -> Result<Self> {
         let mut salt = [0u8; 32];
-        getrandom::fill(&mut salt).context("drawing the BLE salt from the OS CSPRNG")?;
+        // `map_err` rather than `.context()`: `getrandom::Error` only implements
+        // `std::error::Error` when getrandom's `std` feature is on, and whether
+        // it is depends on which packages the invocation selected. A workspace
+        // build unified it on and a `-p csid` build did not, so `.context()`
+        // compiled on the bench and failed on the Pi. `Display` is unconditional.
+        getrandom::fill(&mut salt)
+            .map_err(|e| anyhow::anyhow!("drawing the BLE salt from the OS CSPRNG: {e}"))?;
         Ok(DeviceHasher {
             salt,
             bytes: bytes.clamp(4, 32),
