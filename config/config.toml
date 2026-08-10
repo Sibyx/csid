@@ -25,3 +25,35 @@ vendor_oui       = 0x001735   # INTEL_OUI
 csi_event_subcmd = 0x24       # IWL_MVM_VENDOR_CMD_CSI_EVENT
 attr_csi_hdr     = 0x4d       # IWL_MVM_VENDOR_ATTR_CSI_HDR
 attr_csi_data    = 0x4e       # IWL_MVM_VENDOR_ATTR_CSI_DATA
+
+# ── The bench cockpit (csid fleet …) ────────────────────────────────────────
+# Only the machine you DRIVE the session from needs this; on a capture node the
+# section is inert. On a laptop with no /etc/csid, put the same block in
+# ~/.config/csid/config.toml — `csid fleet` looks there too.
+#
+#   csid fleet status                      # the one screen: is this session good?
+#   csid fleet clock                       # is the fleet one timebase, or ten clocks?
+#   csid fleet gate g1                     # delivered rate, on the registered CI bound
+#   csid fleet start lab-anchor            # and CONFIRM every node started
+#   csid fleet marker --block-id … --zone … --kind … --phase start
+#   csid fleet runbook day0                # the documented bring-up, in order
+#
+# [fleet]
+# nodes             = ["monad01", "monad02", "monad03"]
+# user              = "monad"        # the fleet image's login user
+# remote_csid       = "csid"         # path to csid on the nodes
+# sudo              = "sudo -n"      # prefix for privileged verbs; "" if not needed
+# connect_timeout_s = 5
+# command_timeout_s = 30             # hard per-node deadline; a hung node never
+#                                    # blocks the sweep, it reports UNKNOWN
+# clock_budget_ms   = 250            # gate G4b: half the ±0.5 s T3-CHANGE band
+# disk_min_free_gb  = 5.0
+#
+# # A node not yet enrolled in the tailnet, addressed by its bootstrap name.
+# [fleet.addresses]
+# monad04 = "monad.local"
+#
+# # For `csid fleet gate g3`, the Day-0 5 GHz iax AP stability probe.
+# # ap_node      = "monad01"
+# # ap_unit      = "hostapd"
+# # ap_interface = "wlan1"

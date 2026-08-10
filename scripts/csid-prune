@@ -2,7 +2,9 @@
 # Delete raw captures that have been verifiably shipped and have aged past the
 # grace window.
 #
-# What is deleted: `capture.raw` only.
+# What is deleted: `capture.raw` and `ble_scan.jsonl` — the two durable
+# intermediates. Their derived, self-describing forms (`capture.csiq`,
+# `ble_rssi.parquet`) are already in object storage by the time this runs.
 # What is kept forever: `metadata.json` and `.synced` — together they form a
 # greppable on-node index of every session the node ever ran.
 set -euo pipefail
@@ -16,10 +18,8 @@ freed=0
 pruned=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
-    raw="$dir/capture.raw"
     marker="$dir/.synced"
 
-    [[ -f "$raw" ]] || continue
     # Never prune what was never confirmed shipped.
     [[ -f "$marker" ]] || continue
 
@@ -28,11 +28,15 @@ for dir in "$SPOOL"/*/; do
         continue
     fi
 
-    size=$(wc -c < "$raw" 2>/dev/null || echo 0)
-    rm -f "$raw"
-    freed=$((freed + size))
-    pruned=$((pruned + 1))
-    echo "csid-prune: removed $(basename "$dir")/capture.raw"
+    for name in capture.raw ble_scan.jsonl; do
+        intermediate="$dir/$name"
+        [[ -f "$intermediate" ]] || continue
+        size=$(wc -c < "$intermediate" 2>/dev/null || echo 0)
+        rm -f "$intermediate"
+        freed=$((freed + size))
+        pruned=$((pruned + 1))
+        echo "csid-prune: removed $(basename "$dir")/$name"
+    done
 done
 
-echo "csid-prune: pruned $pruned capture(s), freed $((freed / 1024 / 1024)) MiB"
+echo "csid-prune: pruned $pruned intermediate(s), freed $((freed / 1024 / 1024)) MiB"

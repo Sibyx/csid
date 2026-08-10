@@ -100,11 +100,57 @@ pub fn validate(experiment: &str, experiment_dir: &Path, probe: bool) -> Result<
         }
     );
     println!("csiq on close : {}", cfg.export.on_close);
+    println!(
+        "ble co-capture: {}",
+        if cfg.ble.enabled {
+            let (i, w) = cfg.ble.hci_units();
+            format!(
+                "{} passive {:.0}/{:.0} ms ({i}/{w} units){} -> {}",
+                cfg.ble.adapter,
+                cfg.ble.scan_interval_ms,
+                cfg.ble.scan_window_ms,
+                if cfg.ble.required { ", REQUIRED" } else { "" },
+                crate::ble::PARQUET_NAME,
+            )
+        } else {
+            "disabled".into()
+        }
+    );
+    println!(
+        "time transfer : {}",
+        if cfg.timesync.enabled {
+            format!(
+                "on {}{} -> {} (ftm window {} µs, one-way floor {} µs)",
+                cfg.radio.monitor,
+                if cfg.timesync.required {
+                    ", REQUIRED"
+                } else {
+                    ""
+                },
+                crate::timesync::PARQUET_NAME,
+                cfg.timesync.ftm_tolerance_us,
+                cfg.timesync.one_way_floor_us,
+            )
+        } else {
+            "disabled — `csid fleet skew` will have nothing to difference".into()
+        }
+    );
 
     if probe {
         println!("\n-- hardware probe --");
         if !radio::interface_exists(&cfg.radio.interface) {
             anyhow::bail!("interface {} does not exist", cfg.radio.interface);
+        }
+        if cfg.ble.enabled {
+            let p = crate::hci::probe(&cfg.ble.adapter);
+            println!("BLE adapter   : {} — {}", p.adapter, p.detail);
+            if cfg.ble.required && !p.usable {
+                anyhow::bail!(
+                    "ble.required = true but {} is not usable: {}",
+                    p.adapter,
+                    p.detail
+                );
+            }
         }
         println!("interface     : present");
         let knobs = debugfs::Knobs::for_interface(&cfg.radio.interface)?;
@@ -225,6 +271,18 @@ pub fn doctor(global: &GlobalConfig, interface: &str) -> Result<()> {
             Err(e) => check("debugfs CSI knobs", false, e.to_string()),
         }
     }
+
+    // BLE co-capture readiness. Informational, never a failure: most sessions
+    // do not use it, and the ones that do declare `ble.required` themselves.
+    // A node that reports `usable` here will produce ble_rssi.parquet; one that
+    // does not will produce a session with an honest `ble.status = failed`.
+    let ble = crate::hci::probe("hci0");
+    println!(
+        "[{}] BLE adapter: {} — {}",
+        if ble.usable { "ok" } else { "info" },
+        ble.adapter,
+        ble.detail
+    );
 
     // Regulatory + performance context.
     check(

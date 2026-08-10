@@ -51,6 +51,23 @@ Two layers, on purpose:
 Both are readable from Rust and Python. CSIQ is *derived* — you can always
 re-export from the raw capture.
 
+A session with `[ble].enabled` adds the same two layers for the BLE channel —
+`ble_scan.jsonl` (durable, append-only) and `ble_rssi.parquet` (the interchange
+form the analysis side reads). Both are stamped with the *same* wallclock the
+CSI records carry, which is the reason the scanner lives in this daemon at all.
+See [configuration.md](docs/configuration.md#ble--ble-co-capture) for the column
+contract and the pseudonymisation scheme.
+
+A session with `[timesync].enabled` adds the same two layers again for **time
+transfer** — `time_transfer.jsonl` and `time_transfer.parquet`. Both of this
+lab's transmitters already stamp their transmit time inside the payload (the
+injector's `CSID | seq | tx_unix_ns`, the phone's MNDP header); recording those
+beside each node's own receive stamp turns illumination into a time-transfer
+channel. `csid fleet skew` then measures **inter-node clock skew to
+microseconds** — one frame, many receivers, so the transmit instant cancels
+exactly and nothing is bounded by the round-trip time that bounds
+`csid fleet clock`. See [time-transfer.md](docs/time-transfer.md).
+
 ## Records carry three clocks
 
 | Field | Source | Resolution | Use for |
@@ -168,6 +185,7 @@ Full walkthrough: [deployment.md](docs/deployment.md).
 | [configuration.md](docs/configuration.md) | Complete TOML reference |
 | [deployment.md](docs/deployment.md) | Install, systemd, bring-up, fleet notes |
 | [dashboard.md](docs/dashboard.md) | The live console: views, record classes, security |
+| [time-transfer.md](docs/time-transfer.md) | Inter-node skew + the phone affine fit from the illumination stream |
 
 ## Layout
 

@@ -35,7 +35,20 @@ to surround the data with enough provenance to stay interpretable.
           try_send, drop-newest                     /run/csid/live.sock
 
 [main thread]  sd_notify READY/WATCHDOG/STOPPING · duration bound · stop flag
+
+Siblings, never dependencies — each owns its socket, its thread and its file,
+and shares ONLY the stop flag with the RX path above:
+
+[inject thread]    AF_PACKET tx   paced illumination        (capture.mode = "inject")
+[ble scan thread]  HCI raw   rx   ble_scan.jsonl            ([ble].enabled)
+[timesync thread]  AF_PACKET rx   time_transfer.jsonl       ([timesync].enabled)
 ```
+
+None of the three can apply backpressure to the RX thread — they hold no channel
+into it. `[timesync]` in particular reads the transmit stamps in received frame
+payloads on a **separate** `AF_PACKET` socket rather than tapping the CSI stream,
+and its `ftm` column is filled at session close inside the `capture.raw` pass the
+summary already makes. See [time-transfer.md](time-transfer.md).
 
 ### The invariant
 

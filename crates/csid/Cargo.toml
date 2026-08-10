@@ -26,6 +26,13 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 humantime-serde = "1"
 libc = "0.2"
+# BLE co-capture (IP-106 R5). `parquet` is taken without default features: the
+# low-level column writer is all `ble_rssi.parquet` needs, and the `arrow`
+# feature would drag a columnar runtime onto a capture node for nothing.
+parquet = { version = "59", default-features = false, features = ["snap"] }
+# Per-session device pseudonyms. A cryptographic hash is not something to
+# hand-roll, even in a crate that hand-rolls its own calendar arithmetic.
+sha2 = "0.10"
 
 # Linux-only machinery: raw netlink (via libc), realtime scheduling / CPU
 # affinity (nix), and journald log export. Not built on other platforms, so the

@@ -27,6 +27,13 @@ src_mac      = "ef:be:ad:de:ad:de"   # the fleet's analysis sentinel
 dst_mac      = "ff:ff:ff:ff:ff:ff"   # broadcast: unACKed, loss stays visible
 bitrate_mbps = 6                     # legacy OFDM => 52-tone class on both bands
 
+# Record the injector's own payload stamps so `csid fleet skew` has something to
+# difference. NOT `required` here: this arm is a per-link measurement that still
+# means something on one node, unlike the pooled lab-anchor arm.
+[timesync]
+enabled  = true
+required = false
+
 [stream]
 enabled     = true
 transport   = "unix"

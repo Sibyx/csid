@@ -84,7 +84,12 @@ fn read_sidecar(path: &Path) -> Option<Value> {
 }
 
 /// Recover the monitor width recorded in a sidecar.
-fn width_from_sidecar(v: &Value) -> Option<csiq::Width> {
+/// Monitor width as recorded in a session sidecar.
+///
+/// Public because the time-transfer recovery export (`csid timesync export`)
+/// walks the same `capture.raw` and must read it the same way — a second copy
+/// of this table is a second thing to forget when a width is added.
+pub fn width_from_sidecar(v: &Value) -> Option<csiq::Width> {
     let w = v.get("radio")?.get("width")?.as_str()?;
     Some(match w {
         "NOHT" => csiq::Width::Noht,

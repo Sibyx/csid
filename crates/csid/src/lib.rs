@@ -20,24 +20,41 @@
 //! | [`debugfs`] | Linux | The `iwlmvm` CSI knobs |
 //! | [`source`] | Linux | nl80211 vendor-event netlink consumption |
 //! | [`inject`] | Linux (AF_PACKET) | Paced monitor-mode frame injection (`capture.mode = "inject"`) |
+//! | [`ble`] | any | BLE co-capture: pseudonymisation, the durable log, `ble_rssi.parquet` |
+//! | [`hci`] | Linux (AF_BLUETOOTH) | The passive LE scan that feeds [`ble`] |
+//! | [`timesync`] | any (rx: Linux AF_PACKET) | Time transfer over the illumination stream: payload stamps, inter-node skew, the phone affine fit, `time_transfer.parquet` |
 //! | [`engine`], [`sinks`], [`notify`] | Linux | Session orchestration, the two sinks, `sd_notify` |
 //! | [`thermal`] | Linux (Pi) | Die temperature and the firmware throttle word — what qualifies a node for a long run |
+//! | [`marker`] | any | Block markers stamped in native `unix_ts_ns` — the boundary reference |
+//! | [`fleet`] | any | The bench cockpit: fan-out status, the pre-registered gates, session lifecycle, clock coherence |
+//!
+//! The last two rows are the operator's half of the system rather than the
+//! daemon's. `csid` on a capture node writes captures; the same binary on the
+//! bench laptop drives ten of them ([`fleet`]) over the fleet's existing ssh
+//! control channel. One binary, because a second tool would need its own copy
+//! of the gate arithmetic and the two would drift — the same argument that put
+//! [`caps::validate_radio`] in this library for `csiscope`.
 //!
 //! [`csiscope`]: https://github.com/Sibyx/csid/tree/master/crates/csiscope
 
+pub mod ble;
 pub mod caps;
 pub mod commands;
 pub mod config;
 pub mod debugfs;
 pub mod engine;
 pub mod export;
+pub mod fleet;
+pub mod hci;
 pub mod inject;
+pub mod marker;
 pub mod notify;
 pub mod radio;
 pub mod sidecar;
 pub mod sinks;
 pub mod source;
 pub mod thermal;
+pub mod timesync;
 pub mod util;
 
 /// The `csid` version string, so consumers report the same one the daemon does.

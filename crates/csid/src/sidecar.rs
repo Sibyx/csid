@@ -72,6 +72,12 @@ pub struct SummaryMeta {
     /// Injector totals — present only for `capture.mode = "inject"` sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<InjectSummary>,
+    /// BLE co-capture health — present only when `[ble].enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ble: Option<BleSummary>,
+    /// Time-transfer health — present only when `[timesync].enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timesync: Option<TimesyncSummary>,
 }
 
 /// What the injector actually did, for delivery-ratio analysis downstream
@@ -94,6 +100,104 @@ pub struct InjectMeta {
     pub bitrate_mbps: u32,
 }
 
+/// BLE co-capture configuration as applied, plus the pseudonymisation scheme
+/// the analysis side has to understand to interpret `device_hash`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BleMeta {
+    pub adapter: String,
+    /// Always `"passive"` — see [`crate::hci`] for why there is no other option.
+    pub scan_type: String,
+    pub scan_interval_ms: f64,
+    pub scan_window_ms: f64,
+    /// `false`: a BLE failure degrades the session, it does not fail it.
+    pub required: bool,
+    /// Artefact names, so the sidecar alone tells a reader what to open.
+    pub artefact: String,
+    pub durable_log: String,
+    pub parquet_schema: String,
+    /// How `device_hash` was derived. The salt itself is deliberately absent —
+    /// it never leaves the capturing process's memory, which is what makes the
+    /// pseudonyms unlinkable across sessions.
+    pub hash_algorithm: String,
+    pub hash_bytes: usize,
+    pub salt_bits: usize,
+    pub salt_persisted: bool,
+}
+
+/// BLE co-capture outcome. Every field exists so that a *silently* degraded
+/// scanner is as visible as an absent one — the readiness audit's R3 lesson.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BleSummary {
+    /// `ok` · `degraded` (ran, but restarted or went quiet) · `failed` (never
+    /// produced an observation) · `disabled`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub observations: u64,
+    /// Distinct pseudonyms. An **upper bound** on devices: rotating private
+    /// addresses split one device across several. Use `addr_kind` in the
+    /// parquet to bound the stable-identity population.
+    pub distinct_device_hashes: u64,
+    pub mean_rate_hz: f64,
+    pub max_gap_s: f64,
+    pub gaps_over_alert: u64,
+    pub gap_alert_s: f64,
+    pub scan_restarts: u64,
+    pub adapter_errors: u64,
+    pub unparsed_events: u64,
+    pub rssi_unavailable: u64,
+    pub parquet_rows: u64,
+    pub malformed_log_lines: u64,
+}
+
+/// Time-transfer configuration as applied — the provenance a reader needs to
+/// interpret `time_transfer.parquet` without opening the config that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimesyncMeta {
+    pub required: bool,
+    pub artefact: String,
+    pub durable_log: String,
+    pub parquet_schema: String,
+    /// The pairing window used to attribute an `ftm` to a received frame.
+    pub ftm_tolerance_us: u64,
+    /// The one-way-delay floor assumed when reporting the phone-offset
+    /// interval. It biases the offset, never the slope.
+    pub one_way_floor_us: u64,
+}
+
+/// Time-transfer outcome.
+///
+/// `rx_stamp_source` is the field to read first. A `userspace` session carries
+/// the scheduler's wake-up jitter in every receive stamp — the same order as
+/// the inter-node skew being measured — and must not be pooled with
+/// `kernel`-stamped sessions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimesyncSummary {
+    /// `ok` · `degraded` (ran, but nothing usable) · `failed` · `disabled`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// `kernel` · `userspace` · `mixed` · `none`.
+    pub rx_stamp_source: String,
+    pub rows: u64,
+    pub rows_csid: u64,
+    pub rows_app: u64,
+    pub distinct_transmitters: u64,
+    pub mean_rate_hz: f64,
+    /// Rows credited with a paired CSI `ftm`. A low fraction is normal on a
+    /// channel the radio does not sound every frame on, and is not an error.
+    pub ftm_paired: u64,
+    pub frames_seen: u64,
+    /// Locally transmitted frames looped back by `AF_PACKET` and skipped. A
+    /// node must never "receive" its own injector.
+    pub own_transmissions: u64,
+    /// Encrypted data frames. Large with zero `rows_app` means the experiment
+    /// SSID is not open, and the phone's stamps are unreadable from the air.
+    pub protected_frames: u64,
+    pub unrecognised_frames: u64,
+    pub malformed_log_lines: u64,
+}
+
 /// The full sidecar document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sidecar {
@@ -105,6 +209,12 @@ pub struct Sidecar {
     /// Present only for `capture.mode = "inject"` sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<InjectMeta>,
+    /// Present only when BLE co-capture is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ble: Option<BleMeta>,
+    /// Present only when time transfer is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timesync: Option<TimesyncMeta>,
     pub environment: EnvironmentMeta,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -143,6 +253,30 @@ impl Sidecar {
             bitrate_mbps: cfg.inject.bitrate_mbps,
         });
 
+        let ble = cfg.ble.enabled.then(|| BleMeta {
+            adapter: cfg.ble.adapter.clone(),
+            scan_type: "passive".to_string(),
+            scan_interval_ms: cfg.ble.scan_interval_ms,
+            scan_window_ms: cfg.ble.scan_window_ms,
+            required: cfg.ble.required,
+            artefact: crate::ble::PARQUET_NAME.to_string(),
+            durable_log: crate::ble::NDJSON_NAME.to_string(),
+            parquet_schema: crate::ble::PARQUET_SCHEMA.to_string(),
+            hash_algorithm: "sha256(salt || addr_type || addr)[:hash_bytes], hex".to_string(),
+            hash_bytes: cfg.ble.hash_bytes,
+            salt_bits: 256,
+            salt_persisted: false,
+        });
+
+        let timesync = cfg.timesync.enabled.then(|| TimesyncMeta {
+            required: cfg.timesync.required,
+            artefact: crate::timesync::PARQUET_NAME.to_string(),
+            durable_log: crate::timesync::NDJSON_NAME.to_string(),
+            parquet_schema: crate::timesync::PARQUET_SCHEMA.to_string(),
+            ftm_tolerance_us: cfg.timesync.ftm_tolerance_us,
+            one_way_floor_us: cfg.timesync.one_way_floor_us,
+        });
+
         let sc = Sidecar {
             schema: SCHEMA.to_string(),
             session_id,
@@ -150,6 +284,8 @@ impl Sidecar {
             tag: cfg.tag.clone(),
             radio,
             inject,
+            ble,
+            timesync,
             environment: capture_environment(global, &cfg.radio.interface),
             started_at: rfc3339_utc(util::now_unix()),
             ended_at: None,

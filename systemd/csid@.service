@@ -29,9 +29,11 @@ CPUSchedulingPriority=50
 IOSchedulingClass=realtime
 IOSchedulingPriority=2
 
-# Privileges: CAP_NET_ADMIN for interface/monitor setup and netlink; nothing more.
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_NICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_NICE
+# Privileges: CAP_NET_ADMIN for interface/monitor setup and netlink; CAP_NET_RAW
+# for the two raw sockets (AF_PACKET injection, AF_BLUETOOTH/HCI BLE co-capture);
+# nothing more.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_NICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_NICE
 NoNewPrivileges=yes
 
 # Filesystem hardening. debugfs must stay readable/writable for the CSI knobs.

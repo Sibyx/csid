@@ -1,0 +1,65 @@
+# IP-106 calibration arm: illuminated CSI capture with BLE co-capture on the
+# same node, so the anchor stream and the CSI stream share one clock.
+#
+# `ble.required = true` is the point of this profile. A calibration session
+# without BLE anchors cannot test the thing it exists to test, so a scanner that
+# will not start must fail the session at setup rather than leave a capture that
+# looks fine until the analysis opens it.
+#
+# Before deploying: mask bluetooth.service on the node (an HCI_CHANNEL_RAW
+# socket shares the adapter with bluetoothd's own discovery), and confirm
+# `csid doctor` reports the BLE adapter usable.
+tag = "IP-106 lab anchor arm — illuminated CSI + BLE co-capture"
+
+[radio]
+interface   = "wlp1s0"
+monitor     = "wlp1s0mon0"
+channel     = 11
+width       = "HT20"
+interval_us = 0
+mac_filter  = []
+
+[capture]
+mode     = "inject"
+duration = "45m"
+
+[inject]
+rate_hz      = 25
+frame_bytes  = 200
+src_mac      = "ef:be:ad:de:ad:de"   # the fleet's analysis sentinel
+dst_mac      = "ff:ff:ff:ff:ff:ff"
+bitrate_mbps = 6
+
+[ble]
+enabled          = true
+adapter          = "hci0"
+required         = true              # no anchors, no calibration arm
+scan_interval_ms = 100               # window == interval: always listening
+scan_window_ms   = 100
+hash_bytes       = 8
+restart_after_s  = 30
+gap_alert_s      = 5
+
+# Time transfer over the illumination stream. `required = true` for the same
+# reason `ble.required` is: this profile's analysis POOLS NODES (the
+# receiver-subset contrast, the per-zone folds), and gate G4b budgets 250 ms on
+# the maximum clock residual. A capture with no measurable inter-node skew
+# cannot be certified against that budget, so it must fail at setup rather than
+# look fine until the analysis opens it.
+#
+# `csid fleet skew` reads what this writes. It is the authoritative instrument;
+# `csid fleet clock` (ssh round trip) is the fallback.
+[timesync]
+enabled           = true
+required          = true
+ftm_tolerance_us  = 2000            # << the 40 ms inter-frame spacing at 25 Hz
+one_way_floor_us  = 5000            # measured mgmt RTT 10.6 ms, power-save off
+
+[stream]
+enabled     = true
+transport   = "unix"
+unix_socket = "/run/csid/live.sock"
+max_queue   = 4096
+
+[export]
+on_close = true
