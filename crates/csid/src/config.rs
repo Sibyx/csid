@@ -275,6 +275,27 @@ pub struct InjectConfig {
     /// Legacy OFDM bitrate in Mbps, requested via the radiotap RATE field.
     #[serde(default = "default_inject_bitrate")]
     pub bitrate_mbps: u32,
+    /// Driver-forced `rate_n_flags` for injected monitor-mode frames, written to
+    /// the iax `monitor_tx_rate` debugfs knob before the session (0 = off).
+    ///
+    /// **Why this exists:** the radiotap RATE field is silently ignored for
+    /// group-addressed (broadcast) injection on 2.4 GHz — mac80211 sends at the
+    /// band's lowest *basic* rate, which is 1 Mbps **DSSS**. DSSS carries no OFDM
+    /// preamble, so the receiver gets zero 52-tone CSI (measured 2026-08-10:
+    /// monad01→monad02 band-24 arm, injector sent 45 005 frames, receiver logged
+    /// ~33 records; tcpdump showed `1.0 Mb/s 11b`). On 5 GHz the lowest basic
+    /// rate is already 6 Mbps OFDM, so injection works there by accident. Forcing
+    /// the FW rate via `monitor_tx_rate` bypasses the multicast-rate fallback on
+    /// both bands.
+    ///
+    /// Value is the AX210 new-format (v2) `rate_n_flags`. For 6 Mbps legacy OFDM:
+    /// `RATE_MCS_LEGACY_OFDM_MSK (0x100) | rate_index 0`, plus an antenna bit —
+    /// **verify the exact hex on hardware** by writing candidates to the debugfs
+    /// knob and confirming `6.0 Mb/s` in `tcpdump -i <mon>` before trusting a run.
+    /// Default 0 keeps behaviour unchanged until the value is pinned in fleet
+    /// config.
+    #[serde(default)]
+    pub monitor_tx_rate: u32,
 }
 
 fn default_inject_rate() -> u32 {
@@ -301,6 +322,7 @@ impl Default for InjectConfig {
             src_mac: default_inject_src_mac(),
             dst_mac: default_inject_dst_mac(),
             bitrate_mbps: default_inject_bitrate(),
+            monitor_tx_rate: 0,
         }
     }
 }

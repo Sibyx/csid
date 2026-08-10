@@ -222,6 +222,29 @@ mod imp {
         // Open the socket on the caller's thread so a missing interface or
         // capability fails the session at setup, not silently mid-run.
         let sock = TxSocket::open(monitor)?;
+
+        // Force the FW TX rate for injected monitor frames. The radiotap RATE
+        // field is honoured on 5 GHz but ignored for broadcast injection on
+        // 2.4 GHz (mac80211 falls back to 1 Mbps DSSS → no OFDM CSI at the
+        // receiver). The `monitor_tx_rate` debugfs knob overrides the FW rate
+        // on both bands. Set on the caller's thread so a bad value or a
+        // read-only debugfs fails the session at setup rather than silently
+        // capturing at the wrong rate. Zero = leave the driver's default.
+        if cfg.monitor_tx_rate != 0 {
+            let knobs = crate::debugfs::Knobs::for_interface(monitor)
+                .context("resolving iwlmvm debugfs for monitor_tx_rate")?;
+            knobs
+                .set(
+                    crate::debugfs::knob::MONITOR_TX_RATE,
+                    &format!("0x{:x}", cfg.monitor_tx_rate),
+                )
+                .context("writing monitor_tx_rate knob")?;
+            tracing::info!(
+                monitor_tx_rate = format!("0x{:x}", cfg.monitor_tx_rate),
+                "forced FW injection rate (bypasses mac80211 multicast-rate fallback)"
+            );
+        }
+
         let cfg = cfg.clone();
         let monitor = monitor.to_string();
 
@@ -298,6 +321,15 @@ mod imp {
                 tracing::info!(sent, errors, skipped, rate_hz = rate, "injecting");
                 last_sent = sent;
                 last_log = Instant::now();
+            }
+        }
+
+        // Clear the forced FW rate so a later passive capture on this radio is
+        // not silently pinned to the injection rate. Best-effort: teardown must
+        // not fail a completed session.
+        if cfg.monitor_tx_rate != 0 {
+            if let Ok(knobs) = crate::debugfs::Knobs::for_interface(monitor) {
+                knobs.set_best_effort(crate::debugfs::knob::MONITOR_TX_RATE, "0x0");
             }
         }
 
