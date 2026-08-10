@@ -47,9 +47,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::health::{
-    BleHealth, DiskHealth, NodeHealth, NtpState, Scope, ThermalHealth,
-};
+use super::health::{BleHealth, DiskHealth, NodeHealth, NtpState, Scope, ThermalHealth};
 use super::stats;
 use crate::sidecar::Sidecar;
 
@@ -175,7 +173,8 @@ fn tail_arrivals(path: &Path, tail_bytes: u64, width: csiq::Width) -> Result<Vec
         let csi_len = be32(&buf, csi_off) as usize;
         let csi_start = csi_off + 4;
         if csi_start + csi_len <= buf.len() {
-            if let Ok(rec) = csiq::raw::parse_record(hdr, &buf[csi_start..csi_start + csi_len], width)
+            if let Ok(rec) =
+                csiq::raw::parse_record(hdr, &buf[csi_start..csi_start + csi_len], width)
             {
                 out.push(Arrival {
                     ftm: rec.ftm,
@@ -236,14 +235,18 @@ fn ftm_seconds(arrivals: &[Arrival]) -> Vec<f64> {
         .collect()
 }
 
+/// A transmitter and the record class it was heard on — the two things every
+/// analytical view has to be scoped to before a number from it means anything.
+type ScopeKey = ([u8; 6], u16, Option<csiq::Modulation>);
+
 /// Pick the (src_mac, class) pair that dominates the window.
 ///
 /// G1 and G2 are both scoped to one source MAC and one record class. On an
 /// ambient channel the unscoped rate is a sum over interleaved transmitters and
 /// PHY types and is not a measurement of any link — so the probe scopes, and
 /// reports what it scoped to, rather than reporting a flattering total.
-fn dominant_scope(arrivals: &[Arrival]) -> Option<([u8; 6], u16, Option<csiq::Modulation>)> {
-    let mut tally: Vec<(([u8; 6], u16, Option<csiq::Modulation>), u64)> = Vec::new();
+fn dominant_scope(arrivals: &[Arrival]) -> Option<ScopeKey> {
+    let mut tally: Vec<(ScopeKey, u64)> = Vec::new();
     for a in arrivals {
         let key = (a.src_mac, a.ntone, a.phy);
         match tally.iter_mut().find(|(k, _)| *k == key) {
@@ -289,9 +292,7 @@ pub fn newest_session(spool: &Path) -> Option<(PathBuf, Sidecar)> {
     // written once at open and not touched again until close.
     candidates.sort_by(|a, b| {
         let live = |s: &Sidecar| matches!(s.status, crate::sidecar::Status::Capturing);
-        live(&a.2)
-            .cmp(&live(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
+        live(&a.2).cmp(&live(&b.2)).then_with(|| a.0.cmp(&b.0))
     });
     candidates.pop().map(|(_, d, s)| (d, s))
 }
@@ -386,9 +387,7 @@ pub fn disk_health(spool: &Path, bytes_per_s: Option<f64>) -> Option<DiskHealth>
     Some(DiskHealth {
         free_gb: free / 1e9,
         total_gb: total / 1e9,
-        hours_left: bytes_per_s
-            .filter(|r| *r > 0.0)
-            .map(|r| free / r / 3600.0),
+        hours_left: bytes_per_s.filter(|r| *r > 0.0).map(|r| free / r / 3600.0),
     })
 }
 
@@ -538,7 +537,8 @@ pub fn probe(opts: &ProbeOptions) -> Result<ProbeReport> {
 
         let times = ftm_seconds(&scoped);
         let bins = stats::per_second_bins(&times);
-        health.delivered_hz = stats::bootstrap_mean(&bins, stats::BOOTSTRAP_B, stats::BOOTSTRAP_SEED);
+        health.delivered_hz =
+            stats::bootstrap_mean(&bins, stats::BOOTSTRAP_B, stats::BOOTSTRAP_SEED);
         let (gaps, _) = stats::gaps_s(&times);
         health.interarrival_cv =
             stats::bootstrap_cv(&gaps, stats::BOOTSTRAP_B, stats::BOOTSTRAP_SEED);
@@ -601,7 +601,8 @@ mod tests {
         hdr[52..54].copy_from_slice(&ntone.to_le_bytes());
         hdr[68..74].copy_from_slice(&mac);
         hdr[208..216].copy_from_slice(&unix_ts_ns.to_le_bytes());
-        let csi = vec![0u8; ntone as usize * 1 * 1 * 2 * 2];
+        // ntone tones x (nrx=1 * ntx=1) chains x 2 int16 (I and Q) x 2 bytes.
+        let csi = vec![0u8; ntone as usize * 2 * 2];
 
         let msg_len = (4 + hdr.len() + 4 + csi.len()) as u32;
         let mut out = Vec::new();
@@ -639,7 +640,14 @@ mod tests {
         let dir = tmpdir("tail");
         let mac = [0xef, 0xbe, 0xad, 0xde, 0xad, 0xde];
         let frames: Vec<Vec<u8>> = (0..40)
-            .map(|i| frame(1000 + i * 3_200_000, 1_786_000_000_000_000_000 + i as u64 * 10_000_000, 52, mac))
+            .map(|i| {
+                frame(
+                    1000 + i * 3_200_000,
+                    1_786_000_000_000_000_000 + i as u64 * 10_000_000,
+                    52,
+                    mac,
+                )
+            })
             .collect();
         let p = write_capture(&dir, &frames);
 
@@ -770,7 +778,10 @@ mod tests {
 
     #[test]
     fn a_class_label_matches_the_console_vocabulary() {
-        assert_eq!(class_label(52, Some(csiq::Modulation::LegacyOfdm)), "52:legacyofdm");
+        assert_eq!(
+            class_label(52, Some(csiq::Modulation::LegacyOfdm)),
+            "52:legacyofdm"
+        );
         assert_eq!(class_label(56, Some(csiq::Modulation::Ht)), "56:ht");
         assert_eq!(class_label(242, Some(csiq::Modulation::He)), "242:he");
         assert_eq!(class_label(242, None), "242:unlabelled");
@@ -815,12 +826,7 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..n)
             .map(|i| {
                 let dt_ns = ((n - i) as u64) * 8_333_333;
-                frame(
-                    (i as u32).wrapping_mul(2_666_666),
-                    now - dt_ns,
-                    52,
-                    mac,
-                )
+                frame((i as u32).wrapping_mul(2_666_666), now - dt_ns, 52, mac)
             })
             .collect();
         write_capture(&dir, &frames);

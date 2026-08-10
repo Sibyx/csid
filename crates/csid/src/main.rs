@@ -451,9 +451,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }
         Command::Export { session, out } => commands::export_cmd(session, out.clone()),
         Command::Stream { socket, limit } => commands::stream_cmd(socket, *limit),
-        Command::Thermal { prometheus, write } => {
-            commands::thermal_cmd(*prometheus, write.clone())
-        }
+        Command::Thermal { prometheus, write } => commands::thermal_cmd(*prometheus, write.clone()),
         Command::Bench {
             experiment,
             channels,
@@ -666,13 +664,7 @@ fn dispatch_fleet(cli: &Cli, command: &FleetCommand) -> Result<()> {
                 nodes,
                 adapter,
                 ble_seconds,
-            } => cmd::runbook_day0_cmd(
-                &cfg,
-                nodes.as_deref(),
-                experiment,
-                adapter,
-                *ble_seconds,
-            ),
+            } => cmd::runbook_day0_cmd(&cfg, nodes.as_deref(), experiment, adapter, *ble_seconds),
         },
     }
 }

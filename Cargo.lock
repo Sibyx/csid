@@ -449,6 +449,7 @@ dependencies = [
  "anyhow",
  "clap",
  "csiq",
+ "getrandom 0.3.4",
  "humantime-serde",
  "libc",
  "nix",

@@ -320,7 +320,16 @@ mod tests {
 
     #[test]
     fn nonsense_class_strings_are_rejected_not_guessed() {
-        for s in ["", "ht", "52", "52:", ":ht", "x:ht", "52:nope", "52:unknown()"] {
+        for s in [
+            "",
+            "ht",
+            "52",
+            "52:",
+            ":ht",
+            "x:ht",
+            "52:nope",
+            "52:unknown()",
+        ] {
             assert!(ClassKey::from_str(s).is_err(), "{s:?} must not parse");
         }
     }

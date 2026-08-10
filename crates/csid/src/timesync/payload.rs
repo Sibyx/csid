@@ -153,10 +153,16 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 /// Canonical UUID text for the app's 16 raw session bytes.
 fn uuid_string(b: &[u8]) -> String {
-    let h = |r: std::ops::Range<usize>| -> String {
-        b[r].iter().map(|x| format!("{x:02x}")).collect()
-    };
-    format!("{}-{}-{}-{}-{}", h(0..4), h(4..6), h(6..8), h(8..10), h(10..16))
+    let h =
+        |r: std::ops::Range<usize>| -> String { b[r].iter().map(|x| format!("{x:02x}")).collect() };
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(0..4),
+        h(4..6),
+        h(6..8),
+        h(8..10),
+        h(10..16)
+    )
 }
 
 /// Length of the 802.11 MAC header for this frame control, or `None` if this is
@@ -377,7 +383,12 @@ mod tests {
     /// edited to match a change there, the analysis side must be edited too.
     #[test]
     fn the_injectors_own_frame_round_trips_through_the_recogniser() {
-        let f = frame(0x08, 0x00, SENTINEL, &csid_body(4242, 1_786_000_000_123_456_789));
+        let f = frame(
+            0x08,
+            0x00,
+            SENTINEL,
+            &csid_body(4242, 1_786_000_000_123_456_789),
+        );
         let s = recognise(&f).unwrap();
         assert_eq!(s.kind, TxKind::Csid);
         assert_eq!(s.seq, 4242);
@@ -406,7 +417,12 @@ mod tests {
         let session = [0xab; 16];
         let phone = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
         // QoS data (subtype 0x8) with ToDS set — what a station sends to an AP.
-        let f = frame(0x88, 0x01, phone, &mndp_body(1, session, 99, 12_345_678_901, 1_786_000_000_123));
+        let f = frame(
+            0x88,
+            0x01,
+            phone,
+            &mndp_body(1, session, 99, 12_345_678_901, 1_786_000_000_123),
+        );
         let s = recognise(&f).unwrap();
         assert_eq!(s.kind, TxKind::App);
         assert_eq!(s.seq, 99);
@@ -421,7 +437,12 @@ mod tests {
     /// those would otherwise look like a session that sent nothing.
     #[test]
     fn session_hello_also_carries_a_usable_stamp() {
-        let f = frame(0x88, 0x01, [1, 2, 3, 4, 5, 6], &mndp_body(4, [7; 16], 3, 500, 0));
+        let f = frame(
+            0x88,
+            0x01,
+            [1, 2, 3, 4, 5, 6],
+            &mndp_body(4, [7; 16], 3, 500, 0),
+        );
         let s = recognise(&f).unwrap();
         assert_eq!(s.kind, TxKind::App);
         assert_eq!(s.seq, 3);
@@ -433,7 +454,12 @@ mod tests {
     /// make the phone offset look perfect.
     #[test]
     fn the_collectors_time_response_is_refused() {
-        let f = frame(0x88, 0x01, [1, 2, 3, 4, 5, 6], &mndp_body(3, [7; 16], 3, 500, 0));
+        let f = frame(
+            0x88,
+            0x01,
+            [1, 2, 3, 4, 5, 6],
+            &mndp_body(3, [7; 16], 3, 500, 0),
+        );
         assert_eq!(recognise(&f), Err(Reject::NoStamp));
     }
 
@@ -441,7 +467,12 @@ mod tests {
     /// diagnosable from the counters, not look like an empty room.
     #[test]
     fn an_encrypted_frame_is_counted_as_protected_not_as_noise() {
-        let f = frame(0x88, 0x41, [1, 2, 3, 4, 5, 6], &mndp_body(1, [7; 16], 1, 1, 1));
+        let f = frame(
+            0x88,
+            0x41,
+            [1, 2, 3, 4, 5, 6],
+            &mndp_body(1, [7; 16], 1, 1, 1),
+        );
         assert_eq!(recognise(&f), Err(Reject::Protected));
     }
 
@@ -480,7 +511,10 @@ mod tests {
     #[test]
     fn non_monitor_and_truncated_input_are_refused_rather_than_guessed() {
         assert_eq!(recognise(&[]), Err(Reject::NotRadiotap));
-        assert_eq!(recognise(&[1, 0, 9, 0, 0, 0, 0, 0, 0]), Err(Reject::NotRadiotap));
+        assert_eq!(
+            recognise(&[1, 0, 9, 0, 0, 0, 0, 0, 0]),
+            Err(Reject::NotRadiotap)
+        );
         // it_len longer than the buffer.
         assert_eq!(
             recognise(&[0, 0, 0xff, 0x00, 0, 0, 0, 0, 0]),
@@ -505,7 +539,10 @@ mod tests {
         ip[9] = 6; // TCP
         ip.extend_from_slice(&[0u8; 40]);
         body.extend_from_slice(&ip);
-        assert_eq!(recognise(&frame(0x08, 0x00, SENTINEL, &body)), Err(Reject::NoStamp));
+        assert_eq!(
+            recognise(&frame(0x08, 0x00, SENTINEL, &body)),
+            Err(Reject::NoStamp)
+        );
 
         // UDP that is not MNDP.
         let f = frame(0x08, 0x00, SENTINEL, &{

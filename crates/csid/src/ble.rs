@@ -250,10 +250,14 @@ impl std::fmt::Debug for DeviceHasher {
 
 impl DeviceHasher {
     /// Draw a fresh salt from the OS CSPRNG. One call per session.
+    ///
+    /// Via `getrandom` rather than a `/dev/urandom` read: this module is
+    /// documented as building on any platform (the pseudonymisation and
+    /// parquet paths are read back off a node), and a hardcoded device path
+    /// made that false everywhere but Linux.
     pub fn new_random(bytes: usize) -> Result<Self> {
         let mut salt = [0u8; 32];
-        let mut f = File::open("/dev/urandom").context("opening /dev/urandom for the BLE salt")?;
-        std::io::Read::read_exact(&mut f, &mut salt).context("reading the BLE salt")?;
+        getrandom::fill(&mut salt).context("drawing the BLE salt from the OS CSPRNG")?;
         Ok(DeviceHasher {
             salt,
             bytes: bytes.clamp(4, 32),
@@ -545,8 +549,8 @@ pub struct ObservationLog {
 impl ObservationLog {
     pub fn create(dir: &Path, flush_every: usize) -> Result<Self> {
         let path = dir.join(NDJSON_NAME);
-        let file = File::create(&path)
-            .with_context(|| format!("creating BLE log {}", path.display()))?;
+        let file =
+            File::create(&path).with_context(|| format!("creating BLE log {}", path.display()))?;
         Ok(ObservationLog {
             writer: BufWriter::with_capacity(64 * 1024, file),
             path,
@@ -644,8 +648,8 @@ fn parquet_schema() -> Result<Type> {
 /// malformed line is counted and skipped: a truncated last line from a power
 /// cut must not cost the rest of the capture.
 pub fn export_parquet(ndjson: &Path, out: &Path, ctx: &ParquetContext) -> Result<ExportStats> {
-    let file = File::open(ndjson)
-        .with_context(|| format!("opening BLE log {}", ndjson.display()))?;
+    let file =
+        File::open(ndjson).with_context(|| format!("opening BLE log {}", ndjson.display()))?;
     let reader = BufReader::with_capacity(256 * 1024, file);
 
     let schema = Arc::new(parquet_schema()?);
@@ -704,8 +708,8 @@ fn write_row_group<W: std::io::Write + Send>(
 
     for constant in [&ctx.host, &ctx.session_id, &ctx.adapter] {
         let mut col = rg.next_column()?.context("constant column missing")?;
-        let v: Vec<ByteArray> = std::iter::repeat_n(ByteArray::from(constant.as_str()), batch.len())
-            .collect();
+        let v: Vec<ByteArray> =
+            std::iter::repeat_n(ByteArray::from(constant.as_str()), batch.len()).collect();
         col.typed::<ByteArrayType>().write_batch(&v, None, None)?;
         col.close()?;
     }
@@ -741,7 +745,10 @@ fn write_row_group<W: std::io::Write + Send>(
         .iter()
         .map(|o| if o.rssi_dbm.is_some() { 1 } else { 0 })
         .collect();
-    let vals: Vec<i32> = batch.iter().filter_map(|o| o.rssi_dbm.map(i32::from)).collect();
+    let vals: Vec<i32> = batch
+        .iter()
+        .filter_map(|o| o.rssi_dbm.map(i32::from))
+        .collect();
     col.typed::<Int32Type>()
         .write_batch(&vals, Some(&def), None)?;
     col.close()?;
@@ -795,7 +802,11 @@ pub fn spawn(
 mod tests {
     use super::*;
 
-    fn adv_event(reports: &[(u8, u8, [u8; 6], &[u8], i8)]) -> Vec<u8> {
+    /// One advertising report as the fixtures below spell it out:
+    /// `(event_type, addr_type, addr, adv_data, rssi)`.
+    type Report<'a> = (u8, u8, [u8; 6], &'a [u8], i8);
+
+    fn adv_event(reports: &[Report<'_>]) -> Vec<u8> {
         let mut params = vec![0x02u8, reports.len() as u8];
         for (etype, atype, addr, data, rssi) in reports {
             params.push(*etype);
@@ -913,10 +924,7 @@ mod tests {
     #[test]
     fn classifies_address_kinds_from_the_top_two_bits() {
         let with_msb = |m: u8| [0, 0, 0, 0, 0, m];
-        assert_eq!(
-            AddrKind::classify(0x00, &with_msb(0x00)),
-            AddrKind::Public
-        );
+        assert_eq!(AddrKind::classify(0x00, &with_msb(0x00)), AddrKind::Public);
         assert_eq!(
             AddrKind::classify(0x01, &with_msb(0xC3)),
             AddrKind::RandomStatic

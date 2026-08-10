@@ -19,7 +19,7 @@ mod proto;
 mod rx;
 mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn doctor(path: &PathBuf) -> Result<()> {
+fn doctor(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     println!("collectord {VERSION}");
     println!("node:            {}", config.node_name());
@@ -105,7 +105,7 @@ fn doctor(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run(path: &PathBuf) -> Result<()> {
+fn run(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     std::fs::create_dir_all(&config.session.spool)
         .with_context(|| format!("creating spool {}", config.session.spool.display()))?;
@@ -187,12 +187,8 @@ fn handle(
     }
 
     let uuid = packet.session_uuid();
-    let session = sessions.get_or_create(
-        &config.session.spool,
-        &uuid,
-        received.peer,
-        environment,
-    )?;
+    let session =
+        sessions.get_or_create(&config.session.spool, &uuid, received.peer, environment)?;
 
     match packet.kind {
         proto::TYPE_DATA => session.record_data(
@@ -261,8 +257,7 @@ fn install_signal_handler(running: Arc<AtomicBool>) -> Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

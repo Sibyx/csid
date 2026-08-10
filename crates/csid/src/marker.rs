@@ -331,16 +331,7 @@ mod tests {
     #[test]
     fn absent_optionals_are_omitted_not_nulled() {
         let m = Marker::at(
-            1,
-            "monad01",
-            "s",
-            "SYNC-01",
-            "ZONE-B",
-            "sync",
-            "mark",
-            None,
-            None,
-            None,
+            1, "monad01", "s", "SYNC-01", "ZONE-B", "sync", "mark", None, None, None,
         );
         let line = m.to_line().unwrap();
         assert!(!line.contains("null"), "{line}");

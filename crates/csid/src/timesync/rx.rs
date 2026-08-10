@@ -54,7 +54,7 @@ mod imp {
 
     use anyhow::{Context, Result};
 
-    use super::super::{payload, RowLog, Row, StampSource, TimesyncCounters, TimesyncHandle};
+    use super::super::{payload, Row, RowLog, StampSource, TimesyncCounters, TimesyncHandle};
     use crate::config::TimesyncConfig;
     use crate::util;
 
@@ -100,7 +100,10 @@ mod imp {
                     std::io::Error::last_os_error()
                 );
             }
-            let mut sock = RxSocket { fd, kernel_stamps: false };
+            let mut sock = RxSocket {
+                fd,
+                kernel_stamps: false,
+            };
 
             let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             addr.sll_family = libc::AF_PACKET as u16;
@@ -196,8 +199,7 @@ mod imp {
                             std::mem::size_of::<libc::timespec>(),
                         );
                     }
-                    stamp =
-                        Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
+                    stamp = Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
                     break;
                 }
                 cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
@@ -266,7 +268,7 @@ mod imp {
 
         while !stop.load(Ordering::Relaxed) {
             match sock.recv(&mut buf) {
-                Ok(None) => {}   // read timeout: loop and re-check the stop flag
+                Ok(None) => {} // read timeout: loop and re-check the stop flag
                 Err(e) => {
                     counters.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(error = %e, "time-transfer read failed");

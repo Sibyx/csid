@@ -138,7 +138,7 @@ fn default_control_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::getuid() };
-        return Some(PathBuf::from(format!("/tmp/csid-mux-{uid}")));
+        Some(PathBuf::from(format!("/tmp/csid-mux-{uid}")))
     }
     #[cfg(not(unix))]
     {
@@ -241,9 +241,7 @@ impl SshRunner {
                     stderr: String::new(),
                     status: None,
                     elapsed: started.elapsed(),
-                    unreachable: Some(Unreachable::SshFailed(format!(
-                        "could not spawn ssh: {e}"
-                    ))),
+                    unreachable: Some(Unreachable::SshFailed(format!("could not spawn ssh: {e}"))),
                 }
             }
         };
@@ -288,8 +286,12 @@ impl SshRunner {
             }
         };
 
-        let stdout = out_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-        let stderr = err_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+        let stdout = out_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
+        let stderr = err_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
         let elapsed = started.elapsed();
 
         match status {
@@ -413,8 +415,14 @@ mod tests {
         assert!(joined.contains("BatchMode=yes"), "{joined}");
         assert!(joined.contains("ClearAllForwardings=yes"), "{joined}");
         assert!(joined.contains("ConnectTimeout=5"), "{joined}");
-        assert!(joined.contains("ControlMaster=auto"), "{joined}");
-        assert!(joined.contains("ControlPersist"), "{joined}");
+        // Multiplexing is a Unix-socket feature: `default_control_dir` returns
+        // None off Unix, and the invocation correctly omits ControlMaster
+        // there. Asserting it unconditionally only tests the host OS.
+        #[cfg(unix)]
+        {
+            assert!(joined.contains("ControlMaster=auto"), "{joined}");
+            assert!(joined.contains("ControlPersist"), "{joined}");
+        }
         assert_eq!(args.last().unwrap(), "monad04");
         // The mux socket must not live in the operator's ~/.ssh.
         assert!(
@@ -437,12 +445,15 @@ mod tests {
     /// on macOS is `/var/folders/<2>/<26>/T/`. With `%C`'s 64-character hash
     /// that template is ~130 bytes and OpenSSH rejects every connection with
     /// `ControlPath too long` — on the exact machine the cockpit runs on.
+    ///
+    /// Unix-only by construction: the thing under test is the length budget of
+    /// a Unix domain socket path, which does not exist on Windows.
     #[test]
+    #[cfg(unix)]
     fn the_default_control_path_fits_a_unix_socket_on_this_machine() {
         let dir = default_control_dir().expect("unix has a control dir");
-        let path = control_path(&dir).unwrap_or_else(|| {
-            panic!("the default ControlPath must fit: {}", dir.display())
-        });
+        let path = control_path(&dir)
+            .unwrap_or_else(|| panic!("the default ControlPath must fit: {}", dir.display()));
         assert!(
             path.len() - 2 + 64 <= CONTROL_PATH_LIMIT,
             "{path} expands past the limit"

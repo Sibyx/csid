@@ -289,7 +289,7 @@ fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
 
             let total = hub.total();
             if let Some(seen) = last_total {
-                if !should_recompute(total, seen, last_emit.elapsed().into()) {
+                if !should_recompute(total, seen, last_emit.elapsed()) {
                     continue;
                 }
             }
@@ -311,12 +311,11 @@ fn spawn_view(hub: Arc<Hub>, settings: ViewSettings) -> View {
             // the HTTP surface.
             let hub = hub.clone();
             let view = settings.clone();
-            let handle =
-                tokio::task::spawn_blocking(move || {
-                    let mut a = analysis;
-                    let f = a.compute(&hub, &view);
-                    (f, a)
-                });
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut a = analysis;
+                let f = a.compute(&hub, &view);
+                (f, a)
+            });
             match handle.await {
                 Ok((frame, a)) => {
                     analysis = a;
@@ -382,9 +381,9 @@ mod tests {
     fn a_legacy_52_tone_frame_stays_off_the_pool() {
         // 52 tones, a 256-record window, the full 128-column bundle — the
         // largest a legacy capture gets.
-        assert!(52 * (128 + 256) < JOIN_THRESHOLD);
+        const { assert!(52 * (128 + 256) < JOIN_THRESHOLD) };
         // ...while an HE20 frame is worth splitting.
-        assert!(242 * (128 + 256) >= JOIN_THRESHOLD);
+        const { assert!(242 * (128 + 256) >= JOIN_THRESHOLD) };
     }
 
     /// The idle guard must save work on a quiet channel without ever letting a
@@ -437,7 +436,7 @@ mod tests {
 
     #[test]
     fn the_pool_is_bounded_below_the_machine() {
-        assert!(ANALYSIS_THREADS < 4, "the capture path needs cores too");
+        const { assert!(ANALYSIS_THREADS < 4, "the capture path needs cores too") };
         if let Some(p) = pool() {
             assert_eq!(p.current_num_threads(), ANALYSIS_THREADS);
         }

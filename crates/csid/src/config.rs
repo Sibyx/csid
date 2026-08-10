@@ -426,9 +426,7 @@ impl BleConfig {
             ("ble.scan_window_ms", self.scan_window_ms),
         ] {
             if !(BLE_SCAN_MS_MIN..=BLE_SCAN_MS_MAX).contains(&v) {
-                anyhow::bail!(
-                    "{label} must be {BLE_SCAN_MS_MIN}..={BLE_SCAN_MS_MAX} ms (got {v})"
-                );
+                anyhow::bail!("{label} must be {BLE_SCAN_MS_MIN}..={BLE_SCAN_MS_MAX} ms (got {v})");
             }
         }
         if self.scan_window_ms > self.scan_interval_ms {
@@ -467,7 +465,10 @@ impl BleConfig {
     /// Scan interval/window in HCI 0.625 ms units.
     pub fn hci_units(&self) -> (u16, u16) {
         let to_units = |ms: f64| (ms / 0.625).round().clamp(0x0004 as f64, 0x4000 as f64) as u16;
-        (to_units(self.scan_interval_ms), to_units(self.scan_window_ms))
+        (
+            to_units(self.scan_interval_ms),
+            to_units(self.scan_window_ms),
+        )
     }
 }
 
@@ -708,9 +709,9 @@ impl ExperimentConfig {
                     );
                 }
             }
-            other => anyhow::bail!(
-                "capture.mode must be \"passive\" or \"inject\" (got {other:?})"
-            ),
+            other => {
+                anyhow::bail!("capture.mode must be \"passive\" or \"inject\" (got {other:?})")
+            }
         }
 
         if self.stream.enabled {

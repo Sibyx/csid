@@ -431,7 +431,8 @@ mod tests {
             m.add(52);
         }
         m.add(242);
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(v["52"], 3);
         assert_eq!(v["242"], 1);
     }

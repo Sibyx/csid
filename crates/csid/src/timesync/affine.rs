@@ -214,16 +214,16 @@ pub fn fit(tx_id: &str, samples: &[Sample], d_floor_ns: u64) -> Option<AffineFit
     let y0 = samples.iter().map(|s| s.rx_unix_ns).min()?;
     let pts: Vec<(f64, f64)> = samples
         .iter()
-        .map(|s| (
-            (s.mono_ns - x0) as f64,
-            (s.rx_unix_ns - y0) as f64,
-        ))
+        .map(|s| ((s.mono_ns - x0) as f64, (s.rx_unix_ns - y0) as f64))
         .collect();
 
     let x_min = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let x_max = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
     let span = x_max - x_min;
-    if !(span > 0.0) {
+    // A zero span (every point at one instant) and a NaN span (an empty or
+    // poisoned series) are both unfittable. Spelled out rather than written
+    // `!(span > 0.0)`, so the NaN branch reads as intentional.
+    if span.is_nan() || span <= 0.0 {
         return None;
     }
 
@@ -426,7 +426,10 @@ mod tests {
     fn a_stream_without_a_wallclock_reports_no_offset_rather_than_zero() {
         let s: Vec<Sample> = stream(500, 20.0, 3.0, 0, 1_000_000, 5_000_000)
             .into_iter()
-            .map(|x| Sample { tx_wall_ns: None, ..x })
+            .map(|x| Sample {
+                tx_wall_ns: None,
+                ..x
+            })
             .collect();
         let f = fit("p", &s, D_FLOOR_DEFAULT_NS).unwrap();
         assert_eq!(f.wall_offset_ns, None);
@@ -456,7 +459,11 @@ mod tests {
     fn a_join_whose_residual_breaks_the_budget_says_so() {
         let s = stream(2000, 20.0, 0.0, 0, 2_000_000, 2_000_000_000);
         let f = fit("p", &s, D_FLOOR_DEFAULT_NS).unwrap();
-        assert!(!f.residual_within(G4B_BUDGET_NS), "p95 {}", f.residual_p95_ns);
+        assert!(
+            !f.residual_within(G4B_BUDGET_NS),
+            "p95 {}",
+            f.residual_p95_ns
+        );
     }
 
     /// The whole point of the fit: a phone stamp lands on the fleet timeline
@@ -483,7 +490,11 @@ mod tests {
         assert!(fit("p", &stream(4, 20.0, 0.0, 0, 0, 0), D_FLOOR_DEFAULT_NS).is_none());
         // Every sample at the same instant: no span, therefore no slope.
         let frozen: Vec<Sample> = (0..100)
-            .map(|_| Sample { mono_ns: MONO0, rx_unix_ns: UNIX0, tx_wall_ns: None })
+            .map(|_| Sample {
+                mono_ns: MONO0,
+                rx_unix_ns: UNIX0,
+                tx_wall_ns: None,
+            })
             .collect();
         assert!(fit("p", &frozen, D_FLOOR_DEFAULT_NS).is_none());
     }

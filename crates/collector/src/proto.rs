@@ -99,12 +99,7 @@ impl<'a> Packet<'a> {
 /// The sequence number is echoed deliberately: the phone rejects a reply whose sequence does not
 /// match its request, because a stale reply from an earlier exchange looks *fast* and would bias
 /// the minimum-delay filter in precisely the wrong direction.
-pub fn encode_time_response(
-    session: &[u8; 16],
-    sequence: u32,
-    t2_ns: u64,
-    t3_ns: u64,
-) -> Vec<u8> {
+pub fn encode_time_response(session: &[u8; 16], sequence: u32, t2_ns: u64, t3_ns: u64) -> Vec<u8> {
     let mut out = vec![0u8; HEADER_SIZE + 16];
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
@@ -164,7 +159,10 @@ mod tests {
         assert_eq!(p.sequence, 7);
         assert_eq!(p.t_mono_ns, 123);
         assert_eq!(p.payload, &[1, 2, 3, 4]);
-        assert_eq!(p.session_uuid(), "abababab-abab-abab-abab-ababababababab"[..36].to_string());
+        assert_eq!(
+            p.session_uuid(),
+            "abababab-abab-abab-abab-ababababababab"[..36].to_string()
+        );
     }
 
     #[test]
@@ -187,6 +185,9 @@ mod tests {
         assert_eq!(p.kind, TYPE_TIME_RESPONSE);
         assert_eq!(p.sequence, 3);
         assert_eq!(u64::from_be_bytes(p.payload[0..8].try_into().unwrap()), 111);
-        assert_eq!(u64::from_be_bytes(p.payload[8..16].try_into().unwrap()), 222);
+        assert_eq!(
+            u64::from_be_bytes(p.payload[8..16].try_into().unwrap()),
+            222
+        );
     }
 }

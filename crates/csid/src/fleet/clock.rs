@@ -150,9 +150,7 @@ impl SkewReport {
     /// `true` only when every node was measured *and* the worst-case skew fits
     /// the budget.
     pub fn within_budget(&self) -> bool {
-        self.unmeasured.is_empty()
-            && self.measured >= 1
-            && self.skew_upper_ns <= self.budget_ns
+        self.unmeasured.is_empty() && self.measured >= 1 && self.skew_upper_ns <= self.budget_ns
     }
 
     pub fn render(&self) -> String {
@@ -190,10 +188,7 @@ impl SkewReport {
 /// between two nodes is the difference of their offsets — the cockpit's own
 /// clock cancels out, which is why the cockpit's clock never has to be right.
 /// It only has to be stable across the few seconds the probe takes.
-pub fn fleet_skew(
-    estimates: &[(String, Option<ClockHealth>)],
-    budget_ns: u64,
-) -> SkewReport {
+pub fn fleet_skew(estimates: &[(String, Option<ClockHealth>)], budget_ns: u64) -> SkewReport {
     let mut unmeasured: Vec<String> = Vec::new();
     let mut lo: Option<(String, i64, u64)> = None;
     let mut hi: Option<(String, i64, u64)> = None;
@@ -379,7 +374,10 @@ mod tests {
             system_offset_s: Some(0.000_1),
             root_dispersion_s: Some(0.001),
         };
-        assert_eq!(estimate(&[e], Some(tight)).unwrap().uncertainty_ns, 10_000_000);
+        assert_eq!(
+            estimate(&[e], Some(tight)).unwrap().uncertainty_ns,
+            10_000_000
+        );
 
         // A daemon admitting 50 ms dispersion widens it.
         let loose = NtpState {
@@ -389,7 +387,10 @@ mod tests {
             system_offset_s: Some(0.000_1),
             root_dispersion_s: Some(0.05),
         };
-        assert_eq!(estimate(&[e], Some(loose)).unwrap().uncertainty_ns, 50_000_000);
+        assert_eq!(
+            estimate(&[e], Some(loose)).unwrap().uncertainty_ns,
+            50_000_000
+        );
 
         assert!(estimate(&[], None).is_none(), "no samples, no estimate");
     }

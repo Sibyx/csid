@@ -234,8 +234,7 @@ pub struct RowLog {
 impl RowLog {
     pub fn create(dir: &Path, flush_every: usize) -> Result<Self> {
         let path = dir.join(NDJSON_NAME);
-        let file =
-            File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(RowLog {
             writer: BufWriter::with_capacity(64 * 1024, file),
             path,
@@ -260,7 +259,9 @@ impl RowLog {
     }
 
     pub fn finish(mut self) -> Result<PathBuf> {
-        self.writer.flush().context("flushing the time-transfer log")?;
+        self.writer
+            .flush()
+            .context("flushing the time-transfer log")?;
         self.writer
             .get_ref()
             .sync_all()
@@ -340,7 +341,9 @@ pub fn pair_ftm(rows: &mut [Row], ticks: &[CsiTick], tolerance_ns: u64) -> usize
         // The nearest tick is one of the two straddling the row.
         let mut best: Option<(u64, u32, i64)> = None;
         for cand in [i.checked_sub(1), Some(i)].into_iter().flatten() {
-            let Some(&(ts, ftm)) = v.get(cand) else { continue };
+            let Some(&(ts, ftm)) = v.get(cand) else {
+                continue;
+            };
             let lag = ts as i64 - row.unix_ts_ns as i64;
             if lag.unsigned_abs() <= tolerance_ns
                 && best.is_none_or(|(_, _, b)| lag.abs() < b.abs())
@@ -466,7 +469,7 @@ fn write_row_group<W: std::io::Write + Send>(
     let mut rg = writer.next_row_group()?;
 
     let int_col = |rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
-                       vals: Vec<i64>|
+                   vals: Vec<i64>|
      -> Result<()> {
         let mut col = rg.next_column()?.context("missing required INT64 column")?;
         col.typed::<Int64Type>().write_batch(&vals, None, None)?;
@@ -474,15 +477,18 @@ fn write_row_group<W: std::io::Write + Send>(
         Ok(())
     };
     let text_col = |rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
-                        vals: Vec<ByteArray>|
+                    vals: Vec<ByteArray>|
      -> Result<()> {
-        let mut col = rg.next_column()?.context("missing required string column")?;
-        col.typed::<ByteArrayType>().write_batch(&vals, None, None)?;
+        let mut col = rg
+            .next_column()?
+            .context("missing required string column")?;
+        col.typed::<ByteArrayType>()
+            .write_batch(&vals, None, None)?;
         col.close()?;
         Ok(())
     };
     let opt_int_col = |rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
-                           vals: Vec<Option<i64>>|
+                       vals: Vec<Option<i64>>|
      -> Result<()> {
         let mut col = rg.next_column()?.context("missing optional INT64 column")?;
         // Definition level 1 = present, 0 = null; only present values are in
@@ -504,28 +510,55 @@ fn write_row_group<W: std::io::Write + Send>(
     }
     text_col(
         &mut rg,
-        batch.iter().map(|r| ByteArray::from(r.rx_stamp_src.as_str())).collect(),
+        batch
+            .iter()
+            .map(|r| ByteArray::from(r.rx_stamp_src.as_str()))
+            .collect(),
     )?;
     text_col(
         &mut rg,
-        batch.iter().map(|r| ByteArray::from(r.tx_kind.as_str())).collect(),
+        batch
+            .iter()
+            .map(|r| ByteArray::from(r.tx_kind.as_str()))
+            .collect(),
     )?;
     text_col(
         &mut rg,
-        batch.iter().map(|r| ByteArray::from(r.tx_id.as_str())).collect(),
+        batch
+            .iter()
+            .map(|r| ByteArray::from(r.tx_id.as_str()))
+            .collect(),
     )?;
     text_col(
         &mut rg,
-        batch.iter().map(|r| ByteArray::from(r.tx_mac.as_str())).collect(),
+        batch
+            .iter()
+            .map(|r| ByteArray::from(r.tx_mac.as_str()))
+            .collect(),
     )?;
     int_col(&mut rg, batch.iter().map(|r| r.seq as i64).collect())?;
-    int_col(&mut rg, batch.iter().map(|r| r.tx_stamp_ns as i64).collect())?;
+    int_col(
+        &mut rg,
+        batch.iter().map(|r| r.tx_stamp_ns as i64).collect(),
+    )?;
     text_col(
         &mut rg,
-        batch.iter().map(|r| ByteArray::from(r.tx_clock.as_str())).collect(),
+        batch
+            .iter()
+            .map(|r| ByteArray::from(r.tx_clock.as_str()))
+            .collect(),
     )?;
-    opt_int_col(&mut rg, batch.iter().map(|r| r.tx_wall_ns.map(|v| v as i64)).collect())?;
-    opt_int_col(&mut rg, batch.iter().map(|r| r.ftm.map(i64::from)).collect())?;
+    opt_int_col(
+        &mut rg,
+        batch
+            .iter()
+            .map(|r| r.tx_wall_ns.map(|v| v as i64))
+            .collect(),
+    )?;
+    opt_int_col(
+        &mut rg,
+        batch.iter().map(|r| r.ftm.map(i64::from)).collect(),
+    )?;
     opt_int_col(&mut rg, batch.iter().map(|r| r.ftm_lag_ns).collect())?;
 
     rg.close()?;
@@ -765,13 +798,29 @@ mod tests {
         ];
         let ticks = vec![
             // 120 µs after row 0 — inside the window.
-            CsiTick { unix_ts_ns: T0 + 120_000, ftm: 111, src_mac: mac },
+            CsiTick {
+                unix_ts_ns: T0 + 120_000,
+                ftm: 111,
+                src_mac: mac,
+            },
             // A closer record, but from a different transmitter: must not win.
-            CsiTick { unix_ts_ns: T0 + 40_000_010, ftm: 999, src_mac: other },
+            CsiTick {
+                unix_ts_ns: T0 + 40_000_010,
+                ftm: 999,
+                src_mac: other,
+            },
             // 300 µs before row 1.
-            CsiTick { unix_ts_ns: T0 + 39_700_000, ftm: 222, src_mac: mac },
+            CsiTick {
+                unix_ts_ns: T0 + 39_700_000,
+                ftm: 222,
+                src_mac: mac,
+            },
             // Row 2 has nothing within tolerance.
-            CsiTick { unix_ts_ns: T0 + 200_000_000, ftm: 333, src_mac: mac },
+            CsiTick {
+                unix_ts_ns: T0 + 200_000_000,
+                ftm: 333,
+                src_mac: mac,
+            },
         ];
         let paired = pair_ftm(&mut rows, &ticks, 2_000_000);
         assert_eq!(paired, 2);
@@ -779,7 +828,10 @@ mod tests {
         assert_eq!(rows[0].ftm_lag_ns, Some(120_000));
         assert_eq!(rows[1].ftm, Some(222));
         assert_eq!(rows[1].ftm_lag_ns, Some(-300_000));
-        assert_eq!(rows[2].ftm, None, "no record in tolerance is None, not a guess");
+        assert_eq!(
+            rows[2].ftm, None,
+            "no record in tolerance is None, not a guess"
+        );
         assert_eq!(rows[2].ftm_lag_ns, None);
     }
 
@@ -792,7 +844,11 @@ mod tests {
         assert_eq!(rows[0].ftm, None);
 
         let mac = payload::parse_mac(SENTINEL).unwrap();
-        let far = vec![CsiTick { unix_ts_ns: T0 + 1_000_000_000, ftm: 5, src_mac: mac }];
+        let far = vec![CsiTick {
+            unix_ts_ns: T0 + 1_000_000_000,
+            ftm: 5,
+            src_mac: mac,
+        }];
         assert_eq!(pair_ftm(&mut rows, &far, 2_000_000), 0);
     }
 
@@ -822,8 +878,7 @@ mod tests {
 
         // The column contract, read back off the file itself.
         let file = File::open(&out).unwrap();
-        let reader =
-            parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
         let schema = parquet::file::reader::FileReader::metadata(&reader)
             .file_metadata()
             .schema_descr();
@@ -861,7 +916,10 @@ mod tests {
         let stats = write_parquet(
             &[],
             &out,
-            &ParquetContext { host: "monad02".into(), session_id: "s".into() },
+            &ParquetContext {
+                host: "monad02".into(),
+                session_id: "s".into(),
+            },
         )
         .unwrap();
         assert_eq!(stats.rows, 0);
@@ -876,7 +934,11 @@ mod tests {
             .map(|i| csid_row(i, T0 + i * 40_000_000))
             .collect();
         for i in 0..100u64 {
-            rows.push(app_row(i, T0 + i * 50_000_000, 900_000_000_000 + i * 50_000_000));
+            rows.push(app_row(
+                i,
+                T0 + i * 50_000_000,
+                900_000_000_000 + i * 50_000_000,
+            ));
         }
         let now = T0 + 8_000_000_000;
 
@@ -895,7 +957,10 @@ mod tests {
         // Last 2 s only.
         let win = report("monad02", "s", &rows, 2.0, now, affine::D_FLOOR_DEFAULT_NS);
         assert!(win.rows < all.rows && win.rows > 0);
-        assert!(win.arrivals[0].1.iter().all(|a| a.unix_ts_ns >= now - 2_000_000_000));
+        assert!(win.arrivals[0]
+            .1
+            .iter()
+            .all(|a| a.unix_ts_ns >= now - 2_000_000_000));
     }
 
     /// A window with too few app packets must produce NO fit rather than a
@@ -905,7 +970,14 @@ mod tests {
         let rows: Vec<Row> = (0..4u64)
             .map(|i| app_row(i, T0 + i * 50_000_000, 900_000_000_000 + i * 50_000_000))
             .collect();
-        let r = report("monad02", "s", &rows, 0.0, T0 + 1_000_000_000, affine::D_FLOOR_DEFAULT_NS);
+        let r = report(
+            "monad02",
+            "s",
+            &rows,
+            0.0,
+            T0 + 1_000_000_000,
+            affine::D_FLOOR_DEFAULT_NS,
+        );
         assert_eq!(r.rows_app, 4);
         assert!(r.app_fits.is_empty());
     }

@@ -56,8 +56,10 @@ const RMS_THRESHOLD_DB: f32 = -20.0;
 
 // -- logarithm ----------------------------------------------------------------
 
-/// `log10(2)`, the bridge from a binary exponent to decibels.
-const LOG10_2: f32 = 0.301_029_995_7;
+/// `log10(2)`, the bridge from a binary exponent to decibels. Taken from
+/// `std` rather than written out: a hand-typed literal is a digit away from a
+/// silent scale error in every dB the waterfall renders.
+const LOG10_2: f32 = std::f32::consts::LOG10_2;
 
 /// Minimax coefficients for `log2(1+f)/f` on `f ∈ [√2/2 − 1, √2 − 1]`,
 /// ascending. Fitted at degree 6, which puts the approximation error at
@@ -359,9 +361,7 @@ impl Transforms {
             .or_insert_with(|| {
                 let denom = (len.max(2) - 1) as f32;
                 (0..len)
-                    .map(|i| {
-                        0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / denom).cos()
-                    })
+                    .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / denom).cos())
                     .collect()
             })
             .clone()
@@ -655,7 +655,15 @@ pub struct Cir {
 pub fn cir(h: &[Complex32], spacing_hz: f64, nfft: usize, taps: usize) -> Cir {
     let mut out = Cir::default();
     LOCAL_TRANSFORMS.with(|t| {
-        cir_into(&mut t.borrow_mut(), h, spacing_hz, nfft, taps, &mut Vec::new(), &mut out)
+        cir_into(
+            &mut t.borrow_mut(),
+            h,
+            spacing_hz,
+            nfft,
+            taps,
+            &mut Vec::new(),
+            &mut out,
+        )
     });
     out
 }
@@ -835,7 +843,9 @@ pub fn doppler_series_into(
         if n == 0 {
             continue;
         }
-        let b = chain_b.and_then(|b| chain_slice(rec, b)).filter(|b| b.len() == a.len());
+        let b = chain_b
+            .and_then(|b| chain_slice(rec, b))
+            .filter(|b| b.len() == a.len());
 
         let (mut sre, mut sim) = (0.0f32, 0.0f32);
         match b {

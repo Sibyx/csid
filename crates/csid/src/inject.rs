@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([f[2], f[3]]), 9);
         assert_eq!(u32::from_le_bytes([f[4], f[5], f[6], f[7]]), 1 << 2);
         assert_eq!(f[8], 12); // 6 Mbps in 500 kbps units
-        // 802.11: data frame to broadcast from the sentinel.
+                              // 802.11: data frame to broadcast from the sentinel.
         assert_eq!(&f[9..11], &[0x08, 0x00]);
         assert_eq!(&f[13..19], &[0xff; 6]);
         assert_eq!(&f[19..25], &parse_mac("ef:be:ad:de:ad:de"));

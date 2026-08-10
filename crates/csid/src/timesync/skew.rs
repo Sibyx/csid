@@ -365,10 +365,7 @@ pub fn fleet_transfer_skew(
         }
     }
 
-    let worst = pairs
-        .iter()
-        .max_by_key(|p| p.worst_case_ns())
-        .cloned();
+    let worst = pairs.iter().max_by_key(|p| p.worst_case_ns()).cloned();
 
     TransferReport {
         tx_id: tx_id.to_string(),
@@ -508,7 +505,11 @@ mod tests {
         assert!(r.pairs.is_empty());
         assert_eq!(r.unpaired, vec![("a".to_string(), "b".to_string())]);
         assert!(!r.within_budget());
-        assert!(r.render().contains("TOO FEW COMMON PACKETS"), "{}", r.render());
+        assert!(
+            r.render().contains("TOO FEW COMMON PACKETS"),
+            "{}",
+            r.render()
+        );
     }
 
     /// A one-node "fleet" has no pair. It must not read as a zero skew.
@@ -574,13 +575,28 @@ mod tests {
     #[test]
     fn duplicate_deliveries_keep_the_earliest_sighting() {
         let a = vec![
-            Arrival { seq: 1, unix_ts_ns: T0 + 5_000 },
-            Arrival { seq: 1, unix_ts_ns: T0 + 900_000 },
-            Arrival { seq: 2, unix_ts_ns: T0 + PERIOD_NS },
+            Arrival {
+                seq: 1,
+                unix_ts_ns: T0 + 5_000,
+            },
+            Arrival {
+                seq: 1,
+                unix_ts_ns: T0 + 900_000,
+            },
+            Arrival {
+                seq: 2,
+                unix_ts_ns: T0 + PERIOD_NS,
+            },
         ];
         let b = vec![
-            Arrival { seq: 1, unix_ts_ns: T0 },
-            Arrival { seq: 2, unix_ts_ns: T0 + PERIOD_NS },
+            Arrival {
+                seq: 1,
+                unix_ts_ns: T0,
+            },
+            Arrival {
+                seq: 2,
+                unix_ts_ns: T0 + PERIOD_NS,
+            },
         ];
         let (d, _) = common_differences(&a, &b);
         assert_eq!(d, vec![5_000, 0], "the 900 µs re-delivery must not win");
@@ -611,7 +627,11 @@ mod tests {
         );
         assert_eq!(ok.pairs.len(), 3);
         assert!(ok.within_budget(), "{}", ok.render());
-        assert!(ok.render().contains("worst pair: monad02 ↔ monad03"), "{}", ok.render());
+        assert!(
+            ok.render().contains("worst pair: monad02 ↔ monad03"),
+            "{}",
+            ok.render()
+        );
 
         let bad = fleet_transfer_skew(
             "tx",

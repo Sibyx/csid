@@ -107,7 +107,11 @@ fn a_healthy_link_survives_the_wire_and_passes_both_registered_gates() {
     assert_eq!(report.health.host, "monad04");
     assert!(report.health.capture_alive, "a fresh capture is alive");
 
-    let scope = report.health.scope.as_ref().expect("a scope crossed the wire");
+    let scope = report
+        .health
+        .scope
+        .as_ref()
+        .expect("a scope crossed the wire");
     assert_eq!(scope.src_mac, "ef:be:ad:de:ad:de");
     assert!(scope.scoped_records > 3000, "{scope:?}");
 

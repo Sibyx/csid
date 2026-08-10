@@ -698,14 +698,14 @@ mod tests {
         assert!(text.contains("csid_node_thermal_headroom_celsius -1.500"));
         assert!(text.contains("csid_node_throttle_flags 524288"));
         // The soft limit has fired at some point...
-        assert!(text.contains(
-            "csid_node_throttled{condition=\"soft_limit\",window=\"since_boot\"} 1"
-        ));
+        assert!(
+            text.contains("csid_node_throttled{condition=\"soft_limit\",window=\"since_boot\"} 1")
+        );
         // ...but is not firing at this instant, and the supply is fine.
         assert!(text.contains("csid_node_throttled{condition=\"soft_limit\",window=\"now\"} 0"));
-        assert!(text.contains(
-            "csid_node_throttled{condition=\"undervolt\",window=\"since_boot\"} 0"
-        ));
+        assert!(
+            text.contains("csid_node_throttled{condition=\"undervolt\",window=\"since_boot\"} 0")
+        );
     }
 
     /// An unreadable sensor must produce no sample at all. A zero would render
@@ -738,8 +738,14 @@ mod tests {
 
     #[test]
     fn the_worst_verdict_wins_and_unmeasured_never_masks_a_real_one() {
-        assert_eq!(worse_of(Verdict::Pass, Verdict::Marginal), Verdict::Marginal);
-        assert_eq!(worse_of(Verdict::Marginal, Verdict::Pass), Verdict::Marginal);
+        assert_eq!(
+            worse_of(Verdict::Pass, Verdict::Marginal),
+            Verdict::Marginal
+        );
+        assert_eq!(
+            worse_of(Verdict::Marginal, Verdict::Pass),
+            Verdict::Marginal
+        );
         assert_eq!(worse_of(Verdict::Marginal, Verdict::Fail), Verdict::Fail);
         assert_eq!(worse_of(Verdict::Fail, Verdict::Pass), Verdict::Fail);
         // A dev box with no thermal zone reports Unmeasured throughout...

@@ -151,8 +151,12 @@ impl Analysis {
         // series would produce arrays of changing width and a time series
         // whose consecutive samples are not comparable.
         sc.window.clear();
-        sc.window
-            .extend(sc.all.iter().filter(|smp| ClassKey::of(&smp.rec) == class).cloned());
+        sc.window.extend(
+            sc.all
+                .iter()
+                .filter(|smp| ClassKey::of(&smp.rec) == class)
+                .cloned(),
+        );
         let latest = sc.window.last()?.clone();
         let rec = &latest.rec;
         let geom = dsp::Geometry::of(rec);
@@ -308,8 +312,7 @@ impl Analysis {
                 .extend(s.series_tones.iter().copied().filter(|&t| t < geom.ntone));
         }
         sc.tone_series.clear();
-        sc.tone_series
-            .resize(sc.tones.len() * window_len, f32::NAN);
+        sc.tone_series.resize(sc.tones.len() * window_len, f32::NAN);
         for (j, smp) in sc.window.iter().enumerate() {
             let Some(iq) = dsp::chain_slice(&smp.rec, chain_idx) else {
                 continue;
@@ -550,8 +553,7 @@ impl ClientView {
         // New records since this client's last frame. Ask for more than the
         // row budget, because part of what arrives belongs to other classes
         // and will not be drawn.
-        let (cursor, ring_skipped) =
-            hub.since_into(self.cursor, plan.rows * 8, &mut self.arrived);
+        let (cursor, ring_skipped) = hub.since_into(self.cursor, plan.rows * 8, &mut self.arrived);
         self.cursor = cursor;
 
         let of_class = self
@@ -810,7 +812,8 @@ fn phy_mix(window: &[Sample], mix: &mut MixInfo) {
         mix.width.add(WidthKey(r.width));
         match r.phy {
             Some(p) => {
-                mix.modulation.add(crate::class::Phy::of(Some(p.modulation)));
+                mix.modulation
+                    .add(crate::class::Phy::of(Some(p.modulation)));
                 mix.nss.add(p.nss);
                 mix.mcs.add(p.mcs);
             }
@@ -1430,7 +1433,10 @@ mod tests {
 
         // `chain_identical` is legitimately null on a single-chain record, so
         // it is checked for presence rather than for a value.
-        assert!(h["validation"].as_object().unwrap().contains_key("chain_identical"));
+        assert!(h["validation"]
+            .as_object()
+            .unwrap()
+            .contains_key("chain_identical"));
 
         // The two arrays the console iterates as tables.
         let avail = h["class"]["available"].as_array().expect("class.available");

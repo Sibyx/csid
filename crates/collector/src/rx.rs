@@ -106,11 +106,9 @@ impl RxSocket {
                 if (*cmsg).cmsg_level == libc::SOL_SOCKET
                     && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
                 {
-                    let ts = std::ptr::read_unaligned(
-                        libc::CMSG_DATA(cmsg) as *const libc::timespec
-                    );
-                    arrival_ns =
-                        Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
+                    let ts =
+                        std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::timespec);
+                    arrival_ns = Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
                     break;
                 }
                 cmsg = libc::CMSG_NXTHDR(&msg, cmsg);

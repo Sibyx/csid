@@ -140,7 +140,10 @@ pub fn cv(xs: &[f64]) -> Option<f64> {
         return None;
     }
     let m = mean(xs);
-    if !(m > 0.0) {
+    // NaN and a non-positive mean both make a coefficient of variation
+    // meaningless. Spelled out rather than written `!(m > 0.0)`, which reads
+    // as a typo and hides that the NaN branch is deliberate.
+    if m.is_nan() || m <= 0.0 {
         return None;
     }
     let s = sd(xs);
@@ -270,10 +273,16 @@ mod tests {
 
     #[test]
     fn the_rng_is_bit_reproducible_across_runs() {
-        let a: Vec<usize> = (0..8).scan(Rng::new(0), |r, _| Some(r.below(1000))).collect();
-        let b: Vec<usize> = (0..8).scan(Rng::new(0), |r, _| Some(r.below(1000))).collect();
+        let a: Vec<usize> = (0..8)
+            .scan(Rng::new(0), |r, _| Some(r.below(1000)))
+            .collect();
+        let b: Vec<usize> = (0..8)
+            .scan(Rng::new(0), |r, _| Some(r.below(1000)))
+            .collect();
         assert_eq!(a, b, "seed 0 must give the same stream every time");
-        let c: Vec<usize> = (0..8).scan(Rng::new(1), |r, _| Some(r.below(1000))).collect();
+        let c: Vec<usize> = (0..8)
+            .scan(Rng::new(1), |r, _| Some(r.below(1000)))
+            .collect();
         assert_ne!(a, c);
         assert!(a.iter().all(|&i| i < 1000));
     }
@@ -318,7 +327,9 @@ mod tests {
     #[test]
     fn a_wide_sample_can_clear_the_line_on_the_point_and_miss_on_the_bound() {
         // Mean 105, but hugely dispersed: 60 and 150 alternating.
-        let xs: Vec<f64> = (0..40).map(|i| if i % 2 == 0 { 60.0 } else { 150.0 }).collect();
+        let xs: Vec<f64> = (0..40)
+            .map(|i| if i % 2 == 0 { 60.0 } else { 150.0 })
+            .collect();
         let ci = bootstrap_mean(&xs, 2000, 0).unwrap();
         assert!(ci.point > 100.0, "point estimate clears the floor: {ci:?}");
         assert!(ci.lo < 100.0, "but the lower bound does not: {ci:?}");
@@ -337,7 +348,11 @@ mod tests {
         // 3.5 s of a clean 10 Hz stream: 35 stamps, 3 whole bins of 10.
         let times: Vec<f64> = (0..35).map(|i| i as f64 * 0.1).collect();
         let bins = per_second_bins(&times);
-        assert_eq!(bins, vec![10.0, 10.0, 10.0], "the half-second tail is dropped");
+        assert_eq!(
+            bins,
+            vec![10.0, 10.0, 10.0],
+            "the half-second tail is dropped"
+        );
 
         // Under one whole second there is nothing to bin.
         assert!(per_second_bins(&[0.0, 0.1, 0.2]).is_empty());

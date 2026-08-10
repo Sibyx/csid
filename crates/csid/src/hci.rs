@@ -91,9 +91,9 @@ mod linux {
 
     use super::BleProbe;
     use crate::ble::{
-        command_status, parse_hci_event, scan_enable_command, scan_parameters_command,
-        BleCounters, BleHandle, DeviceHasher, ObservationLog, HCI_EVENT_PKT,
-        OP_LE_SET_SCAN_ENABLE, OP_LE_SET_SCAN_PARAMETERS,
+        command_status, parse_hci_event, scan_enable_command, scan_parameters_command, BleCounters,
+        BleHandle, DeviceHasher, ObservationLog, HCI_EVENT_PKT, OP_LE_SET_SCAN_ENABLE,
+        OP_LE_SET_SCAN_PARAMETERS,
     };
     use crate::config::BleConfig;
     use crate::util::now_unix_ns;
@@ -250,7 +250,10 @@ mod linux {
             };
             if rc != 0 {
                 let e = io::Error::last_os_error();
-                anyhow::bail!("binding the HCI socket to {adapter}: {}", explain(&e, &adapter));
+                anyhow::bail!(
+                    "binding the HCI socket to {adapter}: {}",
+                    explain(&e, &adapter)
+                );
             }
 
             sc.start_scan(cfg)?;
@@ -285,29 +288,21 @@ mod linux {
         /// Send a framed HCI command packet and wait for its Command Complete /
         /// Command Status. `op` is only used to match the completion.
         fn command(&self, op: u16, pkt: &[u8]) -> Result<()> {
-            let n = unsafe {
-                libc::send(
-                    self.fd,
-                    pkt.as_ptr() as *const libc::c_void,
-                    pkt.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::send(self.fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0) };
             if n < 0 {
                 let e = io::Error::last_os_error();
-                anyhow::bail!("sending HCI command 0x{op:04x}: {}", explain(&e, &self.adapter));
+                anyhow::bail!(
+                    "sending HCI command 0x{op:04x}: {}",
+                    explain(&e, &self.adapter)
+                );
             }
 
             let deadline = Instant::now() + CMD_TIMEOUT;
             let mut buf = vec![0u8; RECV_BUF];
             while Instant::now() < deadline {
                 let n = unsafe {
-                    libc::recv(
-                        self.fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
+                    libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
                 };
                 if n < 0 {
                     let e = io::Error::last_os_error();

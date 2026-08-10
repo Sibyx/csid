@@ -94,7 +94,11 @@ pub fn probe_cmd(
         );
     }
     match &health.delivered_hz {
-        Some(c) => println!("  rate      : {} Hz (n = {} one-second bins)", c.render(1), c.n),
+        Some(c) => println!(
+            "  rate      : {} Hz (n = {} one-second bins)",
+            c.render(1),
+            c.n
+        ),
         None => println!("  rate      : not measurable"),
     }
     match &health.interarrival_cv {
@@ -147,7 +151,10 @@ pub fn status_cmd(
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", super::render::fleet_table(&report, &Palette::detect(no_color)));
+        print!(
+            "{}",
+            super::render::fleet_table(&report, &Palette::detect(no_color))
+        );
     }
     std::process::exit(exit_for(report.state()));
 }
@@ -184,16 +191,22 @@ pub fn clock_cmd(
         });
     }
 
-    println!("csid fleet clock — {} node(s), {samples} round trip(s) each\n", nodes.len());
     println!(
-        "{:<3} {:<9} {:>12} {:>12} {:>8}  {}",
-        "", "node", "offset ms", "± ms", "samples", "time daemon"
+        "csid fleet clock — {} node(s), {samples} round trip(s) each\n",
+        nodes.len()
+    );
+    println!(
+        "{:<3} {:<9} {:>12} {:>12} {:>8}  time daemon",
+        "", "node", "offset ms", "± ms", "samples"
     );
     println!("{}", "-".repeat(72));
 
     for (host, est) in &estimates {
         match est {
-            None => println!("{:<3} {:<9} {:>12} {:>12} {:>8}  {}", "??", host, "—", "—", 0, "not measured"),
+            None => println!(
+                "{:<3} {:<9} {:>12} {:>12} {:>8}  not measured",
+                "??", host, "—", "—", 0
+            ),
             Some(c) => {
                 let inside = c.worst_case_ns() <= budget_ns;
                 let daemon = c
@@ -203,8 +216,14 @@ pub fn clock_cmd(
                         format!(
                             "{} {}{}",
                             n.daemon,
-                            if n.synchronised { "synced" } else { "NOT SYNCED" },
-                            n.stratum.map(|s| format!(" stratum {s}")).unwrap_or_default()
+                            if n.synchronised {
+                                "synced"
+                            } else {
+                                "NOT SYNCED"
+                            },
+                            n.stratum
+                                .map(|s| format!(" stratum {s}"))
+                                .unwrap_or_default()
                         )
                     })
                     .unwrap_or_else(|| "none".into());
@@ -236,7 +255,10 @@ pub fn clock_cmd(
     println!("{}", skew.render());
     println!();
     if skew.within_budget() {
-        println!("=== FLEET IS TIME-COHERENT within the {} ms budget ===", cfg.clock_budget_ms);
+        println!(
+            "=== FLEET IS TIME-COHERENT within the {} ms budget ===",
+            cfg.clock_budget_ms
+        );
     } else {
         println!(
             "=== FLEET IS NOT CERTIFIED TIME-COHERENT ===\n\
@@ -319,8 +341,20 @@ pub fn timesync_report_cmd(
     }
 
     println!("{} — session {}", report.host, report.session_id);
-    println!("  window    : {:.0} s ({} row(s) of {} in the log)", report.window_s, report.rows, rows.len());
-    println!("  stamps    : {}", if report.stamp_sources.is_empty() { "none".into() } else { report.stamp_sources.join("+") });
+    println!(
+        "  window    : {:.0} s ({} row(s) of {} in the log)",
+        report.window_s,
+        report.rows,
+        rows.len()
+    );
+    println!(
+        "  stamps    : {}",
+        if report.stamp_sources.is_empty() {
+            "none".into()
+        } else {
+            report.stamp_sources.join("+")
+        }
+    );
     println!("  csid / app: {} / {}", report.rows_csid, report.rows_app);
     if malformed > 0 {
         println!("  malformed : {malformed} log line(s) skipped");
@@ -552,41 +586,44 @@ pub fn gate_rate_cmd(
 
     let mut worst = GateVerdict::Pass;
     for (node, out) in runner.run_all(&nodes, &cmd) {
-        let outcome = match out
-            .require()
-            .map_err(|e| e.summary())
-            .and_then(|s| serde_json::from_str::<probe::ProbeReport>(s).map_err(|e| e.to_string()))
-        {
-            Err(why) => {
-                let mut g = if which == "g1" {
-                    gates::g1_delivered_rate(&node.name, &[], gates::G1_FLOOR_HZ)
-                } else {
-                    gates::g2_interarrival_cv(&node.name, &[], gates::G2_CV_CEILING)
-                };
-                g.verdict = GateVerdict::Unknown;
-                g.detail.insert(0, format!("node not measured — {why}"));
-                g
-            }
-            Ok(r) => {
-                let scope = r
-                    .health
-                    .scope
-                    .as_ref()
-                    .map(|s| format!("{} / {} {}", node.name, s.class, s.src_mac))
-                    .unwrap_or_else(|| node.name.clone());
-                if which == "g1" {
-                    gates::g1_delivered_rate(&scope, &r.arrival_s, gates::G1_FLOOR_HZ)
-                } else {
-                    gates::g2_interarrival_cv(&scope, &r.arrival_s, gates::G2_CV_CEILING)
+        let outcome =
+            match out.require().map_err(|e| e.summary()).and_then(|s| {
+                serde_json::from_str::<probe::ProbeReport>(s).map_err(|e| e.to_string())
+            }) {
+                Err(why) => {
+                    let mut g = if which == "g1" {
+                        gates::g1_delivered_rate(&node.name, &[], gates::G1_FLOOR_HZ)
+                    } else {
+                        gates::g2_interarrival_cv(&node.name, &[], gates::G2_CV_CEILING)
+                    };
+                    g.verdict = GateVerdict::Unknown;
+                    g.detail.insert(0, format!("node not measured — {why}"));
+                    g
                 }
-            }
-        };
+                Ok(r) => {
+                    let scope = r
+                        .health
+                        .scope
+                        .as_ref()
+                        .map(|s| format!("{} / {} {}", node.name, s.class, s.src_mac))
+                        .unwrap_or_else(|| node.name.clone());
+                    if which == "g1" {
+                        gates::g1_delivered_rate(&scope, &r.arrival_s, gates::G1_FLOOR_HZ)
+                    } else {
+                        gates::g2_interarrival_cv(&scope, &r.arrival_s, gates::G2_CV_CEILING)
+                    }
+                }
+            };
         print!("{}", outcome.render(if which == "g1" { 1 } else { 3 }));
         println!();
         worst = worst.worse(outcome.verdict);
     }
 
-    println!("=== {} overall: {} ===", which.to_uppercase(), worst.label());
+    println!(
+        "=== {} overall: {} ===",
+        which.to_uppercase(),
+        worst.label()
+    );
     std::process::exit(exit_for_gate(worst));
 }
 
@@ -615,7 +652,11 @@ pub fn gate_g3_cmd(
         .or_else(|| cfg.ap_node.clone())
         .context("G3 needs an AP node: pass --ap-node or set [fleet] ap_node")?;
     let ap = ssh::NodeSpec {
-        addr: cfg.addresses.get(&ap_name).cloned().unwrap_or_else(|| ap_name.clone()),
+        addr: cfg
+            .addresses
+            .get(&ap_name)
+            .cloned()
+            .unwrap_or_else(|| ap_name.clone()),
         name: ap_name.clone(),
         user: None,
     };
@@ -631,7 +672,11 @@ pub fn gate_g3_cmd(
          AP node   : {ap_name} (unit {unit}, interface {iface})\n\
          Rx nodes  : {}\n\
          Window    : {:.0} min (registered minimum {} min)\n",
-        nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>().join(", "),
+        nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         duration.as_secs_f64() / 60.0,
         gates::G3_MIN_PROBE_S / 60,
     );
@@ -682,13 +727,17 @@ pub fn gate_g3_cmd(
     //    that drops off mid-probe fails condition (i-b), and the minimum over
     //    the samples is what catches it — a final check would not.
     println!("\nholding the probe window; sampling AP associations every 30 s…");
-    let station_cmd = format!("iw dev {} station dump | grep -c '^Station' || true", ssh::shell_quote(&iface));
+    let station_cmd = format!(
+        "iw dev {} station dump | grep -c '^Station' || true",
+        ssh::shell_quote(&iface)
+    );
     let mut min_stations: Option<u32> = None;
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_secs(30).min(
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        ));
+        std::thread::sleep(
+            Duration::from_secs(30)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
         let out = runner.run(&ap, &station_cmd);
         if let Ok(s) = out.require() {
             if let Ok(n) = s.trim().parse::<u32>() {
@@ -701,7 +750,11 @@ pub fn gate_g3_cmd(
     let mut resets: std::collections::BTreeMap<String, Option<u32>> = Default::default();
     for (node, cursor) in &cursors {
         let spec = ssh::NodeSpec {
-            addr: cfg.addresses.get(node).cloned().unwrap_or_else(|| node.clone()),
+            addr: cfg
+                .addresses
+                .get(node)
+                .cloned()
+                .unwrap_or_else(|| node.clone()),
             name: node.clone(),
             user: None,
         };
@@ -715,7 +768,9 @@ pub fn gate_g3_cmd(
         let out = runner.run(&spec, &cmd);
         resets.insert(
             node.clone(),
-            out.require().ok().and_then(|s| s.trim().parse::<u32>().ok()),
+            out.require()
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok()),
         );
     }
 
@@ -733,7 +788,9 @@ pub fn gate_g3_cmd(
         {
             None => (None, None),
             Some(r) => (
-                Some(gates::g1_delivered_rate(&node.name, &r.arrival_s, gates::G1_FLOOR_HZ).verdict),
+                Some(
+                    gates::g1_delivered_rate(&node.name, &r.arrival_s, gates::G1_FLOOR_HZ).verdict,
+                ),
                 Some(
                     gates::g2_interarrival_cv(&node.name, &r.arrival_s, gates::G2_CV_CEILING)
                         .verdict,
@@ -755,7 +812,10 @@ pub fn gate_g3_cmd(
         worst = worst.worse(outcome.verdict);
     }
 
-    print!("{}", super::render_lifecycle("stop", &super::stop(cfg, &nodes, experiment)));
+    print!(
+        "{}",
+        super::render_lifecycle("stop", &super::stop(cfg, &nodes, experiment))
+    );
     println!("\n=== G3 overall: {} ===", worst.label());
     if worst != GateVerdict::Pass {
         println!("\n{}", gates::G3_FALLBACK);
@@ -897,7 +957,11 @@ pub fn runbook_day0_cmd(
          Source: experiments/Lab Session Plan 2026-08.md (Day 0) + prereg v2 §3, §11.\n\
          This stops at the FIRST failure. Fix it, then re-run.\n",
         nodes.len(),
-        nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>().join(", ")
+        nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     for (i, step) in steps.iter().enumerate() {
@@ -970,7 +1034,11 @@ pub fn runbook_day0_cmd(
                     match c {
                         Some(c) => println!(
                             "  {}  {} — {:+.3} ms ± {:.3} ms ({} sample(s))",
-                            if c.worst_case_ns() <= budget_ns { "OK" } else { "XX" },
+                            if c.worst_case_ns() <= budget_ns {
+                                "OK"
+                            } else {
+                                "XX"
+                            },
                             host,
                             c.offset_ns as f64 / 1e6,
                             c.uncertainty_ns as f64 / 1e6,
@@ -985,9 +1053,7 @@ pub fn runbook_day0_cmd(
                     Vec::new()
                 } else {
                     est.iter()
-                        .filter(|(_, c)| {
-                            c.as_ref().is_none_or(|c| c.worst_case_ns() > budget_ns)
-                        })
+                        .filter(|(_, c)| c.as_ref().is_none_or(|c| c.worst_case_ns() > budget_ns))
                         .map(|(h, _)| h.clone())
                         .collect::<Vec<_>>()
                         .into_iter()
@@ -1135,7 +1201,9 @@ mod tests {
             "{wrapped:#?}"
         );
         assert!(
-            wrapped.iter().any(|l| l.starts_with("       capture proceeds.")),
+            wrapped
+                .iter()
+                .any(|l| l.starts_with("       capture proceeds.")),
             "the list indentation must survive: {wrapped:#?}"
         );
     }

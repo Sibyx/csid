@@ -132,10 +132,15 @@ impl Session {
             "arrival_unix_ns\tsequence\tphone_mono_ns\tphone_wall_ms\tbytes\tkernel_stamped"
         )?;
         let mut exchanges = BufWriter::new(File::create(dir.join("exchanges.tsv"))?);
-        writeln!(exchanges, "t1_phone_mono_ns\tt2_unix_ns\tt3_unix_ns\tsequence")?;
+        writeln!(
+            exchanges,
+            "t1_phone_mono_ns\tt2_unix_ns\tt3_unix_ns\tsequence"
+        )?;
 
-        let mut identity = Identity::default();
-        identity.peer = peer.to_string();
+        let identity = Identity {
+            peer: peer.to_string(),
+            ..Identity::default()
+        };
 
         let mut session = Self {
             dir,
@@ -268,7 +273,11 @@ impl Session {
                 0.0
             },
             mean_interval_ms: mean / 1e6,
-            interval_cv: if mean > 0.0 { variance.sqrt() / mean } else { 0.0 },
+            interval_cv: if mean > 0.0 {
+                variance.sqrt() / mean
+            } else {
+                0.0
+            },
             max_gap_ms: self.max_gap_ns as f64 / 1e6,
             clock_exchanges: self.exchange_count,
             bytes: self.bytes,

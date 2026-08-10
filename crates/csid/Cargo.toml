@@ -33,6 +33,12 @@ parquet = { version = "59", default-features = false, features = ["snap"] }
 # Per-session device pseudonyms. A cryptographic hash is not something to
 # hand-roll, even in a crate that hand-rolls its own calendar arithmetic.
 sha2 = "0.10"
+# The BLE salt's entropy source. Reading `/dev/urandom` directly was the same
+# reflex as hand-rolling the hash: it works on the capture nodes and fails on
+# every other host the `ble` module is documented to build for. `getrandom` is
+# the OS CSPRNG on each platform (`getrandom(2)`, `BCryptGenRandom`, …) and was
+# already in the lock file transitively.
+getrandom = "0.3"
 
 # Linux-only machinery: raw netlink (via libc), realtime scheduling / CPU
 # affinity (nix), and journald log export. Not built on other platforms, so the

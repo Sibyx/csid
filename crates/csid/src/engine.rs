@@ -51,12 +51,7 @@ pub struct SessionOutcome {
 /// `ble` carries `(observations, Hz)` when co-capture is enabled. It is appended
 /// rather than interleaved so the CSI half of the line is byte-identical to
 /// what it has always been, and absent entirely on a session without BLE.
-fn capture_status(
-    session_id: &str,
-    records: u64,
-    rate_hz: f64,
-    ble: Option<(u64, f64)>,
-) -> String {
+fn capture_status(session_id: &str, records: u64, rate_hz: f64, ble: Option<(u64, f64)>) -> String {
     let base = format!("capturing {session_id} ({records} rec, {rate_hz:.1} Hz)");
     match ble {
         // A scanner that has stopped producing shows as `0.0 Hz` here, which is
@@ -152,7 +147,8 @@ pub fn run_session(
                     let _ = h.join();
                 }
                 sidecar.close(Status::Failed, None);
-                return Err(e).context("starting the time-transfer receiver (timesync.required = true)");
+                return Err(e)
+                    .context("starting the time-transfer receiver (timesync.required = true)");
             }
             Err(e) => {
                 tracing::error!(

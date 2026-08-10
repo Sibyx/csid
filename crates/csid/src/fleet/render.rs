@@ -53,8 +53,8 @@ impl Palette {
         // Bold on everything that is not OK: on a dim projector the weight
         // carries further than the hue.
         let code = match state {
-            State::Ok => "32",       // green
-            State::Warn => "1;33",   // bold yellow
+            State::Ok => "32",        // green
+            State::Warn => "1;33",    // bold yellow
             State::Unknown => "1;35", // bold magenta — deliberately not grey:
             // "no news" must be as loud as "bad news".
             State::Fail => "1;31", // bold red
@@ -256,7 +256,7 @@ mod tests {
                 .collect(),
         );
         let text = fleet_table(&r, &Palette::plain());
-        assert_eq!(text.matches("OK ").count() >= 3, true, "{text}");
+        assert!(text.matches("OK ").count() >= 3, "{text}");
         assert!(text.contains("=== GO — 3/3 nodes OK ==="), "{text}");
         assert!(text.contains("52:legacyofdm ef:be:ad:de:ad:de"), "{text}");
     }
@@ -279,7 +279,10 @@ mod tests {
             .skip_while(|l| !l.starts_with("---"))
             .skip(1)
             .collect();
-        assert!(body[0].starts_with("XX "), "worst row must be first: {text}");
+        assert!(
+            body[0].starts_with("XX "),
+            "worst row must be first: {text}"
+        );
         assert!(body[0].contains("monad07"), "{text}");
         assert!(
             body[1].contains("NOT producing records"),
@@ -321,11 +324,14 @@ mod tests {
         let ok = p.paint(State::Ok, "x");
         let unknown = p.paint(State::Unknown, "x");
         assert!(ok.contains("\x1b[32m"), "{ok:?}");
-        assert!(!unknown.contains("32m"), "UNKNOWN must not be green: {unknown:?}");
+        assert!(
+            !unknown.contains("32m"),
+            "UNKNOWN must not be green: {unknown:?}"
+        );
         assert!(unknown.contains("1;35"), "{unknown:?}");
         assert_eq!(p.paint(State::Fail, "x"), "\x1b[1;31mx\x1b[0m");
         // NO_COLOR / --no-color wins.
-        assert_eq!(Palette::detect(true).colour, false);
+        assert!(!Palette::detect(true).colour);
     }
 
     /// An unreachable node shows the reason, not an empty row that reads as

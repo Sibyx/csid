@@ -194,7 +194,9 @@ impl ClockHealth {
     /// The bound the budget is checked against: an offset is only inside the
     /// budget if it is inside it *including* its uncertainty.
     pub fn worst_case_ns(&self) -> u64 {
-        self.offset_ns.unsigned_abs().saturating_add(self.uncertainty_ns)
+        self.offset_ns
+            .unsigned_abs()
+            .saturating_add(self.uncertainty_ns)
     }
 }
 
@@ -671,7 +673,11 @@ mod tests {
         });
         let s = n.grade(&Budgets::default());
         assert_eq!(s, State::Warn);
-        assert!(n.notes.iter().any(|m| m.contains("lower bound")), "{:?}", n.notes);
+        assert!(
+            n.notes.iter().any(|m| m.contains("lower bound")),
+            "{:?}",
+            n.notes
+        );
 
         // And when the point itself misses, it is a hard failure.
         n.delivered_hz = Some(Ci {
@@ -822,8 +828,7 @@ mod tests {
     /// contribute does not exist.
     #[test]
     fn one_unmeasured_node_takes_the_whole_fleet_off_go() {
-        let mut nodes: Vec<(NodeHealth, State)> =
-            (0..9).map(|_| (healthy(), State::Ok)).collect();
+        let mut nodes: Vec<(NodeHealth, State)> = (0..9).map(|_| (healthy(), State::Ok)).collect();
         let r = report(nodes.clone());
         assert_eq!(r.state(), State::Ok);
         assert!(r.go_no_go().starts_with("GO —"), "{}", r.go_no_go());

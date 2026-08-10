@@ -158,7 +158,11 @@ impl FleetConfig {
         names
             .into_iter()
             .map(|name| {
-                let addr = self.addresses.get(&name).cloned().unwrap_or_else(|| name.clone());
+                let addr = self
+                    .addresses
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
                 NodeSpec {
                     name,
                     addr,
@@ -414,7 +418,10 @@ pub fn timesync_sweep(
     cfg: &FleetConfig,
     nodes: &[NodeSpec],
     window_s: f64,
-) -> Vec<(String, std::result::Result<crate::timesync::TimesyncReport, String>)> {
+) -> Vec<(
+    String,
+    std::result::Result<crate::timesync::TimesyncReport, String>,
+)> {
     let runner = cfg.runner();
     let cmd = format!(
         "{} {} timesync report --json --window {window_s}",
@@ -447,7 +454,10 @@ pub fn timesync_sweep(
 /// transmitter on the air (an injector plus a phone), and a skew measured on a
 /// transmitter only two nodes could hear is a measurement of those two nodes.
 pub fn dominant_transmitter(
-    reports: &[(String, std::result::Result<crate::timesync::TimesyncReport, String>)],
+    reports: &[(
+        String,
+        std::result::Result<crate::timesync::TimesyncReport, String>,
+    )],
 ) -> Option<String> {
     let mut tally: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
     for (_, r) in reports {
@@ -471,7 +481,10 @@ pub fn dominant_transmitter(
 /// reach at all is returned separately, because "unreachable" and "heard
 /// nothing" are different failures.
 pub fn transfer_report(
-    reports: &[(String, std::result::Result<crate::timesync::TimesyncReport, String>)],
+    reports: &[(
+        String,
+        std::result::Result<crate::timesync::TimesyncReport, String>,
+    )],
     tx_id: &str,
     budget_ns: u64,
     min_common: usize,
@@ -521,7 +534,10 @@ what makes it safe to fall back to.";
 /// Render the full time-transfer readout: per-node liveness, the pairwise skew
 /// table, the phone fits, and the authority statement.
 pub fn render_transfer(
-    reports: &[(String, std::result::Result<crate::timesync::TimesyncReport, String>)],
+    reports: &[(
+        String,
+        std::result::Result<crate::timesync::TimesyncReport, String>,
+    )],
     report: &crate::timesync::skew::TransferReport,
     unreachable: &[(String, String)],
     window_s: f64,
@@ -589,7 +605,10 @@ pub fn render_transfer(
     } else {
         out.push_str("\nphone → fleet affine fit (unix_ts_ns ~ a*mono_ns + b)\n");
         for (host, f) in fits {
-            out.push_str(&format!("\n  [{host}] {}\n", f.render().replace('\n', "\n  ")));
+            out.push_str(&format!(
+                "\n  [{host}] {}\n",
+                f.render().replace('\n', "\n  ")
+            ));
         }
     }
 
@@ -654,7 +673,10 @@ pub fn render_lifecycle(verb: &str, results: &[(String, LifecycleOutcome)]) -> S
     }
     out.push('\n');
     if ok == results.len() && !results.is_empty() {
-        out.push_str(&format!("=== ALL {ok} NODE(S) {} ===\n", verb.to_uppercase()));
+        out.push_str(&format!(
+            "=== ALL {ok} NODE(S) {} ===\n",
+            verb.to_uppercase()
+        ));
     } else {
         out.push_str(&format!(
             "=== {} — {ok} of {} node(s) confirmed. The rest did NOT {verb}. \
@@ -754,7 +776,11 @@ pub fn start(
 }
 
 /// Stop a capture on every node and confirm the session closed.
-pub fn stop(cfg: &FleetConfig, nodes: &[NodeSpec], experiment: &str) -> Vec<(String, LifecycleOutcome)> {
+pub fn stop(
+    cfg: &FleetConfig,
+    nodes: &[NodeSpec],
+    experiment: &str,
+) -> Vec<(String, LifecycleOutcome)> {
     let runner = cfg.runner();
     let unit = format!("csid@{experiment}");
     // `systemctl stop` is synchronous, so by the time it returns the session
@@ -772,7 +798,10 @@ pub fn stop(cfg: &FleetConfig, nodes: &[NodeSpec], experiment: &str) -> Vec<(Str
             let outcome = match out.require() {
                 Err(why) => LifecycleOutcome::Unreachable(why.summary()),
                 Ok(stdout) => match serde_json::from_str::<probe::ProbeReport>(
-                    stdout.lines().find(|l| l.starts_with('{')).unwrap_or(stdout),
+                    stdout
+                        .lines()
+                        .find(|l| l.starts_with('{'))
+                        .unwrap_or(stdout),
                 ) {
                     Ok(r) if !r.health.capture_alive => LifecycleOutcome::Confirmed(format!(
                         "stopped — last session {}",
@@ -997,8 +1026,7 @@ mod tests {
         assert_eq!(ad_hoc[0].addr, "monad11");
 
         // An address override wins (a node not yet enrolled in the tailnet).
-        cfg.addresses
-            .insert("monad04".into(), "monad.local".into());
+        cfg.addresses.insert("monad04".into(), "monad.local".into());
         let ovr = cfg.select(Some("monad04"));
         assert_eq!(ovr[0].name, "monad04");
         assert_eq!(ovr[0].addr, "monad.local");
@@ -1122,7 +1150,10 @@ mod tests {
             ("monad03".to_string(), Ok(mk(base + 12_000_000))),
         ];
         let text = render_broadcast(&results, gates::G4B_BUDGET_NS);
-        assert!(text.contains("stamp spread across nodes: 40.0 ms"), "{text}");
+        assert!(
+            text.contains("stamp spread across nodes: 40.0 ms"),
+            "{text}"
+        );
         assert!(text.contains("upper"), "{text}");
         assert!(text.contains("boundary of record"), "{text}");
         assert!(!text.contains("ABOVE BUDGET"), "{text}");
@@ -1143,16 +1174,7 @@ mod tests {
             (
                 "monad01".to_string(),
                 Ok(crate::marker::Marker::at(
-                    1,
-                    "h",
-                    "s",
-                    "B",
-                    "Z",
-                    "cycling",
-                    "start",
-                    None,
-                    None,
-                    None,
+                    1, "h", "s", "B", "Z", "cycling", "start", None, None, None,
                 )),
             ),
             ("monad02".to_string(), Err("timed out".into())),
@@ -1169,7 +1191,10 @@ mod tests {
         let steps = day0_steps(&FleetConfig::default(), "lab-anchor", "hci0");
         let titles: Vec<&str> = steps.iter().map(|s| s.title).collect();
         let clock = titles.iter().position(|t| t.contains("clock")).unwrap();
-        let rate = titles.iter().position(|t| t.contains("delivered-rate")).unwrap();
+        let rate = titles
+            .iter()
+            .position(|t| t.contains("delivered-rate"))
+            .unwrap();
         assert!(clock < rate, "{titles:?}");
 
         // And the documented order of the BLE bring-up is preserved.
