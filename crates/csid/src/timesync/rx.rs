@@ -67,6 +67,13 @@ mod imp {
     /// How long a read waits before returning so the stop flag is observed.
     const RECV_TIMEOUT_MS: i64 = 250;
 
+    /// One frame off the wire: its bytes, the `sockaddr_ll` packet type, and
+    /// the kernel's receive stamp when `SO_TIMESTAMPNS` gave one. The stamp is
+    /// an `Option` rather than a fallback value because a userspace stamp
+    /// carries scheduler jitter of the same order as the skew being measured,
+    /// and a session that fell back must not be pooled with kernel-stamped ones.
+    type Frame<'a> = (&'a [u8], u8, Option<u64>);
+
     struct RxSocket {
         fd: libc::c_int,
         /// Whether `SO_TIMESTAMPNS` was accepted. Decided once, at open.
@@ -156,11 +163,8 @@ mod imp {
             rc == 0
         }
 
-        /// One frame: `(bytes, pkttype, kernel stamp if the kernel gave one)`.
-        fn recv<'a>(
-            &self,
-            buf: &'a mut [u8],
-        ) -> std::io::Result<Option<(&'a [u8], u8, Option<u64>)>> {
+        /// One frame, or `None` on a timeout so the stop flag gets observed.
+        fn recv<'a>(&self, buf: &'a mut [u8]) -> std::io::Result<Option<Frame<'a>>> {
             let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             let mut cbuf = [0u8; 128];
             let mut iov = libc::iovec {
