@@ -874,6 +874,36 @@ on_close = true
         assert!(cfg.validate().is_err());
     }
 
+    /// A segmented profile is legal on its own terms, and 80 MHz has nothing to
+    /// do with it — the pair `segment_duration >= duration` is what validate()
+    /// rejects. This is the shape `csid bench` used to build by shortening
+    /// `duration` while leaving the profile's segment length alone, which made
+    /// every segmenting profile look like it had an invalid radio config.
+    #[test]
+    fn rejects_segment_longer_than_session() {
+        let segmented = SAMPLE.replace(
+            "duration = \"30m\"",
+            "duration = \"30m\"\nsegment_duration = \"5m\"",
+        );
+        let cfg: ExperimentConfig = toml::from_str(&segmented).unwrap();
+        cfg.validate().expect("5m segments inside a 30m session are fine");
+
+        // Shorten the session below the segment — what bench did.
+        let bench_shaped = segmented.replace("duration = \"30m\"\nsegment", "duration = \"30s\"\nsegment");
+        let cfg: ExperimentConfig = toml::from_str(&bench_shaped).unwrap();
+        assert!(
+            cfg.validate().is_err(),
+            "a 5m segment inside a 30s session must be rejected"
+        );
+
+        // Dropping segmentation — what bench now does — makes it valid again,
+        // proving the radio config (ch36 @ 80MHz) was never the problem.
+        let mut cfg: ExperimentConfig = toml::from_str(&bench_shaped).unwrap();
+        cfg.capture.segment_duration = None;
+        cfg.validate()
+            .expect("ch36 @ 80MHz is valid; only the segment/duration pair was wrong");
+    }
+
     #[test]
     fn rejects_bad_mac() {
         let bad = SAMPLE.replace("aa:bb:cc:dd:ee:ff", "not-a-mac");

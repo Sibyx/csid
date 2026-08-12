@@ -25,6 +25,13 @@ pub fn run(
     let mut cfg = ExperimentConfig::resolve(experiment, experiment_dir)?;
     if let Some(d) = duration_override {
         cfg.capture.duration = Some(d);
+        // Same trap as in `bench`: shortening the session below the profile's
+        // own segment length makes validate() reject the config outright. Drop
+        // segmentation rather than fail — the operator asked for a short run,
+        // and a session that fits in one segment does not need rotation.
+        if cfg.capture.segment_duration.is_some_and(|seg| seg >= d) {
+            cfg.capture.segment_duration = None;
+        }
     }
     let outcome = engine::run_session(global, &cfg, stop)?;
     println!(
@@ -595,6 +602,15 @@ pub fn bench(
         let mut cfg = base.clone();
         cfg.radio.channel = ch;
         cfg.capture.duration = Some(duration);
+        // A bench is a seconds-long probe, so segmentation is meaningless here —
+        // and leaving the experiment's own value in place makes the run
+        // UNRUNNABLE: validate() rejects `segment_duration >= duration`, which is
+        // exactly what a 30 m segment against a 30 s bench is. Every profile that
+        // segments (drift-24h, drift-overnight-illum, …) therefore failed
+        // `csid bench` with a bare "configuration is invalid", while unsegmented
+        // ones (smoke) passed — which reads as a band or width fault and is not
+        // one. Observed 2026-08-12 on monad06 chasing a phantom 80 MHz bug.
+        cfg.capture.segment_duration = None;
         cfg.experiment = Some(format!("{}-bench-ch{ch}", base.slug()));
 
         // Started before the session so the trace covers the radio setup too,
