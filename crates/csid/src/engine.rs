@@ -5,14 +5,23 @@
 //! ```text
 //! [RX thread]  pinned, SCHED_RR — recv + stamp + hand off, nothing else
 //!     ├─ unbounded channel ─→ [durable thread] → capture.raw (lossless)
+//!     │                                            │ (capture.segment_duration)
+//!     │                                            └─→ [sealer thread] → sidecar + .csiq
 //!     └─ bounded channel   ─→ [live thread]    → CSIQ datagrams (best-effort)
 //! [main thread] sd_notify watchdog, duration bound, stop flag
 //! ```
 //!
 //! Nothing on the live side can apply backpressure to the RX thread: its
 //! channel is bounded and the producer uses `try_send`.
+//!
+//! With `capture.segment_duration` set, the durable thread rolls its output
+//! file on a wall-clock deadline and hands each sealed file to the sealer,
+//! which writes that segment's sidecar and CSIQ export. The rotation itself is
+//! only flush + fsync + create, so the expensive export never stalls the
+//! writer. See [`crate::segment`] for why a segment is a sibling session
+//! directory rather than a nested one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
@@ -24,6 +33,7 @@ use anyhow::{Context, Result};
 use crate::ble::{self, BleCounters};
 use crate::config::{ExperimentConfig, GlobalConfig};
 use crate::debugfs::Knobs;
+use crate::segment;
 use crate::sidecar::{BleSummary, Sidecar, Status, SummaryMeta, TimesyncSummary};
 use crate::sinks::{Counters, DurableSink, LiveSink};
 use crate::source::{self, RawCsiMessage};
@@ -240,17 +250,114 @@ pub fn run_session(
         1
     });
 
+    // -- segment sealer ----------------------------------------------------
+    // Only spawned when rotation is configured. It turns each sealed segment
+    // into a session-shaped directory that `csid-sync` ships and `csid-prune`
+    // reclaims *while this session is still running* — see `segment`.
+    let segment_duration = cfg.capture.segment_duration;
+    let sealer = match segment_duration {
+        Some(d) => {
+            tracing::info!(
+                every = %humantime_serde::re::humantime::format_duration(d),
+                "segment rotation enabled — sealed segments sync and prune during the run"
+            );
+            Some(segment::spawn(sidecar.clone(), cfg.clone())?)
+        }
+        None => None,
+    };
+
     // -- durable writer thread --------------------------------------------
     let durable_counters = counters.clone();
     let durable_dir = dir.clone();
+    let durable_session_id = session_id.clone();
     let durable = thread::Builder::new()
         .name("csid-durable".into())
-        .spawn(move || -> Result<PathBuf> {
-            let mut sink = DurableSink::create(&durable_dir, durable_counters)?;
-            while let Ok(msg) = durable_rx.recv() {
-                sink.write(&msg)?;
+        .spawn(move || -> Result<Vec<PathBuf>> {
+            // With rotation on, the CSI stream never lands in the session root:
+            // segment 0001 is a directory in its own right, so the root holds
+            // only whole-session artefacts (the sidecar, time transfer, BLE).
+            let spool = durable_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| durable_dir.clone());
+            let mut index: u32 = 1;
+            let mut write_dir = durable_dir.clone();
+            if segment_duration.is_some() {
+                write_dir = spool.join(segment::segment_dir_name(&durable_session_id, index));
+                std::fs::create_dir_all(&write_dir)
+                    .with_context(|| format!("creating segment dir {}", write_dir.display()))?;
             }
-            sink.finish()
+
+            let mut sink = DurableSink::create(&write_dir, durable_counters)?;
+            let mut deadline = segment_duration.map(|d| Instant::now() + d);
+
+            loop {
+                // A short poll rather than a blocking `recv`: a segment must
+                // roll on wall-clock time even on a channel so quiet that no
+                // record arrives to trigger the check. Otherwise a silent hour
+                // produces one oversized segment and nothing ships.
+                match durable_rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(msg) => sink.write(&msg)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                let Some(d) = segment_duration else { continue };
+                if deadline.is_some_and(|dl| Instant::now() < dl) {
+                    continue;
+                }
+
+                index += 1;
+                let next_dir = spool.join(segment::segment_dir_name(&durable_session_id, index));
+                if let Err(e) = std::fs::create_dir_all(&next_dir) {
+                    // Keep capturing into the current segment rather than
+                    // losing the stream over a full or read-only spool; the
+                    // next tick retries.
+                    tracing::error!(
+                        error = %e,
+                        dir = %next_dir.display(),
+                        "creating the next segment dir failed; continuing in the current segment"
+                    );
+                    deadline = Some(Instant::now() + d);
+                    index -= 1;
+                    continue;
+                }
+                let sealed_raw = sink.rotate(&next_dir)?;
+                let sealed_dir = sealed_raw
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| spool.clone());
+                if let Some(s) = &sealer {
+                    s.submit(segment::Sealed {
+                        dir: sealed_dir,
+                        raw: sealed_raw,
+                        index: index - 1,
+                    });
+                }
+                deadline = Some(Instant::now() + d);
+            }
+
+            let last = sink.finish()?;
+            match sealer {
+                // The final partial segment is sealed exactly like the others,
+                // so a stopped run leaves no directory that sync would skip.
+                // `finish` then drains the queue and hands back every sealed
+                // raw in index order — which is the order the session-level
+                // summary must walk them in for FTM unwrapping to be continuous.
+                Some(s) => {
+                    let last_dir = last
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| spool.clone());
+                    s.submit(segment::Sealed {
+                        dir: last_dir,
+                        raw: last,
+                        index,
+                    });
+                    Ok(s.finish())
+                }
+                None => Ok(vec![last]),
+            }
         })
         .context("spawning durable writer thread")?;
 
@@ -404,17 +511,24 @@ pub fn run_session(
         let _ = h.join();
     }
     let _ = rx.join();
-    let raw_path = match durable.join() {
-        Ok(Ok(p)) => Some(p),
+    // One entry for an unsegmented session; one per segment, in index order,
+    // for a rotated one.
+    let raw_paths: Vec<PathBuf> = match durable.join() {
+        Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "durable writer failed");
-            None
+            Vec::new()
         }
         Err(_) => {
             tracing::error!("durable writer panicked");
-            None
+            Vec::new()
         }
     };
+    // The session root only owns a `capture.raw` when rotation is off; with
+    // segments the root keeps just the whole-session artefacts.
+    let raw_path: Option<PathBuf> = (cfg.capture.segment_duration.is_none())
+        .then(|| raw_paths.first().cloned())
+        .flatten();
     let _ = live.join();
 
     knobs.set_best_effort(crate::debugfs::knob::CSI_ENABLED, "0");
@@ -442,10 +556,11 @@ pub fn run_session(
     // Close-time summary is best effort — it must never invalidate the capture.
     // The same single pass over `capture.raw` yields the `ftm` ticks, so time
     // transfer costs the teardown nothing extra and the hot path nothing at all.
-    let (mut summary, ticks) = raw_path
-        .as_ref()
-        .map(|p| summarize(p, cfg, &counters, &ts_macs))
-        .unwrap_or_else(|| (base_summary(&counters), Vec::new()));
+    let (mut summary, ticks) = if raw_paths.is_empty() {
+        (base_summary(&counters), Vec::new())
+    } else {
+        summarize(&raw_paths, cfg, &counters, &ts_macs)
+    };
 
     if cfg.timesync.enabled {
         summary.timesync = Some(finish_timesync(
@@ -711,8 +826,17 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
 /// triples the time-transfer pairing needs. Passing an empty set collects
 /// nothing, so a session without `[timesync]` walks the file exactly as it
 /// always did and allocates nothing extra.
+/// Session-level summary over the whole CSI stream.
+///
+/// Takes a *list* because a segmented session's stream is spread across
+/// `<session_id>-segNNNN/capture.raw` files. They are walked in index order
+/// with a single [`csiq::FtmUnwrapper`]: the FTM counter is a free-running
+/// hardware value that wraps, so unwrapping it per segment and summing would
+/// mis-measure the span at every boundary. One unwrapper across the
+/// concatenation is the only correct reading, and it is why segment order is
+/// part of the contract rather than an implementation detail.
 fn summarize(
-    raw: &std::path::Path,
+    raws: &[PathBuf],
     cfg: &ExperimentConfig,
     counters: &Counters,
     ftm_macs: &std::collections::HashSet<[u8; 6]>,
@@ -720,37 +844,40 @@ fn summarize(
     let mut summary = base_summary(counters);
     let mut ticks: Vec<timesync::CsiTick> = Vec::new();
 
-    let Ok(file) = std::fs::File::open(raw) else {
-        return (summary, ticks);
-    };
-    let reader = std::io::BufReader::new(file);
-    let mut rr = csiq::raw::RawReader::new(reader, cfg.radio.width.to_csiq());
-
     let mut tones: Vec<u16> = Vec::new();
     let mut count: u64 = 0;
     let mut first_ftm: Option<u32> = None;
     let mut unwrapper = csiq::FtmUnwrapper::new();
     let mut last_unwrapped: u64 = 0;
 
-    while let Ok(Some(rec)) = rr.next_record() {
-        count += 1;
-        if !tones.contains(&rec.ntone) {
-            tones.push(rec.ntone);
-        }
-        let u = unwrapper.push(rec.ftm);
-        if first_ftm.is_none() {
-            first_ftm = Some(rec.ftm);
-        }
-        last_unwrapped = u;
+    for raw in raws {
+        let Ok(file) = std::fs::File::open(raw) else {
+            tracing::warn!(path = %raw.display(), "summary: segment unreadable; skipping");
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut rr = csiq::raw::RawReader::new(reader, cfg.radio.width.to_csiq());
 
-        // A record with no wallclock cannot be matched to a received frame, and
-        // one from a transmitter we never stamped can never be needed.
-        if rec.unix_ts_ns != 0 && ftm_macs.contains(&rec.src_mac) {
-            ticks.push(timesync::CsiTick {
-                unix_ts_ns: rec.unix_ts_ns,
-                ftm: rec.ftm,
-                src_mac: rec.src_mac,
-            });
+        while let Ok(Some(rec)) = rr.next_record() {
+            count += 1;
+            if !tones.contains(&rec.ntone) {
+                tones.push(rec.ntone);
+            }
+            let u = unwrapper.push(rec.ftm);
+            if first_ftm.is_none() {
+                first_ftm = Some(rec.ftm);
+            }
+            last_unwrapped = u;
+
+            // A record with no wallclock cannot be matched to a received frame,
+            // and one from a transmitter we never stamped can never be needed.
+            if rec.unix_ts_ns != 0 && ftm_macs.contains(&rec.src_mac) {
+                ticks.push(timesync::CsiTick {
+                    unix_ts_ns: rec.unix_ts_ns,
+                    ftm: rec.ftm,
+                    src_mac: rec.src_mac,
+                });
+            }
         }
     }
 

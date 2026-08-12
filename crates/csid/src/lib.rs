@@ -24,6 +24,7 @@
 //! | [`hci`] | Linux (AF_BLUETOOTH) | The passive LE scan that feeds [`ble`] |
 //! | [`timesync`] | any (rx: Linux AF_PACKET) | Time transfer over the illumination stream: payload stamps, inter-node skew, the phone affine fit, `time_transfer.parquet` |
 //! | [`engine`], [`sinks`], [`notify`] | Linux | Session orchestration, the two sinks, `sd_notify` |
+//! | [`segment`] | any | Rotating a long capture into session-shaped segments that sync and prune while it runs |
 //! | [`thermal`] | Linux (Pi) | Die temperature and the firmware throttle word — what qualifies a node for a long run |
 //! | [`marker`] | any | Block markers stamped in native `unix_ts_ns` — the boundary reference |
 //! | [`fleet`] | any | The bench cockpit: fan-out status, the pre-registered gates, session lifecycle, clock coherence |
@@ -50,6 +51,7 @@ pub mod inject;
 pub mod marker;
 pub mod notify;
 pub mod radio;
+pub mod segment;
 pub mod sidecar;
 pub mod sinks;
 pub mod source;

@@ -315,6 +315,17 @@ impl Sidecar {
             .with_context(|| format!("writing sidecar {}", self.path.display()))
     }
 
+    /// Re-target this sidecar at another file.
+    ///
+    /// Used by segment rotation: a segment's sidecar is a clone of the
+    /// session's open-time one (so it inherits the radio / inject / timesync /
+    /// environment blocks verbatim and is self-describing) pointed at the
+    /// segment's own directory. `path` is `#[serde(skip)]`, so it is the one
+    /// field a clone does not carry meaningfully.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     /// Path of the sidecar on disk.
     pub fn path(&self) -> &Path {
         &self.path

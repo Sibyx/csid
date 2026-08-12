@@ -92,6 +92,36 @@ impl DurableSink {
         Ok(())
     }
 
+    /// Path of the file currently being written.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Seal the current `capture.raw` and begin a new one under `dir`.
+    ///
+    /// Returns the path of the file just sealed. The durable stream is
+    /// flushed and `fsync`ed before the handle is dropped, so the sealed file
+    /// is complete and readable the instant this returns — that is what lets a
+    /// sealed segment be exported and uploaded while the capture continues.
+    ///
+    /// This is the only blocking work on the durable thread, and it is
+    /// deliberately kept to flush + fsync + create: the expensive part
+    /// (CSIQ export) happens on the sealer thread. Records that arrive during
+    /// the rotation queue in the unbounded durable channel and drain
+    /// immediately after, so a rotation costs latency, never data.
+    pub fn rotate(&mut self, dir: &Path) -> Result<PathBuf> {
+        self.out.flush().context("flushing capture.raw before rotation")?;
+        self.out
+            .get_ref()
+            .sync_all()
+            .context("fsync on capture.raw before rotation")?;
+
+        let next = dir.join("capture.raw");
+        let file = File::create(&next).with_context(|| format!("creating {}", next.display()))?;
+        self.out = BufWriter::with_capacity(1024 * 1024, file);
+        Ok(std::mem::replace(&mut self.path, next))
+    }
+
     /// Flush and sync to disk. Called once at session close.
     pub fn finish(mut self) -> Result<PathBuf> {
         self.out.flush().context("flushing capture.raw")?;
@@ -244,5 +274,68 @@ mod tests {
         assert_eq!(counters.records.load(Ordering::Relaxed), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a structurally valid single-record message.
+    fn sample_msg() -> RawCsiMessage {
+        let mut hdr = vec![0u8; 272];
+        hdr[46] = 2; // nrx
+        hdr[47] = 1; // ntx
+        hdr[52..54].copy_from_slice(&52u16.to_le_bytes());
+        RawCsiMessage {
+            hdr,
+            csi: vec![0u8; 52 * 2 * 2 * 2],
+            unix_ts_ns: 1,
+        }
+    }
+
+    /// The property segment rotation depends on: the file handed back by
+    /// `rotate` is closed, complete and parseable *immediately* — that is what
+    /// makes it safe to export and upload while the capture keeps running —
+    /// and records written afterwards land in the new segment, not the old one.
+    #[test]
+    fn rotation_seals_a_readable_file_and_keeps_writing_into_the_next() {
+        let root = std::env::temp_dir().join(format!("csid-rot-{}", std::process::id()));
+        let seg1 = root.join("seg0001");
+        let seg2 = root.join("seg0002");
+        std::fs::create_dir_all(&seg1).unwrap();
+        std::fs::create_dir_all(&seg2).unwrap();
+        let counters = Arc::new(Counters::default());
+
+        let mut sink = DurableSink::create(&seg1, counters.clone()).unwrap();
+        sink.write(&sample_msg()).unwrap();
+        sink.write(&sample_msg()).unwrap();
+
+        let sealed = sink.rotate(&seg2).unwrap();
+        assert_eq!(sealed, seg1.join("capture.raw"));
+        assert_eq!(sink.path(), seg2.join("capture.raw"));
+
+        // Two records readable from the sealed segment before the session ends.
+        let bytes = std::fs::read(&sealed).unwrap();
+        let mut rr = csiq::raw::RawReader::new(&bytes[..], csiq::Width::Ht20);
+        let mut sealed_count = 0;
+        while let Ok(Some(_)) = rr.next_record() {
+            sealed_count += 1;
+        }
+        assert_eq!(sealed_count, 2, "sealed segment must be complete on rotate");
+
+        // The next record goes to the new segment only.
+        sink.write(&sample_msg()).unwrap();
+        let last = sink.finish().unwrap();
+        let bytes2 = std::fs::read(&last).unwrap();
+        let mut rr2 = csiq::raw::RawReader::new(&bytes2[..], csiq::Width::Ht20);
+        let mut next_count = 0;
+        while let Ok(Some(_)) = rr2.next_record() {
+            next_count += 1;
+        }
+        assert_eq!(next_count, 1, "post-rotation records belong to the new segment");
+
+        // The sealed file is untouched by later writes.
+        assert_eq!(std::fs::read(&sealed).unwrap().len(), bytes.len());
+
+        // Counters are session-wide, spanning the rotation.
+        assert_eq!(counters.records.load(Ordering::Relaxed), 3);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

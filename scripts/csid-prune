@@ -12,6 +12,23 @@ set -euo pipefail
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
 GRACE_DAYS="${CSID_PRUNE_GRACE_DAYS:-7}"
 
+# Grace is compared in MINUTES, not days.
+#
+# `find -mtime +N` truncates a file's age to whole 24 h units before comparing,
+# so `-mtime +1` matches only files aged >= 48 h — i.e. a "1 day" grace was
+# silently two days, and "0" was silently one. That off-by-a-day did not matter
+# at the historical 7-day setting, but it does the moment the knob is used to
+# bound disk on a segmented long run, where segments ship within ~15 min of
+# sealing and the whole point is to reclaim promptly.
+#
+# `-mmin +N` truncates to whole minutes instead, so the error is one minute
+# rather than one day and every value means what it says.
+if ! [[ "$GRACE_DAYS" =~ ^[0-9]+$ ]]; then
+    echo "csid-prune: CSID_PRUNE_GRACE_DAYS must be a non-negative integer (got '$GRACE_DAYS')" >&2
+    exit 2
+fi
+GRACE_MINUTES=$(( GRACE_DAYS * 1440 ))
+
 [[ -d "$SPOOL" ]] || { echo "csid-prune: spool $SPOOL missing" >&2; exit 0; }
 
 freed=0
@@ -24,7 +41,7 @@ for dir in "$SPOOL"/*/; do
     [[ -f "$marker" ]] || continue
 
     # Marker older than the grace window?
-    if [[ -z "$(find "$marker" -mtime "+${GRACE_DAYS}" -print -quit 2>/dev/null)" ]]; then
+    if [[ -z "$(find "$marker" -mmin "+${GRACE_MINUTES}" -print -quit 2>/dev/null)" ]]; then
         continue
     fi
 

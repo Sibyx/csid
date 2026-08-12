@@ -232,6 +232,32 @@ pub struct CaptureConfig {
     /// remains the outer bound).
     #[serde(default, with = "humantime_serde::option")]
     pub duration: Option<Duration>,
+    /// Roll `capture.raw` into a fresh, self-contained segment every N of wall
+    /// clock. `None` (the default) keeps the historical single-file session.
+    ///
+    /// A segment is a SESSION-SHAPED DIRECTORY — `<session_id>-segNNNN/` beside
+    /// the session root, carrying its own `capture.raw`, `metadata.json` and
+    /// `capture.csiq`. That shape is the whole point: `csid-sync` ships any
+    /// directory whose sidecar reads `complete` and that has no `.synced`
+    /// marker, and `csid-prune` reclaims raw bytes a grace window after that
+    /// marker appears. Segments therefore upload *during* a run, retry from the
+    /// on-disk queue when the node is offline, and get cleaned up — with no
+    /// change to either script.
+    ///
+    /// WHY THIS EXISTS. Without it an N-hour capture is a single file that no
+    /// consumer can read and no copy can leave the node until a clean close,
+    /// because `capture.csiq` is only exported at teardown. A node lost at hour
+    /// 5 of 6 costs the entire session. Segmenting bounds that loss to one
+    /// segment and puts every sealed one in object storage while the run
+    /// continues. It also bounds disk: `csid-prune` can reclaim shipped
+    /// segments mid-run, which is what makes a 1 kHz / 80 MHz profile
+    /// (~14 GB/h) survivable on a 58 GB card at all.
+    ///
+    /// The radio is NOT touched on rotation — same monitor VIF, same tune, same
+    /// netlink registration. Only the output file rolls, so there is no
+    /// retune gap and no capture hole at a segment boundary.
+    #[serde(default, with = "humantime_serde::option")]
+    pub segment_duration: Option<Duration>,
 }
 
 fn default_mode() -> String {
@@ -243,6 +269,7 @@ impl Default for CaptureConfig {
         CaptureConfig {
             mode: default_mode(),
             duration: None,
+            segment_duration: None,
         }
     }
 }
@@ -703,6 +730,32 @@ impl ExperimentConfig {
     pub fn validate(&self) -> Result<()> {
         caps::validate_radio(&self.radio)?;
 
+        // Segment rotation. A too-short segment turns a capture into a sealing
+        // treadmill (every rotation costs an fsync plus a CSIQ export of the
+        // segment just closed); a segment longer than the session never fires
+        // and is almost certainly a units mistake — both are cheap to catch
+        // here and expensive to discover at hour six of an unattended run.
+        if let Some(seg) = self.capture.segment_duration {
+            if seg < Duration::from_secs(60) {
+                anyhow::bail!(
+                    "capture.segment_duration must be >= 60s (got {}); \
+                     shorter segments spend more time sealing than capturing",
+                    humantime_serde::re::humantime::format_duration(seg)
+                );
+            }
+            if let Some(total) = self.capture.duration {
+                if seg >= total {
+                    anyhow::bail!(
+                        "capture.segment_duration ({}) must be shorter than capture.duration ({}) \
+                         — as written the session would produce exactly one segment, so drop \
+                         segment_duration or shorten it",
+                        humantime_serde::re::humantime::format_duration(seg),
+                        humantime_serde::re::humantime::format_duration(total)
+                    );
+                }
+            }
+        }
+
         match self.capture.mode.as_str() {
             "passive" => {}
             "inject" => {
@@ -985,5 +1038,76 @@ monad04 = "monad.local"
         let toml_src = format!("{SAMPLE}\n[inject]\nrate_hz = 0\n");
         let cfg: ExperimentConfig = toml::from_str(&toml_src).unwrap();
         cfg.validate().unwrap();
+    }
+
+    /// Segmentation is opt-in; every existing experiment file predates the
+    /// field and must keep validating and behaving exactly as before.
+    #[test]
+    fn segmentation_is_absent_by_default() {
+        let cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        assert!(cfg.capture.segment_duration.is_none());
+        cfg.validate().unwrap();
+    }
+
+    /// `SAMPLE` already carries a `[capture]` table, so these build on the
+    /// parsed struct rather than appending TOML (which would be a duplicate
+    /// key, not a second section).
+    fn sample_with_segments(duration: Option<&str>, segment: Option<&str>) -> ExperimentConfig {
+        let parse = |s: &str| humantime_serde::re::humantime::parse_duration(s).unwrap();
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.duration = duration.map(parse);
+        cfg.capture.segment_duration = segment.map(parse);
+        cfg
+    }
+
+    #[test]
+    fn a_segment_shorter_than_a_minute_is_rejected() {
+        // Below this the run spends more time sealing (fsync + CSIQ export of
+        // the segment just closed) than capturing.
+        let err = sample_with_segments(Some("1h"), Some("5s"))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("60s"), "{err}");
+    }
+
+    /// A segment at least as long as the session yields exactly one segment —
+    /// invariably a units slip (`30m` vs `30s`), and one that would otherwise
+    /// only reveal itself as "why did nothing upload?" hours into a run.
+    #[test]
+    fn a_segment_no_shorter_than_the_session_is_rejected() {
+        let err = sample_with_segments(Some("30m"), Some("30m"))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shorter than"), "{err}");
+    }
+
+    #[test]
+    fn a_sane_segment_validates() {
+        let cfg = sample_with_segments(Some("12h"), Some("30m"));
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.capture.segment_duration,
+            Some(Duration::from_secs(1800))
+        );
+    }
+
+    /// An open-ended session (the console feed, a drift run stopped by hand)
+    /// is exactly where rotation matters most, so it must not need a duration.
+    #[test]
+    fn segmentation_works_without_a_session_duration() {
+        sample_with_segments(None, Some("30m")).validate().unwrap();
+    }
+
+    /// The field must survive a TOML round trip — an operator writes it by
+    /// hand in `/etc/csid/experiments/<exp>.toml` and Ansible renders it there.
+    #[test]
+    fn segment_duration_round_trips_through_toml() {
+        let cfg = sample_with_segments(Some("12h"), Some("30m"));
+        let rendered = toml::to_string(&cfg).unwrap();
+        assert!(rendered.contains("segment_duration"), "{rendered}");
+        let back: ExperimentConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.capture.segment_duration, Some(Duration::from_secs(1800)));
     }
 }
