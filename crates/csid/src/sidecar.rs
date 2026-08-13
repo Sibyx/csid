@@ -203,6 +203,30 @@ pub struct TimesyncSummary {
 pub struct Sidecar {
     pub schema: String,
     pub session_id: String,
+    /// Fleet run identifier — the thing that makes a multi-node capture one
+    /// addressable object.
+    ///
+    /// Every node stamps its own `session_id` from its own start instant, so
+    /// five nodes in one experiment produce five unrelated ids
+    /// (`…184314` … `…184323`, observed 2026-08-12) and every cross-node
+    /// analysis begins by resolving them by hand. Set `CSID_RUN_ID` on the
+    /// units of a fleet capture and they all carry the same value.
+    ///
+    /// When unset, csid generates one so the field is never absent — but see
+    /// `run_id_generated`: a generated id groups nothing but its own session,
+    /// and analysis code must not treat it as evidence of a fleet run.
+    ///
+    /// `serde(default)` is load-bearing, not tidiness: every sidecar written
+    /// before this field existed lacks it, including the whole 2026-08-12
+    /// fleet run and every cached segment. Without a default, adding the field
+    /// would make csid unable to READ its own back catalogue. An empty string
+    /// therefore means "written before run ids existed" — distinct from a
+    /// generated one, and not groupable either.
+    #[serde(default)]
+    pub run_id: String,
+    /// True when csid invented the `run_id` because none was supplied.
+    #[serde(default)]
+    pub run_id_generated: bool,
     pub experiment: String,
     pub tag: Option<String>,
     pub radio: RadioMeta,
@@ -224,6 +248,23 @@ pub struct Sidecar {
     path: PathBuf,
 }
 
+
+/// Environment variable carrying the fleet run identifier.
+pub const RUN_ID_ENV: &str = "CSID_RUN_ID";
+
+/// Resolve the run identifier: supplied by the launcher, or invented here.
+///
+/// Deliberately NOT derived from the experiment name plus a time window. That
+/// inference is what this field exists to replace, and it breaks exactly when
+/// it matters — staggered starts, a node restarted mid-run, two runs of the
+/// same experiment in one evening.
+fn resolve_run_id(session_id: &str) -> (String, bool) {
+    match std::env::var(RUN_ID_ENV) {
+        Ok(v) if !v.trim().is_empty() => (v.trim().to_string(), false),
+        _ => (format!("solo-{session_id}"), true),
+    }
+}
+
 impl Sidecar {
     /// Build the open-time sidecar for a session.
     pub fn open(
@@ -233,6 +274,8 @@ impl Sidecar {
         global: &GlobalConfig,
         tuning: &Tuning,
     ) -> Result<Self> {
+        let (run_id, run_id_generated) = resolve_run_id(&session_id);
+
         let radio = RadioMeta {
             interface: cfg.radio.interface.clone(),
             monitor: cfg.radio.monitor.clone(),
@@ -280,6 +323,8 @@ impl Sidecar {
         let sc = Sidecar {
             schema: SCHEMA.to_string(),
             session_id,
+            run_id,
+            run_id_generated,
             experiment: cfg.slug().to_string(),
             tag: cfg.tag.clone(),
             radio,
@@ -370,5 +415,77 @@ pub fn capture_environment(global: &GlobalConfig, iface: &str) -> EnvironmentMet
         regdomain: crate::radio::regdomain(),
         cpu_governor,
         csid_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+#[cfg(test)]
+mod run_id_tests {
+    use super::*;
+
+    /// A supplied run id is carried verbatim and NOT marked generated — this is
+    /// what makes five nodes one addressable run.
+    #[test]
+    fn supplied_run_id_is_used() {
+        temp_env::with_var(RUN_ID_ENV, Some("exp-lib-01"), || {
+            let (id, generated) = resolve_run_id("monad02_x_20260812-184314");
+            assert_eq!(id, "exp-lib-01");
+            assert!(!generated);
+        });
+    }
+
+    /// Whitespace-only is treated as absent: a systemd `Environment=CSID_RUN_ID=`
+    /// with nothing after it must not silently group every node under "".
+    #[test]
+    fn blank_run_id_is_treated_as_absent() {
+        temp_env::with_var(RUN_ID_ENV, Some("   "), || {
+            let (id, generated) = resolve_run_id("monad02_x_20260812-184314");
+            assert!(generated);
+            assert!(id.starts_with("solo-"));
+        });
+    }
+
+    /// Unset: the field is still populated, but flagged so analysis code cannot
+    /// mistake a solo session for a fleet run.
+    #[test]
+    fn missing_run_id_is_generated_and_flagged() {
+        temp_env::with_var_unset(RUN_ID_ENV, || {
+            let (id, generated) = resolve_run_id("monad02_x_20260812-184314");
+            assert!(generated);
+            assert_eq!(id, "solo-monad02_x_20260812-184314");
+        });
+    }
+}
+
+#[cfg(test)]
+mod legacy_sidecar_tests {
+    use super::*;
+
+    /// A sidecar written before `run_id` existed must still parse.
+    ///
+    /// This is not hypothetical: the entire 2026-08-12 fleet run (120 segments)
+    /// and every cached capture predate the field. A required field here would
+    /// have made csid unable to read its own back catalogue — caught by the
+    /// probe test, pinned here on purpose.
+    #[test]
+    fn sidecar_without_run_id_still_parses() {
+        let json = serde_json::json!({
+            "schema": "csid-session/1",
+            "session_id": "monad02_drift-overnight-illum_20260812-184314",
+            "experiment": "drift-overnight-illum",
+            "tag": null,
+            "radio": {
+                "interface": "wlp1s0", "monitor": "wlp1s0mon0", "band": "2.4",
+                "channel": 11, "control_freq_mhz": 2462, "center_freq_mhz": null,
+                "width": "HT20", "interval_us": 0, "mac_filter": []
+            },
+            "environment": { "csid_version": "0.1.0" },
+            "started_at": "2026-08-12T18:43:14Z",
+            "ended_at": null,
+            "status": "capturing",
+            "summary": null
+        });
+        let sc: Sidecar = serde_json::from_value(json).expect("legacy sidecar must parse");
+        assert_eq!(sc.run_id, "", "legacy sidecars carry no run id");
+        assert!(!sc.run_id_generated);
     }
 }
