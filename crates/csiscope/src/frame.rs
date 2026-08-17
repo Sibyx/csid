@@ -82,6 +82,19 @@ pub struct ViewSettings {
     /// whichever class dominates the window", which is right until the
     /// operator wants a specific one held still.
     pub class: Option<String>,
+    /// Transmitter to scope every view to, as a lower-case colon-separated MAC.
+    ///
+    /// The companion to `class`, and on an illuminated capture the more
+    /// important of the two: the class selector is degenerate when one geometry
+    /// is 100% of the channel, while the transmitter axis separates a 100 Hz
+    /// injector from the ambient talkers whose frames are interleaved with its
+    /// own. Unset means "follow the busiest", which selects the injector by
+    /// itself on a lit channel.
+    ///
+    /// A transmitter that leaves the air falls back to the busiest one, for the
+    /// same reason a pinned class does: the console's job is to keep showing the
+    /// channel.
+    pub smac: Option<String>,
     /// Waterfall scope: `"class"` draws only the selected record class at its
     /// native tone grid; `"all"` draws **every** record on a shared frequency
     /// axis.
@@ -121,6 +134,7 @@ impl Default for ViewSettings {
             paused: false,
             fps: 20.0,
             class: None,
+            smac: None,
             wf_scope: "class".to_string(),
             wf_bins: 256,
             freq_mhz: None,
@@ -148,6 +162,15 @@ impl ViewSettings {
         if self.chain_b == Some(self.chain) {
             self.chain_b = None;
         }
+        // One spelling reaches the analysis, so two clients that typed the same
+        // address in different cases share one computed view rather than two.
+        // An unparseable address is treated as unset for the same reason an
+        // unparseable class is: the console keeps showing the channel.
+        self.smac = self
+            .smac
+            .take()
+            .and_then(|s| parse_mac(&s))
+            .map(|m| format_mac(&m));
     }
 
     /// Frame interval implied by `fps`.
@@ -162,6 +185,11 @@ impl ViewSettings {
     /// the dominant class is what it does when a pinned one leaves the air.
     pub fn class_key(&self) -> Option<ClassKey> {
         self.class.as_deref().and_then(|s| s.parse().ok())
+    }
+
+    /// The pinned transmitter, if the client sent one this build can parse.
+    pub fn smac_bytes(&self) -> Option<[u8; 6]> {
+        self.smac.as_deref().and_then(parse_mac)
     }
 
     /// The subset of settings the shared analysis depends on.
@@ -181,6 +209,7 @@ impl ViewSettings {
             db_max: self.db_max.to_bits(),
             series_tones: self.series_tones.clone(),
             class: self.class.clone(),
+            smac: self.smac.clone(),
             wf_scope: self.wf_scope.clone(),
             wf_bins: self.wf_bins,
             freq_mhz: self.freq_mhz.map(f64::to_bits),
@@ -206,6 +235,7 @@ pub struct ViewKey {
     pub db_max: u32,
     pub series_tones: Vec<usize>,
     pub class: Option<String>,
+    pub smac: Option<String>,
     pub wf_scope: String,
     pub wf_bins: usize,
     pub freq_mhz: Option<u64>,
@@ -223,6 +253,10 @@ pub struct WaterfallPlan {
     pub class: ClassKey,
     /// Tone count of that class, i.e. the row width in `class` scope.
     pub ntone: usize,
+    /// The transmitter every other view is scoped to. Rows from anyone else are
+    /// not drawn, so the waterfall shows the same records the panels beside it
+    /// were computed from.
+    pub smac: Option<[u8; 6]>,
     pub chain: usize,
     pub db_min: f32,
     pub db_max: f32,
@@ -315,6 +349,38 @@ pub fn quantise_db(values: &[f32], db_min: f32, db_max: f32, out: &mut Vec<u8>) 
         let n = ((v - db_min) * scale).round();
         n.clamp(0.0, 255.0) as u8
     }));
+}
+
+
+/// Parse `aa:bb:cc:dd:ee:ff` (any case, `-` also accepted) into six bytes.
+///
+/// Deliberately strict about length and separators: a half-parsed MAC would
+/// scope every view to a transmitter that does not exist, and an empty screen
+/// is a much worse failure than a rejected setting.
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut n = 0usize;
+    for part in s.split([':', '-']) {
+        if n == 6 || part.len() != 2 {
+            return None;
+        }
+        out[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    (n == 6).then_some(out)
+}
+
+/// The canonical spelling: lower case, colon separated.
+pub fn format_mac(m: &[u8; 6]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(17);
+    for (i, b) in m.iter().enumerate() {
+        if i > 0 {
+            s.push(':');
+        }
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 #[cfg(test)]

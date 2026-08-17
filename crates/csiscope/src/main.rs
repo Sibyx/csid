@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use csid::config::{DEFAULT_CONFIG, DEFAULT_EXPERIMENT_DIR};
-use csiscope::{ingest, server, state, DEFAULT_COEFF_BUDGET, DEFAULT_HISTORY};
+use csiscope::{capture, ingest, server, state, DEFAULT_COEFF_BUDGET, DEFAULT_HISTORY};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +54,16 @@ struct Cli {
     /// Node-global configuration file.
     #[arg(long, default_value = DEFAULT_CONFIG)]
     config: PathBuf,
+
+    /// `csid`'s status document (IP-132), read for the capture yield.
+    ///
+    /// It is the only source of `frames_seen`, and therefore the only way to
+    /// tell "the room is quiet" apart from "the channel is busy with traffic
+    /// that cannot produce CSI". Absent on an off-node console, where the
+    /// capture is on another host — the panel then says so rather than
+    /// reporting zero.
+    #[arg(long, default_value = "/run/csid/status.json")]
+    status: PathBuf,
 
     /// Directory holding per-experiment configuration files.
     #[arg(long, default_value = DEFAULT_EXPERIMENT_DIR)]
@@ -102,10 +112,17 @@ fn run(cli: Cli) -> Result<()> {
         None => ingest::Source::Unix(cli.socket.clone()),
     };
 
-    let hub = state::Hub::new(
+    // The status reader starts even when the file is absent: a capture may
+    // begin after the console does, and polling for it is how the console
+    // notices. A missing file is the normal state between sessions.
+    let status = capture::CaptureStatus::new(cli.status.clone());
+    status.spawn();
+
+    let hub = state::Hub::with_capture_status(
         source.label(),
         cli.history.max(64),
         cli.coeff_budget.max(100_000),
+        status,
     );
     ingest::spawn(source, hub.clone())?;
 

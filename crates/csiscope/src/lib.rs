@@ -31,6 +31,8 @@
 //! because each client holds its own cursor into the ring.
 
 pub mod analyze;
+pub mod bandplan;
+pub mod capture;
 pub mod class;
 pub mod console;
 pub mod dsp;
@@ -39,6 +41,7 @@ pub mod ingest;
 pub mod pipeline;
 pub mod server;
 pub mod state;
+pub mod tones;
 pub mod wire;
 
 /// Records held for the windowed views. At the measured 608 Hz ceiling this is

@@ -165,6 +165,93 @@ pub struct ClassInfo {
     pub available: Vec<ClassEntry>,
 }
 
+/// The transmitter scope, and the census that fills its selector.
+///
+/// ## Why this axis exists alongside the class one
+///
+/// The console was built around one organising idea: every analytical view is
+/// scoped to a single record class, because an ambient channel interleaves
+/// incompatible geometries and mixing them produces a series whose consecutive
+/// samples are not measurements of the same thing.
+///
+/// That is right, and on an *illuminated* capture it does nothing. Both
+/// measured coexistence sessions of 2026-08-17 were ~100% one class, so the
+/// class selector had nothing to select. The axis that carried the structure
+/// was the transmitter: the 5 GHz capture held twelve of them and the injector
+/// was 54.3% of records, so the pooled inter-arrival p50 of 6.1 ms described no
+/// transmitter at all — it was an artefact of interleaving one 100 Hz metronome
+/// with eleven ambient talkers.
+///
+/// So the same argument that justifies the class axis justifies this one, and
+/// the same safeguard applies: [`TransmitterInfo::available`] is computed
+/// **before** the transmitter scope is applied, so choosing one transmitter can
+/// never hide the others from the operator who chose it. The whole channel,
+/// every class included, is in the talker table beside it.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct TransmitterInfo {
+    /// The transmitter every view is scoped to, if any.
+    pub selected: Option<Mac>,
+    /// True when the operator pinned it rather than it being the busiest.
+    pub pinned: bool,
+    /// The selected transmitter's share of the **class** window.
+    ///
+    /// Of the class rather than of the channel, because the class is the set the
+    /// operator is choosing within: a transmitter that is every record of its
+    /// own class would otherwise read as a minority.
+    pub share: f64,
+    pub count: u64,
+    /// Every transmitter of the selected class, busiest first — the set the deep
+    /// views can actually be scoped to.
+    pub available: Vec<Talker>,
+}
+
+/// What `csid` says about the capture, as opposed to what the records say.
+///
+/// Everything here comes from `/run/csid/status.json` and none of it can be
+/// derived from the live stream — most importantly `frames_seen`, whose absence
+/// is what makes an empty waterfall ambiguous.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct CaptureInfo {
+    /// False when no status file could be read: csiscope is watching a remote
+    /// UDP stream, or no capture is running. The panel says which.
+    pub present: bool,
+    /// True when the document is older than the console is willing to trust.
+    pub stale: bool,
+    pub age_s: f64,
+    pub session_id: String,
+    pub run_id: String,
+    /// A generated run id groups nothing but its own session, and the panel
+    /// says so rather than presenting it as a fleet key.
+    pub run_id_generated: bool,
+    pub experiment: String,
+    pub state: String,
+    pub uptime_s: u64,
+    pub band: String,
+    pub records: u64,
+    pub frames_seen: u64,
+    /// `records / frames_seen`, or `null` when no frames have arrived — which
+    /// is a different fact from a yield of zero.
+    pub yield_ratio: Option<f64>,
+    /// `ok` / `low` / `bad` / `no frames`, banded per band.
+    pub yield_verdict: &'static str,
+    /// The sentence a bad yield deserves, empty when there is nothing to say.
+    pub yield_note: &'static str,
+    pub rate_hz: f64,
+    pub capture_bytes: u64,
+    pub live_dropped: u64,
+    /// Commanded frame interval in microseconds; 0 means unthrottled. This is
+    /// what lets the metronome panel declare its slot rather than infer it.
+    pub interval_us: u32,
+    /// Present only when BLE co-capture is enabled on the session.
+    pub ble: Option<BleInfo>,
+}
+
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct BleInfo {
+    pub observations: u64,
+    pub rate_hz: f64,
+}
+
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct GeometryInfo {
     pub ntone: usize,
@@ -307,7 +394,17 @@ pub struct Talker {
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct StreamInfo {
+    /// Records the analysis actually ran over: one class, one transmitter.
+    ///
+    /// Two scopes sit between the requested window and this number, and both
+    /// shrink it. The operator has to be able to see that: a Doppler spectrogram
+    /// computed over 139 records when 256 were asked for is a different
+    /// measurement, and silently narrowing it would be the same failure as
+    /// silently pooling transmitters.
     pub window: usize,
+    /// Records of the selected class, before the transmitter scope.
+    pub window_class: usize,
+    /// Every record in the requested window, of every class.
     pub window_all: usize,
     pub depth: usize,
     pub total: u64,
@@ -335,6 +432,11 @@ pub struct WaterfallInfo {
 pub struct SharedHeader {
     pub waterfall: WaterfallInfo,
     pub class: ClassInfo,
+    pub transmitter: TransmitterInfo,
+    pub capture: CaptureInfo,
+    pub metronome: dsp::Metronome,
+    pub tone_stats: dsp::ToneStats,
+    pub bandplan: crate::bandplan::Bandplan,
     pub geometry: GeometryInfo,
     pub radio: RadioInfo,
     pub record: RecordInfo,
@@ -364,6 +466,13 @@ pub struct ClientHeader {
     pub skipped: u64,
     /// Records that arrived but belong to another class.
     pub other_class: u64,
+    /// Records of the right class that belong to another transmitter.
+    ///
+    /// Kept apart from `other_class` and from `skipped` because the three are
+    /// different facts and only one of them is a shortfall: a record excluded
+    /// by a scope was never meant to be drawn, while a record in `skipped` is
+    /// one the display could not keep up with.
+    pub other_transmitter: u64,
     pub wf_rows: usize,
     pub u8: ArrayMap,
     pub n_u8: usize,

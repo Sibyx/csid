@@ -377,7 +377,11 @@ impl Sidecar {
     }
 }
 
-fn band_label(b: Band) -> &'static str {
+/// The band's sidecar spelling. Public because the status document
+/// ([`crate::status`]) must say the same word the sidecar says — a capture that
+/// reports "2.4" while it runs and "2.4 GHz" once closed is one field with two
+/// answers, and every join across the two would have to know that.
+pub fn band_label(b: Band) -> &'static str {
     match b {
         Band::Ghz24 => "2.4",
         Band::Ghz5 => "5",

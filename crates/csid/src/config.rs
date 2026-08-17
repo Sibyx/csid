@@ -58,6 +58,22 @@ pub struct NodeConfig {
     /// Override the reported hostname (defaults to the system hostname).
     #[serde(default)]
     pub hostname: Option<String>,
+    /// Where a running session publishes `csid-status/1` (see [`crate::status`]).
+    ///
+    /// Node-global rather than per-experiment: there is one radio, so there is
+    /// one capture, so there is one status document — and a reader that had to
+    /// know which experiment is running in order to find out what is running
+    /// would be solving the problem backwards.
+    ///
+    /// An empty path disables publication.
+    #[serde(default = "default_status_path")]
+    pub status_path: PathBuf,
+}
+
+fn default_status_path() -> PathBuf {
+    // Beside the live socket: both are volatile, both belong to the running
+    // session, and `RuntimeDirectory=csid` already creates the directory.
+    PathBuf::from("/run/csid/status.json")
 }
 
 impl Default for NodeConfig {
@@ -65,6 +81,7 @@ impl Default for NodeConfig {
         NodeConfig {
             spool: PathBuf::from("/var/lib/csid"),
             hostname: None,
+            status_path: default_status_path(),
         }
     }
 }

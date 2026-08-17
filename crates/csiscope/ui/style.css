@@ -238,7 +238,11 @@ textarea#editor {
 .verdict { margin: 6px 0 0; padding: 6px 9px; font: 11.5px var(--mono);
            border-left: 2px solid var(--line-2); color: var(--muted); }
 .verdict.ok  { border-left-color: var(--accent); color: var(--accent); }
+.verdict.warn { border-left-color: var(--warn); color: var(--warn); }
 .verdict.bad { border-left-color: var(--bad); color: var(--bad); white-space: pre-wrap; }
+/* A verdict inside a panel wraps; the editor's does not. */
+.panel .verdict { white-space: normal; line-height: 1.45; }
+.panel .verdict:empty { display: none; }
 
 .term {
   margin: 0; padding: 8px 10px; max-height: 320px; overflow: auto;

@@ -20,7 +20,9 @@
   </nav>
 
   <div class="strip" id="strip">
+    <div class="tile" id="tile-yield" title="records / frames_seen — an empty census is not evidence of a quiet channel"><span class="k">yield</span><span class="v" id="t-yield">—</span></div>
     <div class="tile"><span class="k">rate</span><span class="v" id="t-rate">—</span></div>
+    <div class="tile" id="tile-deficit" title="delivered vs commanded rate for the scoped transmitter"><span class="k">deficit</span><span class="v" id="t-deficit">—</span></div>
     <div class="tile"><span class="k">class</span><span class="v" id="t-class">—</span></div>
     <div class="tile"><span class="k">mimo</span><span class="v" id="t-mimo">—</span></div>
     <div class="tile"><span class="k">mcs</span><span class="v" id="t-phy">—</span></div>
@@ -44,6 +46,9 @@
       <label>record class
         <select id="c-class"></select>
       </label>
+      <label>transmitter
+        <select id="c-smac"></select>
+      </label>
       <label>waterfall shows
         <select id="c-wfscope">
           <option value="class">the selected class only</option>
@@ -51,13 +56,16 @@
         </select>
       </label>
       <p class="hint">
-        An ambient channel interleaves several PHY types at once. The spectrum,
-        phase, impulse-response and Doppler views are scoped to one class —
-        mixing geometries would change the array widths under the plots and
-        make a time series compare unlike things. The waterfall can show all of
-        them, placed by frequency. <b>Nothing is dropped from the capture
-        either way</b>: csiscope only reads the live stream, and every record
-        still lands in capture.raw.
+        Two scopes, because a capture is a mixture on two axes. An ambient
+        channel interleaves several PHY types at once, and an illuminated one
+        interleaves a metronomic injector with whoever else is talking. The
+        spectrum, phase, impulse-response, Doppler and metronome views are
+        scoped to <b>one class and one transmitter</b> — mixing geometries
+        changes the array widths under the plots, and mixing transmitters
+        produces timing statistics that belong to none of them. The waterfall
+        can still show every class, placed by frequency. <b>Nothing is dropped
+        from the capture</b>: csiscope only reads the live stream, and every
+        record still lands in capture.raw.
       </p>
     </div>
 
@@ -134,6 +142,25 @@
   <!-- --------------------------------------------------------------- scope -->
   <section id="tab-scope" class="tab on">
     <div class="grid">
+
+      <figure class="panel" id="p-capture">
+        <figcaption>
+          <span class="title">Capture</span>
+          <span class="sub">what csid says about itself — the half the live stream cannot report</span>
+          <span class="readout" id="r-capture"></span>
+        </figcaption>
+        <div class="scroll"><table id="tbl-capture"></table></div>
+        <p class="verdict" id="capture-note"></p>
+      </figure>
+
+      <figure class="panel" id="p-metronome">
+        <figcaption>
+          <span class="title">Metronome</span>
+          <span class="sub">delivered against commanded, for the scoped transmitter — inter-arrival as slot multiples</span>
+          <span class="readout" id="r-metronome"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
 
       <figure class="panel span2 tall" id="p-waterfall">
         <figcaption>
@@ -232,6 +259,34 @@
           <span class="title">Clock divergence</span>
           <span class="sub">host and firmware clocks minus the baseband clock, over the window</span>
           <span class="readout" id="r-clocks"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel span2" id="p-bandplan">
+        <figcaption>
+          <span class="title">Band plan</span>
+          <span class="sub">where BLE's channels fall inside this capture's tone grid, over its own median |H(f)|</span>
+          <span class="readout" id="r-bandplan"></span>
+        </figcaption>
+        <canvas></canvas>
+        <p class="verdict" id="bandplan-note"></p>
+      </figure>
+
+      <figure class="panel" id="p-ratio">
+        <figcaption>
+          <span class="title">CSI ratio</span>
+          <span class="sub">H_a/H_b — CFO, SFO and packet-detection delay divide out exactly (FarSense)</span>
+          <span class="readout" id="r-ratio"></span>
+        </figcaption>
+        <canvas></canvas>
+      </figure>
+
+      <figure class="panel" id="p-tonestats">
+        <figcaption>
+          <span class="title">Subcarrier statistics</span>
+          <span class="sub">per-tone median and temporal spread — which tones carry information</span>
+          <span class="readout" id="r-tonestats"></span>
         </figcaption>
         <canvas></canvas>
       </figure>

@@ -108,6 +108,15 @@ pub struct Hub {
     /// Human-readable description of where the stream comes from.
     pub source: String,
     pub started: Instant,
+    /// `csid`'s own view of the capture, polled from its status file.
+    ///
+    /// It lives here rather than beside the HTTP surface because the analysis
+    /// needs it: the yield, the tuned channel and the commanded frame interval
+    /// all belong in the same frame as the numbers derived from the records, or
+    /// an operator is left correlating two panels that refreshed at different
+    /// instants. It is `None` when csiscope is watching a UDP stream from
+    /// another host, where there is no local status file to read.
+    pub capture: Option<Arc<crate::capture::CaptureStatus>>,
 }
 
 impl Hub {
@@ -118,6 +127,23 @@ impl Hub {
             counters: Counters::default(),
             source,
             started: Instant::now(),
+            capture: None,
+        })
+    }
+
+    /// Build a hub that also reads `csid`'s status file.
+    pub fn with_capture_status(
+        source: String,
+        max_records: usize,
+        max_coeffs: usize,
+        status: Arc<crate::capture::CaptureStatus>,
+    ) -> Arc<Self> {
+        Arc::new(Hub {
+            ring: RwLock::new(Ring::new(max_records, max_coeffs)),
+            counters: Counters::default(),
+            source,
+            started: Instant::now(),
+            capture: Some(status),
         })
     }
 

@@ -85,6 +85,22 @@ struct Scratch {
     timing_scratch: Vec<f32>,
     hist: Vec<f32>,
     talkers: Vec<(Mac, TalkerAcc)>,
+    /// A second accumulator, for the transmitters *within the selected class*.
+    /// Separate from `talkers` because the two answer different questions and
+    /// are both wanted in the same frame: one is the channel, one is the set the
+    /// deep views can actually be scoped to.
+    talkers_class: Vec<(Mac, TalkerAcc)>,
+
+    ratio_amp: Vec<f32>,
+    ratio_phase: Vec<f32>,
+    tone_median: Vec<f32>,
+    tone_spread: Vec<f32>,
+    tone_null: Vec<f32>,
+    tone_offsets_mhz: Vec<f32>,
+    stats_scratch: Vec<f32>,
+    metro_scratch: Vec<f32>,
+    metronome: dsp::Metronome,
+    tone_stats: dsp::ToneStats,
 
     census: Census,
     section: F32Section,
@@ -140,6 +156,10 @@ impl Analysis {
         for smp in &sc.all {
             sc.census.add(ClassKey::of(&smp.rec));
         }
+        // What csid says about itself, read once per frame so every panel in
+        // this frame describes the same instant.
+        let capture = hub.capture.as_ref().and_then(|c| c.get());
+
         let dominant = sc.census.dominant()?;
         let requested = s.class_key();
         let class = match requested {
@@ -157,6 +177,30 @@ impl Analysis {
                 .filter(|smp| ClassKey::of(&smp.rec) == class)
                 .cloned(),
         );
+
+        // -- and then only this transmitter --------------------------------
+        //
+        // The second scope, and on an illuminated capture the one that does the
+        // work. Measured 2026-08-17 on ch36: twelve transmitters, the injector
+        // 54.3% of records, and a pooled inter-arrival p50 of 6.1 ms that
+        // belongs to none of them — it is one 100 Hz metronome interleaved with
+        // eleven ambient talkers. Every deep view was being computed over that
+        // mixture.
+        //
+        // The census is taken *before* scoping, so choosing a transmitter can
+        // never hide the others from the operator who chose it.
+        let by_mac = talkers(&sc.window, &mut sc.talkers_class);
+        let requested_mac = s.smac_bytes().map(Mac);
+        let selected_mac = match requested_mac {
+            // A transmitter that has gone quiet falls back to the busiest, for
+            // the same reason a pinned class does.
+            Some(want) if by_mac.iter().any(|t| t.mac == want) => Some(want),
+            _ => by_mac.first().map(|t| t.mac),
+        };
+        let class_window_len = sc.window.len();
+        if let Some(mac) = selected_mac {
+            sc.window.retain(|smp| Mac(smp.rec.src_mac) == mac);
+        }
         let latest = sc.window.last()?.clone();
         let rec = &latest.rec;
         let geom = dsp::Geometry::of(rec);
@@ -358,6 +402,83 @@ impl Analysis {
         let hist_max_us = histogram(&sc.ftm_ns, t_ftm.p999_us, &mut sc.hist);
         sc.section.push("interarrival_hist", &sc.hist);
 
+        // -- the metronome ---------------------------------------------------
+        //
+        // Now that the window is one transmitter, its arrivals are a single
+        // process and can be judged against a slot. Declared beats inferred:
+        // recovering the slot from the very arrivals being judged makes a
+        // source that lost every other slot look perfectly punctual at half the
+        // rate. `interval_us` comes from the capture's own configuration.
+        let declared_us = capture
+            .as_ref()
+            .map(|r| r.snap.interval_us)
+            .filter(|&i| i > 0)
+            .map(|i| i as f64);
+        dsp::metronome_into(
+            &sc.ftm_ns,
+            declared_us,
+            &mut sc.metro_scratch,
+            &mut sc.metronome,
+        );
+        sc.section.push("metronome_multiples", &sc.metronome.multiples);
+
+        // -- per-tone behaviour ----------------------------------------------
+        //
+        // Reads the decimated bundle columns that are already in hand, so this
+        // is a pass rather than an extraction.
+        {
+            let Scratch {
+                columns,
+                tone_median,
+                tone_spread,
+                tone_null,
+                stats_scratch,
+                tone_stats,
+                ..
+            } = sc;
+            dsp::tone_stats_into(
+                columns,
+                geom.ntone,
+                tone_median,
+                tone_spread,
+                tone_null,
+                stats_scratch,
+                tone_stats,
+            );
+        }
+        sc.section.push("tone_median_db", &sc.tone_median);
+        sc.section.push("tone_spread_db", &sc.tone_spread);
+        sc.section.push("tone_null_frac", &sc.tone_null);
+
+        // -- the CSI ratio ----------------------------------------------------
+        {
+            let Scratch {
+                ratio_amp,
+                ratio_phase,
+                ..
+            } = sc;
+            if let Some(b) = chain_b {
+                dsp::ratio_into(rec, chain_idx, b, ratio_amp, ratio_phase);
+            } else {
+                ratio_amp.clear();
+                ratio_phase.clear();
+            }
+        }
+        sc.section.push("ratio_amp_db", &sc.ratio_amp);
+        sc.section.push("ratio_phase", &sc.ratio_phase);
+
+        // -- the frequency axis ------------------------------------------------
+        //
+        // Explicit rather than implied by the index, because it is not implied
+        // by the index: the delivered tones are two runs with a hole at DC (see
+        // `crate::tones`), and the browser cannot reconstruct that from an array
+        // length alone.
+        crate::tones::offsets_hz_into(geom.ntone, spacing, &mut sc.tone_offsets_mhz);
+        for v in sc.tone_offsets_mhz.iter_mut() {
+            *v /= 1e6;
+        }
+        sc.section.push("tone_offset_mhz", &sc.tone_offsets_mhz);
+
         // -- the waterfall's plan (its pixels are drawn per client) -----------
         //
         // Two scopes, because the waterfall answers two different questions.
@@ -381,7 +502,10 @@ impl Analysis {
         // -- mixes and the talker table ---------------------------------------
         let mut mix = std::mem::take(&mut sc.header.mix);
         phy_mix(&sc.window, &mut mix);
-        let talkers = talkers(&sc.window, &mut sc.talkers);
+        // Over `all`, not the scoped window: this panel answers "who is on the
+        // channel", and scoping it to the transmitter already selected would
+        // make it a table with one row that always says 100%.
+        let talkers = talkers(&sc.all, &mut sc.talkers);
 
         let counters = &hub.counters;
         use std::sync::atomic::Ordering::Relaxed;
@@ -412,6 +536,63 @@ impl Analysis {
             count: sc.census.count(class),
             available,
         };
+
+        let selected_count = selected_mac
+            .and_then(|m| by_mac.iter().find(|t| t.mac == m).map(|t| t.count))
+            .unwrap_or(0);
+        h.transmitter = crate::wire::TransmitterInfo {
+            selected: selected_mac,
+            pinned: requested_mac.is_some() && requested_mac == selected_mac,
+            // Share of the *class*, not of the channel: the denominator has to
+            // be the set the operator is choosing within, or a transmitter that
+            // is 100% of its class reads as a minority.
+            share: if class_window_len > 0 {
+                selected_count as f64 / class_window_len as f64
+            } else {
+                0.0
+            },
+            count: selected_count,
+            available: by_mac,
+        };
+
+        h.capture = match &capture {
+            Some(r) => {
+                let ratio = r.snap.yield_ratio();
+                let verdict = crate::capture::classify(ratio, &r.snap.band);
+                crate::wire::CaptureInfo {
+                    present: true,
+                    stale: r.stale(),
+                    age_s: r.age.as_secs_f64(),
+                    session_id: r.snap.session_id.clone(),
+                    run_id: r.snap.run_id.clone(),
+                    run_id_generated: r.snap.run_id_generated,
+                    experiment: r.snap.experiment.clone(),
+                    state: r.snap.state.clone(),
+                    uptime_s: r.snap.uptime_s,
+                    band: r.snap.band.clone(),
+                    records: r.snap.records,
+                    frames_seen: r.snap.frames_seen,
+                    yield_ratio: ratio,
+                    yield_verdict: verdict.label(),
+                    yield_note: crate::capture::note(verdict, &r.snap.band).unwrap_or(""),
+                    rate_hz: r.snap.rate_hz,
+                    capture_bytes: r.snap.capture_bytes,
+                    live_dropped: r.snap.live_dropped,
+                    interval_us: r.snap.interval_us,
+                    ble: r.snap.ble.as_ref().map(|b| crate::wire::BleInfo {
+                        observations: b.observations,
+                        rate_hz: b.rate_hz,
+                    }),
+                }
+            }
+            None => crate::wire::CaptureInfo::default(),
+        };
+
+        h.metronome = sc.metronome.clone();
+        h.tone_stats = sc.tone_stats.clone();
+        // The band plan needs the tuned channel, which the record carries, and
+        // the grid, which the class fixes. Both are already resolved here.
+        h.bandplan = crate::bandplan::compute(rec.channel, geom.ntone, spacing);
 
         h.geometry.ntone = geom.ntone;
         h.geometry.nrx = geom.nrx;
@@ -488,6 +669,7 @@ impl Analysis {
         h.talkers = talkers;
 
         h.stream.window = window_len;
+        h.stream.window_class = class_window_len;
         h.stream.window_all = sc.all.len();
         h.stream.depth = hub.depth();
         h.stream.total = hub.total();
@@ -514,6 +696,7 @@ impl Analysis {
                 span_hz: wf_span_hz,
                 class,
                 ntone: geom.ntone,
+                smac: selected_mac.map(|m| m.0),
                 chain: s.chain,
                 db_min: s.db_min,
                 db_max: s.db_max,
@@ -556,12 +739,21 @@ impl ClientView {
         let (cursor, ring_skipped) = hub.since_into(self.cursor, plan.rows * 8, &mut self.arrived);
         self.cursor = cursor;
 
-        let of_class = self
-            .arrived
-            .iter()
-            .filter(|smp| ClassKey::of(&smp.rec) == plan.class)
-            .count();
-        let other_class = (self.arrived.len() - of_class) as u64;
+        // Three outcomes, counted separately, because only one of them is a
+        // shortfall. A record excluded by a scope was never meant to be drawn;
+        // a record in `skipped` is one the display could not keep up with.
+        let mut of_class = 0usize;
+        let mut other_class = 0u64;
+        let mut other_transmitter = 0u64;
+        for smp in &self.arrived {
+            if ClassKey::of(&smp.rec) != plan.class {
+                other_class += 1;
+            } else if plan.smac.is_some_and(|mac| smp.rec.src_mac != mac) {
+                other_transmitter += 1;
+            } else {
+                of_class += 1;
+            }
+        }
         // Records of this class the row budget could not carry are skipped
         // just as surely as the ones the ring never handed over; both belong
         // in the same honest count.
@@ -580,6 +772,19 @@ impl ClientView {
             if !plan.all_scope {
                 if !same_class {
                     continue;
+                }
+                // The panels beside the waterfall were computed over one
+                // transmitter, so its rows are that transmitter's too. A
+                // waterfall carrying an ambient AP's frames next to a spectrum
+                // built only from the injector's would be two measurements on
+                // one screen, which is the mistake the scope exists to stop.
+                //
+                // In `all` scope the transmitter filter is deliberately not
+                // applied: that mode's whole purpose is to show the channel.
+                if let Some(mac) = plan.smac {
+                    if smp.rec.src_mac != mac {
+                        continue;
+                    }
                 }
                 if remaining_drop > 0 {
                     remaining_drop -= 1;
@@ -616,6 +821,7 @@ impl ClientView {
             cursor,
             skipped,
             other_class,
+            other_transmitter,
             wf_rows,
             n_u8: self.wf.len(),
             ..Default::default()
@@ -975,6 +1181,13 @@ mod tests {
             "drift_host_us",
             "drift_fw_us",
             "interarrival_hist",
+            "metronome_multiples",
+            "tone_median_db",
+            "tone_spread_db",
+            "tone_null_frac",
+            "ratio_amp_db",
+            "ratio_phase",
+            "tone_offset_mhz",
         ] {
             assert!(h["f32"][name].is_array(), "missing f32 array {name}");
         }
@@ -985,11 +1198,25 @@ mod tests {
         assert_eq!(h["f32"]["amp_db"][1], 242);
         assert_eq!(h["f32"]["iq"][1], 484);
         assert_eq!(h["f32"]["chain_amp_db"][1], 484, "one spectrum per chain");
+        // The frequency axis is sent explicitly because it cannot be derived
+        // from the array length: the delivered tones have a hole at DC.
+        assert_eq!(h["f32"]["tone_offset_mhz"][1], 242);
+        assert_eq!(h["f32"]["tone_spread_db"][1], 242);
 
-        // ~600 Hz in, and the window is what was asked for.
+        // The requested window is the whole channel; the analysis window is one
+        // class and one transmitter of it. The synthetic stream cycles three
+        // source MACs, so a third of the class window survives the second scope.
+        assert_eq!(h["stream"]["window_all"], 256);
+        assert_eq!(h["stream"]["window_class"], 256, "one class in this stream");
+        let scoped = h["stream"]["window"].as_u64().unwrap();
+        assert!((84..=86).contains(&scoped), "scoped window was {scoped}");
+        assert_eq!(h["transmitter"]["available"].as_array().unwrap().len(), 3);
+        assert!(h["transmitter"]["selected"].is_string());
+
+        // ~600 Hz arrives on the channel; one transmitter of three delivers a
+        // third of it, and the rate under the plots is that transmitter's.
         let rate = h["timing"]["ftm"]["rate_hz"].as_f64().unwrap();
-        assert!(rate > 550.0 && rate < 650.0, "rate was {rate}");
-        assert_eq!(h["stream"]["window"], 256);
+        assert!(rate > 150.0 && rate < 250.0, "rate was {rate}");
     }
 
     #[test]
@@ -1007,11 +1234,22 @@ mod tests {
         let h = header(&buf);
         assert_eq!(h["wf_rows"], 16);
         assert_eq!(h["u8"]["waterfall"][1], 16 * 52);
+
+        // Every record that arrived is accounted for exactly once, and the four
+        // outcomes are kept apart: drawn, not kept up with, wrong class, wrong
+        // transmitter. Only the second is a shortfall of the display.
+        let drawn = h["wf_rows"].as_u64().unwrap();
+        let skipped = h["skipped"].as_u64().unwrap();
+        let other_class = h["other_class"].as_u64().unwrap();
+        let other_tx = h["other_transmitter"].as_u64().unwrap();
         assert_eq!(
-            h["skipped"], 584,
-            "every record the display did not draw must be counted, whether \
-             the ring dropped it or the row budget did"
+            drawn + skipped + other_class + other_tx,
+            600,
+            "drawn {drawn} + skipped {skipped} + other class {other_class} + \
+             other transmitter {other_tx} must be every record pushed"
         );
+        assert_eq!(other_class, 0, "the stream is one class");
+        assert!(other_tx > 0, "and three transmitters");
         assert_eq!(h["other_class"], 0, "one synthetic class only");
 
         // Caught up: the next frame carries nothing new, and says so.
@@ -1182,8 +1420,12 @@ mod tests {
         assert_eq!(t.len(), 3, "three synthetic source MACs");
         let counts: Vec<u64> = t.iter().map(|r| r["count"].as_u64().unwrap()).collect();
         assert!(counts.windows(2).all(|w| w[0] >= w[1]), "must be ranked");
-        assert_eq!(h["mix"]["modulation"]["he"], 256);
-        assert_eq!(h["mix"]["ntone"]["52"], 256);
+        // The talker table is the CHANNEL, so it counts every record; the mix
+        // describes what is under the plots, so it counts the scoped window.
+        assert_eq!(counts.iter().sum::<u64>(), 256);
+        let mixed = h["mix"]["ntone"]["52"].as_u64().unwrap();
+        assert_eq!(h["mix"]["modulation"]["he"].as_u64().unwrap(), mixed);
+        assert!((84..=86).contains(&mixed), "mix counted {mixed}");
     }
 
     #[test]

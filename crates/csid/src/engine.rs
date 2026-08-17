@@ -110,6 +110,40 @@ pub fn run_session(
     // complete provenance on disk.
     let mut sidecar = Sidecar::open(&dir, session_id.clone(), cfg, global, &tuning)?;
 
+    // The volatile counterpart of the sidecar (IP-132): what the capture is
+    // doing right now, readable while it runs. Built here so it inherits the
+    // sidecar's own run-id resolution rather than repeating it — two answers to
+    // "which run is this" is exactly the drift the field exists to remove.
+    let status_writer = (!global.node.status_path.as_os_str().is_empty())
+        .then(|| crate::status::StatusWriter::new(global.node.status_path.clone()));
+    let mut status_snap = crate::status::Snapshot {
+        schema: crate::status::SCHEMA.to_string(),
+        session_id: session_id.clone(),
+        run_id: sidecar.run_id.clone(),
+        run_id_generated: sidecar.run_id_generated,
+        experiment: cfg.slug().to_string(),
+        host: host.clone(),
+        state: crate::status::STATE_STARTING.to_string(),
+        started_unix_ns: util::now_unix_ns(),
+        uptime_s: 0,
+        channel: cfg.radio.channel,
+        width: cfg.radio.width.iw_token().to_string(),
+        band: crate::sidecar::band_label(tuning.band).to_string(),
+        control_freq_mhz: tuning.freq,
+        center_freq_mhz: tuning.center,
+        interval_us: cfg.radio.interval_us,
+        records: 0,
+        frames_seen: 0,
+        rate_hz: 0.0,
+        capture_bytes: 0,
+        live_sent: 0,
+        live_dropped: 0,
+        ble: cfg.ble.enabled.then(crate::status::BleStatus::default),
+    };
+    if let Some(w) = &status_writer {
+        w.publish(&status_snap);
+    }
+
     // -- injector (capture.mode = "inject") --------------------------------
     // Spawned before the RX loop so a failed socket open fails the session at
     // setup. Runs on the tuned monitor interface; capture continues unchanged
@@ -446,9 +480,19 @@ pub fn run_session(
     ));
     let deadline = cfg.capture.duration.map(|d| Instant::now() + d);
     let watchdog_every = crate::notify::watchdog_interval().unwrap_or(Duration::from_secs(10));
+    let started = Instant::now();
     let mut last_log = Instant::now();
     let mut last_records: u64 = 0;
     let mut last_ble: u64 = 0;
+
+    // The status file ticks ten times faster than the journal heartbeat. It is
+    // read by a human watching a room, and ten seconds is long enough to walk
+    // out of one; the journal line is read afterwards, where it is not.
+    const STATUS_EVERY: Duration = Duration::from_secs(1);
+    let mut last_status = Instant::now();
+    let mut last_status_records: u64 = 0;
+    let mut last_status_ble: u64 = 0;
+    status_snap.state = crate::status::STATE_CAPTURING.to_string();
 
     let status = loop {
         thread::sleep(Duration::from_millis(200));
@@ -466,6 +510,41 @@ pub fn run_session(
         }
 
         crate::notify::watchdog();
+
+        if let Some(w) = &status_writer {
+            if last_status.elapsed() >= STATUS_EVERY {
+                let window = last_status.elapsed().as_secs_f64();
+                let (records, bytes, sent, dropped) = counters.snapshot();
+                status_snap.records = records;
+                // `frames_seen` is the time-transfer receiver's count of frames
+                // the radio delivered, CSI-bearing or not. Without it there is
+                // no denominator, and a session with `timesync.enabled = false`
+                // honestly reports 0 rather than inventing one.
+                status_snap.frames_seen = ts_counters.frames_seen.load(Ordering::Relaxed);
+                status_snap.rate_hz = if window > 0.0 {
+                    records.saturating_sub(last_status_records) as f64 / window
+                } else {
+                    0.0
+                };
+                status_snap.capture_bytes = bytes;
+                status_snap.live_sent = sent;
+                status_snap.live_dropped = dropped;
+                status_snap.uptime_s = started.elapsed().as_secs();
+                if let Some(b) = status_snap.ble.as_mut() {
+                    let obs = ble_counters.observations.load(Ordering::Relaxed);
+                    b.rate_hz = if window > 0.0 {
+                        obs.saturating_sub(last_status_ble) as f64 / window
+                    } else {
+                        0.0
+                    };
+                    b.observations = obs;
+                    last_status_ble = obs;
+                }
+                w.publish(&status_snap);
+                last_status_records = records;
+                last_status = Instant::now();
+            }
+        }
 
         if last_log.elapsed() >= watchdog_every.max(Duration::from_secs(10)) {
             let (records, bytes, sent, dropped) = counters.snapshot();
@@ -506,6 +585,14 @@ pub fn run_session(
 
     // -- teardown ----------------------------------------------------------
     crate::notify::stopping();
+    // Say so before the joins rather than after: sealing a segmented capture
+    // can take seconds, and during them a console reading the last `capturing`
+    // snapshot would report a session that has already stopped.
+    if let Some(w) = &status_writer {
+        status_snap.state = crate::status::STATE_STOPPING.to_string();
+        status_snap.uptime_s = started.elapsed().as_secs();
+        w.publish(&status_snap);
+    }
     stop.store(true, Ordering::Relaxed);
     if let Some(h) = injector {
         let _ = h.join();

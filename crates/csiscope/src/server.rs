@@ -467,3 +467,93 @@ async fn session_export(State(app): State<Shared>, Path(id): Path<String>) -> Ap
     let run = console::run(&app.csid_bin, &["export", &dir.display().to_string()]);
     Ok(Json(json!(run)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{APP_JS, INDEX_HTML};
+
+    /// Every element the console reaches for must exist in the page it serves.
+    ///
+    /// This is the one class of break that neither the compiler nor the Rust
+    /// tests can see: the analysis can be perfect, the frame can carry every
+    /// array, and a panel added to `app.js` with no `<figure>` behind it simply
+    /// renders nothing — silently, in a lab, during a session that will not
+    /// happen twice.
+    ///
+    /// The scan is deliberately dumb. It reads every `$('id')` literal out of
+    /// the script and checks the markup declares it. A dynamic id would slip
+    /// through, and there are none; if one is ever added, this test failing is
+    /// the right way to find out.
+    #[test]
+    fn every_element_the_script_addresses_exists_in_the_page() {
+        let mut missing: Vec<&str> = Vec::new();
+        for (i, _) in APP_JS.match_indices("$('") {
+            let rest = &APP_JS[i + 3..];
+            let Some(end) = rest.find('\'') else { continue };
+            let id = &rest[..end];
+            // Template literals and anything non-literal are not ids.
+            if id.is_empty() || id.contains('$') || id.contains('{') {
+                continue;
+            }
+            let declared = INDEX_HTML.contains(&format!("id=\"{id}\""));
+            if !declared && !missing.contains(&id) {
+                missing.push(id);
+            }
+        }
+        assert!(missing.is_empty(), "app.js addresses missing ids: {missing:?}");
+    }
+
+    /// The panels the render loop draws into must have a canvas to draw on.
+    ///
+    /// `setupPanels` binds `el('canvas', $('p-<id>'))`, which throws on a
+    /// `<figure>` that has none — and the render loop swallows the first throw
+    /// into a single toast, so a missing canvas costs the whole frame.
+    #[test]
+    fn every_registered_panel_has_a_canvas() {
+        let start = APP_JS
+            .find("function setupPanels()")
+            .expect("setupPanels must exist");
+        // Exactly the ids in the registration list, not every string literal in
+        // the function — `el('canvas', ...)` sits in there too.
+        let list_at = start
+            + APP_JS[start..]
+                .find("for (const id of [")
+                .expect("setupPanels must register its panels from one list");
+        let open = list_at + "for (const id of [".len();
+        let close = open + APP_JS[open..].find(']').expect("the list must close");
+        let list = &APP_JS[open..close];
+
+        // Split on the quote: the odd-numbered pieces are the quoted ids, the
+        // even ones are the commas and whitespace between them.
+        let mut checked = 0usize;
+        for id in list.split('\'').skip(1).step_by(2) {
+            let fig = format!("id=\"p-{id}\"");
+            let Some(at) = INDEX_HTML.find(&fig) else {
+                panic!("panel {id} is registered in setupPanels but has no <figure id=\"p-{id}\">");
+            };
+            let block_end = INDEX_HTML[at..]
+                .find("</figure>")
+                .expect("a panel must close");
+            assert!(
+                INDEX_HTML[at..at + block_end].contains("<canvas"),
+                "panel {id} has no canvas to draw on"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 12, "the scan found only {checked} panels");
+    }
+
+    /// A panel that draws must also explain itself. Every `<figure>` carries a
+    /// title and a subtitle stating units or assumptions — the console's
+    /// standing rule that an unlabelled axis is decoration, not an instrument.
+    #[test]
+    fn every_panel_states_what_it_shows() {
+        for (i, _) in INDEX_HTML.match_indices("<figure class=\"panel") {
+            let rest = &INDEX_HTML[i..];
+            let end = rest.find("</figcaption>").unwrap_or(0);
+            let cap = &rest[..end];
+            assert!(cap.contains("class=\"title\""), "a panel has no title");
+            assert!(cap.contains("class=\"sub\""), "a panel has no subtitle");
+        }
+    }
+}

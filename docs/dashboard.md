@@ -28,6 +28,38 @@ The console exists for the two questions that only a live view answers:
 - **Showing the work.** A waterfall and a Doppler spectrogram of a real channel
   are the most direct explanation of what this project measures.
 
+## Capture yield — read this before the record class
+
+`records / frames_seen`, first tile on the strip and first panel on the page.
+
+It cannot be computed from the live stream, which carries records and nothing
+else. `csid` publishes it to `/run/csid/status.json` about once a second, and
+the console polls that file.
+
+The reason it leads is that its most important reading is the one where the
+stream is silent. Measured on 2026-08-17, a `smoke-bench-ch11` session received
+**3915 frames and produced 0 CSI records**. Without the denominator that is four
+indistinguishable states — a quiet room, a mistuned radio, a dead driver, a
+stopped unit — and it is none of them. On 2.4 GHz the usual cause is DSSS/CCK,
+which has no OFDM preamble and therefore no channel estimate to report. The
+channel was busy. Every frame was seen. None could become CSI.
+
+The verdict is banded per band, because the bands genuinely differ. Over that
+day's channel survey, 5 GHz yielded a median **99.4%** across 57 sessions while
+2.4 GHz yielded **3.5%** across 18:
+
+| band | ≥ 80 % | 20–80 % | < 20 % | no frames |
+|---|---|---|---|---|
+| 5 / 6 GHz | `ok` | `low` | `bad` | `no frames` |
+| 2.4 GHz | `ok` | `ok` | `low` — expected | `no frames` |
+
+The panel also carries the **run id**, which is what makes a multi-node capture
+one addressable object, and says plainly when `csid` generated one — a generated
+id groups nothing but its own session.
+
+When no status file can be read — no capture running, or an off-node console on
+a UDP stream — the panel says so rather than showing a zero.
+
 ## The record class — read this first
 
 `csid caps` states it plainly: **CSI type follows the received frame.** An
@@ -49,6 +81,34 @@ So the console has one organising idea:
 > `(tone count, modulation)`. The operator picks it in the rail; the default is
 > whichever class dominates the analysis window.
 
+## …and one transmitter
+
+The class axis is right on an ambient channel and does nothing on an illuminated
+one. Both coexistence sessions of 2026-08-17 were ~100% a single class, so the
+class selector had nothing to select.
+
+The axis that carried the structure was the transmitter. The 5 GHz capture held
+**twelve** of them and the injector was 54.3% of records, so its pooled
+inter-arrival p50 of 6.1 ms described no transmitter at all — it was one 100 Hz
+metronome interleaved with eleven ambient talkers, and every deep view was being
+computed over the mixture.
+
+> Every analytical view is *also* scoped to exactly **one transmitter**. The
+> default is the busiest of the selected class, which on a lit channel is the
+> injector.
+
+The same safeguard as the class axis applies. The selector's list is built
+before the scope is applied, and the talker table beside it counts the whole
+channel, so choosing one transmitter can never hide the rest. The status bar
+states all three window sizes — records in the window, of the class, of the
+transmitter — because two scopes shrink the analysis window and a Doppler
+spectrogram over 139 records when 256 were requested is a different
+measurement.
+
+Rows the waterfall does not draw are counted in three separate buckets: not kept
+up with, wrong class, wrong transmitter. Only the first is a shortfall of the
+display.
+
 **Nothing is dropped from the capture.** The scope is a *display* decision.
 `capture.raw` receives every record regardless, and the console shows the full
 census in two places:
@@ -68,6 +128,11 @@ mean those frames are never recorded — the opposite of what the console does.
 
 | Panel | What it shows | Grounding |
 |---|---|---|
+| **Capture** | yield, run id, tuned channel, commanded interval, BLE | `csid`'s own status document — the half the live stream cannot report |
+| **Metronome** | delivered against commanded, inter-arrival as slot multiples | measured: 61.3 Hz against a commanded 100 Hz on 2.4 GHz, 99.4 Hz on 5 GHz |
+| **Band plan** | where BLE's channels fall in this tone grid, over the median `\|H(f)\|` | the EXP-010 spectral derivation; ABBA-probe artefact regions |
+| **CSI ratio** | `H_a/H_b` — phase without a fit | FarSense (Zeng et al. 2019) |
+| **Subcarrier statistics** | per-tone median, temporal spread, null fraction | ABBA probe: 55% of spurious events in the outer three tones |
 | **Waterfall** | `\|H\|` in dB, subcarrier × time | Gringoli et al. 2019 (Nexmon CSI) — the canonical live CSI view |
 | **Spectrum & bundle** | current `\|H(f)\|` against the p05–p95 envelope over the window | Choi et al. 2021/2022 — bundle *width* is the occupancy feature |
 | **Doppler spectrogram** | STFT of the conjugate product between two chains | Li et al. 2022 (STFT); Zheng et al. 2019 (conjugate multiplication) |
@@ -97,15 +162,56 @@ band, which removes the constant (CFO) and linear-in-subcarrier (SFO/STO) terms
 
 **The Doppler axis assumes uniform sampling, and ambient traffic is not.**
 Packets arrive when somebody transmits, so the series is nearest-neighbour
-resampled onto a uniform grid and the panel reports the inter-arrival
-coefficient of variation. Below ~0.5 the axis is quantitative; on a bursty real
-channel it can exceed 2, and then the plot is qualitative at best. **For Doppler
-work that has to hold up, throttle the capture to a regular rate with
-`radio.interval_us`.**
+resampled onto a uniform grid. **For Doppler work that has to hold up, throttle
+the capture to a regular rate with `radio.interval_us`.**
+
+**But the coefficient of variation is the wrong test for a throttled source,**
+and the console no longer uses it as one. Measured on 2026-08-17, one injector
+at a commanded 10 ms slot:
+
+| | 2.4 GHz ch6 | 5 GHz ch36 |
+|---|---|---|
+| delivered | 61.3 Hz | 99.4 Hz |
+| p50 / p95 / p99.9 | 10.00 / 40.00 / 80.00 ms | 10.00 / 10.03 / 20.02 ms |
+| CV | 0.714 | 0.083 |
+
+The percentiles are exact integer multiples of the slot. The 2.4 GHz source was
+not jittering — it was losing whole slots, and the old readout's `CV 0.71 →
+qualitative` was the wrong verdict for a process whose surviving arrivals are
+all on grid. The metronome panel decides this instead, on two tolerances, and
+reports one of three mechanisms:
+
+- **`on grid`** — ≥90% of gaps within a quarter-slot of a multiple. Resampling
+  is near-exact and the axis is quantitative, whatever the CV says.
+- **`deferred`** — a clear mode on the grid with a population pushed off it. On
+  2.4 GHz that is CSMA/CA: the radio waits for a clear channel, so a frame is
+  delayed by a random backoff rather than merely dropped. Measured on that arm,
+  65.8% of gaps sit within 2% of a multiple while the off-grid remainder lands
+  at a uniform phase (fractional part p25/p50/p75 = 0.40/0.52/0.63). Only the
+  dropped half resamples cleanly, so the axis is approximate.
+- **`irregular`** — no mode at all. Ambient traffic; the axis is qualitative.
+
+The Doppler readout defers to that verdict rather than to the CV.
 
 **Zero subcarriers are not measurements.** 802.11 nulls DC and the guard bands
 and the driver delivers exact zeros; the console floors them at one LSB of the
 `i16` grid (0 dB) and excludes them from automatic axis ranges.
+
+**The tone axis is a grid, not a ruler.** Because 802.11 never transmits on DC,
+the delivered tones are two runs with a hole between them, and the console used
+to map array position to frequency as `(i − n/2 + 0.5) · spacing` — which put
+the outermost 52-tone legacy tone at +7.97 MHz where it is physically
++8.125 MHz. `tones.rs` now carries the used-tone set for each delivered tone
+count and every frequency axis reads from it. Half a subcarrier sounds like
+nothing until it decides an experiment: the same arithmetic places BLE
+advertising channel 39, on Wi-Fi ch13, at array index **50.6 of 51** — inside
+the band-edge region — which is what moved EXP-010's inclusion arm to ch3.
+
+Two transforms deliberately still treat the tones as contiguous, matching the
+Python service exactly rather than diverging from it: `cir` does not zero-pad
+the DC hole onto its true FFT bin, and `detrend` fits over array index rather
+than subcarrier `k`, so a 52-tone `tau_ns` is about 2% off. Both are bounded,
+neither changes a shape, and neither should be quoted as an absolute delay.
 
 **The waterfall says how much it is not showing.** The stream can exceed the
 frame rate thirtyfold; the readout reports the percentage of records that
@@ -181,6 +287,7 @@ csid_csiscope_read_only: false
 csid_csiscope_autostart: true
 csid_csiscope_history: 8192            # records retained for the windowed views
 csid_csiscope_coeff_budget: 4000000    # I/Q coefficient ceiling (~16 MiB)
+csid_status_path: /run/csid/status.json  # what the yield panel reads; "" disables
 ```
 
 Arguments are rendered into `/etc/csid/csiscope.env`; the unit reads them from
@@ -198,7 +305,10 @@ rate. Two bounds keep it flat on a Pi 5 that is also capturing:
 - the ring is bounded by record count **and** a total I/Q coefficient budget, so
   the footprint does not scale with tone count;
 - windowed statistics run over a decimated subset of the window, and the
-  waterfall carries only what the frame rate can show.
+  waterfall carries only what the frame rate can show;
+- the transmitter scope makes the analysis window smaller, never larger, so the
+  five panels added in IP-132 cost nothing measurable — the frame benchmark
+  moved by at most +1.9% at 996 tones, and improved by 10.6% on one case.
 
 The unit runs at `Nice=10` with the default scheduling policy, so it can never
 compete with `csid`'s `SCHED_RR` RX thread for a core.

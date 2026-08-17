@@ -50,6 +50,13 @@ const MAG_FLOOR: f32 = 1.0;
 /// in `|H|²` and takes the square root implicitly inside the logarithm.
 const POWER_FLOOR: f32 = MAG_FLOOR * MAG_FLOOR;
 
+/// At or below this many dB, a tone is a null rather than a weak measurement.
+///
+/// [`MAG_FLOOR`] is one LSB, which `db_from_power` maps to exactly 0 dB, so
+/// anything within a decibel of that is the quantisation floor and not a
+/// reading. The browser applies the same threshold when it fits an axis.
+pub const NULL_TONE_DB: f32 = 1.0;
+
 /// Taps this far below the strongest one are excluded from the RMS delay
 /// spread — see [`cir`].
 const RMS_THRESHOLD_DB: f32 = -20.0;
@@ -1228,6 +1235,394 @@ pub fn timing_ns_into(times_ns: &[u64], scratch: &mut Vec<f32>) -> Timing {
     out
 }
 
+// -- the metronome ------------------------------------------------------------
+
+/// Largest slot multiple the histogram reports. Beyond this the gaps are a
+/// tail, not a pattern.
+pub const MAX_MULTIPLE: usize = 16;
+
+/// A gap counts as on-slot when it is within this fraction of an exact
+/// multiple. A quarter of a slot is far wider than the jitter measured on a
+/// clear channel (the 5 GHz arm's whole p95 residual is 3% of a slot) and far
+/// narrower than half, where multiples would start to overlap.
+const ON_SLOT_TOLERANCE: f64 = 0.25;
+
+/// The tight tolerance: a gap this close to a multiple is *on the grid*, not
+/// merely near it.
+///
+/// Two tolerances rather than one because the measured 2.4 GHz arm is a
+/// mixture, and a single threshold cannot describe it. Its residuals are
+/// bimodal — p50 is 0.001 of a slot and p75 is 0.11 — so 65.8% of gaps land
+/// dead on the grid while 11.7% sit at an arbitrary phase (their fractional
+/// part has p25/p50/p75 = 0.40/0.52/0.63, i.e. uniform). The 5 GHz pair, on a
+/// clear channel, is 94.2% exact with fourteen off-grid gaps in twenty-nine
+/// thousand.
+const EXACT_SLOT_TOLERANCE: f64 = 0.05;
+
+/// Above this on-slot fraction the source is simply on the grid.
+const ON_GRID_AT: f32 = 0.90;
+
+/// Above this *exact* fraction there is a real slot underneath, even when a
+/// substantial population has been pushed off it.
+const DEFERRED_AT: f32 = 0.40;
+
+/// How a periodic transmitter is actually delivering.
+///
+/// ## Why the coefficient of variation is the wrong statistic here
+///
+/// Measured on 2026-08-17, one injector at a commanded 10 ms slot, two bands:
+///
+/// | | 2.4 GHz ch6 | 5 GHz ch36 |
+/// |---|---|---|
+/// | delivered | 61.3 Hz | 99.4 Hz |
+/// | p50 / p95 / p99.9 | 10.00 / 40.00 / 80.00 ms | 10.00 / 10.03 / 20.02 ms |
+/// | CV | 0.714 | 0.083 |
+///
+/// The percentiles are exact integer multiples of the slot. The source is not
+/// jittering — it is metronomic and *losing whole slots*, 38.7% of them on
+/// 2.4 GHz against 0.6% on 5 GHz. The console used to report `CV 0.71` and,
+/// from that, "treat the Doppler axis as qualitative". That verdict is wrong
+/// for this process: every surviving arrival is on grid, so nearest-neighbour
+/// resampling is near-exact and only the missing slots need filling. Irregular
+/// ambient traffic with the same CV resamples badly. One number, two physically
+/// different processes.
+///
+/// So this measures the two quantities that do separate them: what fraction of
+/// arrivals are on-slot, and what fraction of slots arrived at all. The second
+/// is EXP-010's primary occupancy channel — "the delivery deficit of an
+/// injected metronomic reference against its 5 GHz pair".
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Metronome {
+    /// Gaps the estimate is built from.
+    pub n_gaps: usize,
+    /// The nominal slot, in microseconds. Zero when none could be established.
+    pub slot_us: f32,
+    /// `"declared"` when the capture stated `radio.interval_us`, `"inferred"`
+    /// when it was recovered from the arrivals, `"none"` when neither worked.
+    pub slot_source: &'static str,
+    /// `1e6 / slot_us` — the rate the source is trying to achieve.
+    pub commanded_hz: f32,
+    /// Arrivals per second actually delivered over the window.
+    pub delivered_hz: f32,
+    /// `1 − delivered/commanded`, clamped to `[0, 1]`.
+    pub deficit: f32,
+    /// Share of gaps at each multiple `k = 1..=MAX_MULTIPLE`, indexed from 0.
+    /// Sums to `1 − off_slot` less whatever fell beyond the last bin.
+    pub multiples: Vec<f32>,
+    /// Share of gaps that are not near any integer multiple. High here means
+    /// the source is not metronomic and nothing else in this struct applies.
+    pub off_slot: f32,
+    /// Share of gaps sitting *dead* on a multiple, within 5% of a slot.
+    ///
+    /// The quantity that separates the two ways a metronome fails. A slot that
+    /// was never transmitted leaves a gap of exactly `k` slots; a slot that was
+    /// deferred by the channel leaves a gap at an arbitrary phase. Measured
+    /// 2026-08-17: 65.8% exact on 2.4 GHz against 94.2% on 5 GHz.
+    pub exact_slot: f32,
+    /// Longest run of consecutive missed slots, i.e. `max(k) − 1`.
+    pub longest_run: u32,
+    /// True only when the source is squarely on the grid — the case where the
+    /// Doppler axis survives resampling intact.
+    pub quantised: bool,
+}
+
+impl Metronome {
+    /// The verdict, in the words the panel prints.
+    ///
+    /// Three outcomes, because the measured arms show three mechanisms and a
+    /// binary verdict misdescribes the middle one:
+    ///
+    /// - **`on grid`** — nearly every surviving arrival sits on a multiple, so
+    ///   the missing slots are the whole story. Resampling onto a uniform grid
+    ///   is near-exact and the Doppler axis is quantitative whatever the CV
+    ///   says. The measured 5 GHz arm: 100% on-slot at a 0.6% deficit.
+    /// - **`deferred`** — there is a real slot underneath (a clear mode at the
+    ///   grid) but a substantial population has been pushed off it. On 2.4 GHz
+    ///   that is CSMA/CA: the radio waits for a clear channel, so a frame is
+    ///   not merely dropped, it is delayed by a random backoff — which is why
+    ///   the off-grid gaps land at an arbitrary phase rather than near one.
+    ///   The measured 2.4 GHz arm: 65.8% exact, 86.5% within tolerance, 38.7%
+    ///   deficit.
+    /// - **`irregular`** — no mode at all. Ambient traffic. Nothing else in
+    ///   this struct describes it.
+    pub fn verdict(&self) -> &'static str {
+        if self.slot_us <= 0.0 {
+            "no slot"
+        } else if self.quantised {
+            "on grid"
+        } else if self.exact_slot >= DEFERRED_AT {
+            "deferred"
+        } else {
+            "irregular"
+        }
+    }
+
+    /// Does the missing-slot picture hold well enough to resample against?
+    pub fn resamples_cleanly(&self) -> bool {
+        self.quantised
+    }
+}
+
+/// Recover the nominal slot from a gap distribution, in microseconds.
+///
+/// The p25 is the seed rather than the median, because the median is only the
+/// slot while fewer than half the slots are lost, and the whole point is to
+/// survive heavy loss. The refinement pass then re-centres on the gaps that
+/// agree with the seed, so a seed landing between two multiples is pulled onto
+/// the real one.
+///
+/// Returns `None` when too few gaps cluster around the seed to call it a slot
+/// at all — a genuinely irregular source must not be handed a fabricated one.
+fn infer_slot_us(sorted_gaps_us: &[f32]) -> Option<f64> {
+    if sorted_gaps_us.len() < 8 {
+        return None;
+    }
+    let seed = sorted_gaps_us[sorted_gaps_us.len() / 4] as f64;
+    if !(seed > 0.0) {
+        return None;
+    }
+    let (lo, hi) = (seed * 0.7, seed * 1.3);
+    let near: Vec<f32> = sorted_gaps_us
+        .iter()
+        .copied()
+        .filter(|&g| (g as f64) >= lo && (g as f64) <= hi)
+        .collect();
+    // A tenth of the gaps agreeing on a value is a mode; less is a coincidence.
+    if near.len() * 10 < sorted_gaps_us.len() {
+        return None;
+    }
+    Some(near[near.len() / 2] as f64)
+}
+
+/// Measure a transmitter's delivery against its slot.
+///
+/// `times_ns` must be ascending. `declared_us` is the capture's commanded
+/// `radio.interval_us` when it has one — a declared slot is always preferred,
+/// because inferring the slot from the very arrivals being judged makes a
+/// source that lost every other slot look perfectly on time at half the rate.
+pub fn metronome_into(
+    times_ns: &[u64],
+    declared_us: Option<f64>,
+    scratch: &mut Vec<f32>,
+    out: &mut Metronome,
+) {
+    out.multiples.clear();
+    out.multiples.resize(MAX_MULTIPLE, 0.0);
+    out.n_gaps = times_ns.len().saturating_sub(1);
+    out.slot_us = 0.0;
+    out.slot_source = "none";
+    out.commanded_hz = 0.0;
+    out.delivered_hz = 0.0;
+    out.deficit = 0.0;
+    out.off_slot = 0.0;
+    out.exact_slot = 0.0;
+    out.longest_run = 0;
+    out.quantised = false;
+
+    if out.n_gaps < 8 {
+        return;
+    }
+
+    scratch.clear();
+    scratch.reserve(out.n_gaps);
+    scratch.extend(
+        times_ns
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]) as f32 / 1000.0),
+    );
+    let span_us = times_ns[times_ns.len() - 1].saturating_sub(times_ns[0]) as f64 / 1000.0;
+    if span_us <= 0.0 {
+        return;
+    }
+    out.delivered_hz = (out.n_gaps as f64 / (span_us / 1e6)) as f32;
+
+    let slot_us = match declared_us.filter(|&d| d > 0.0) {
+        Some(d) => {
+            out.slot_source = "declared";
+            d
+        }
+        None => {
+            scratch.sort_by(f32::total_cmp);
+            match infer_slot_us(scratch) {
+                Some(s) => {
+                    out.slot_source = "inferred";
+                    s
+                }
+                None => return,
+            }
+        }
+    };
+    out.slot_us = slot_us as f32;
+    out.commanded_hz = (1e6 / slot_us) as f32;
+    out.deficit = (1.0 - out.delivered_hz as f64 / (1e6 / slot_us)).clamp(0.0, 1.0) as f32;
+
+    // The sort above (inference path only) reorders `scratch`, which is fine:
+    // every quantity below is a property of the multiset of gaps, not of their
+    // order. The longest run is the largest single gap, not a positional one.
+    let mut on_slot = 0usize;
+    let mut exact = 0usize;
+    let mut off = 0usize;
+    let mut max_k = 0u32;
+    for &g in scratch.iter() {
+        let ratio = g as f64 / slot_us;
+        let k = ratio.round();
+        let resid = (ratio - k).abs();
+        if k >= 1.0 && resid <= ON_SLOT_TOLERANCE {
+            on_slot += 1;
+            if resid <= EXACT_SLOT_TOLERANCE {
+                exact += 1;
+            }
+            max_k = max_k.max(k as u32);
+            let bin = (k as usize - 1).min(MAX_MULTIPLE - 1);
+            out.multiples[bin] += 1.0;
+        } else {
+            off += 1;
+        }
+    }
+    let n = out.n_gaps as f32;
+    for v in out.multiples.iter_mut() {
+        *v /= n;
+    }
+    out.off_slot = off as f32 / n;
+    out.exact_slot = exact as f32 / n;
+    out.longest_run = max_k.saturating_sub(1);
+    out.quantised = (on_slot as f32 / n) >= ON_GRID_AT;
+}
+
+// -- the CSI ratio ------------------------------------------------------------
+
+/// `H_a / H_b` across two chains, as amplitude in dB and phase in radians.
+///
+/// The one representation whose **phase** is stable from packet to packet
+/// without fitting anything. CFO, SFO and packet-detection delay are common to
+/// both chains of one radio, so the division cancels them exactly (FarSense,
+/// Zeng et al. 2019) — where the console's sanitised phase subtracts a
+/// least-squares line and takes any genuinely linear part of the channel with
+/// it.
+///
+/// The denominator is floored at one LSB of the `i16` grid: a nulled subcarrier
+/// is an exact zero, and dividing by it would put an infinity in the middle of
+/// the trace.
+pub fn ratio_into(
+    rec: &csiq::CsiRecord,
+    chain_a: usize,
+    chain_b: usize,
+    amp_db: &mut Vec<f32>,
+    phase: &mut Vec<f32>,
+) -> bool {
+    amp_db.clear();
+    phase.clear();
+    let (Some(a), Some(b)) = (chain_slice(rec, chain_a), chain_slice(rec, chain_b)) else {
+        return false;
+    };
+    let n = (a.len() / 2).min(b.len() / 2);
+    if n == 0 {
+        return false;
+    }
+    amp_db.reserve(n);
+    phase.reserve(n);
+    for t in 0..n {
+        // Storage is (im, re) per tone; see `chain_into`.
+        let (ai, ar) = (a[2 * t] as f32, a[2 * t + 1] as f32);
+        let (bi, br) = (b[2 * t] as f32, b[2 * t + 1] as f32);
+        let den = (br * br + bi * bi).max(1.0);
+        // H_a · conj(H_b) / |H_b|²
+        let re = (ar * br + ai * bi) / den;
+        let im = (ai * br - ar * bi) / den;
+        amp_db.push(db_from_power(re * re + im * im));
+        phase.push(im.atan2(re));
+    }
+    true
+}
+
+// -- per-tone statistics ------------------------------------------------------
+
+/// Per-subcarrier behaviour over the window.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ToneStats {
+    /// Columns the statistics were computed over.
+    pub n: usize,
+    /// Tones whose median sits at the quantisation floor — nulled, not measured.
+    pub null_tones: usize,
+    /// The widest per-tone spread in the band, in dB.
+    pub max_spread_db: f32,
+    /// Array index of that tone, so the readout can name it.
+    pub max_spread_tone: usize,
+}
+
+/// Median and temporal spread for every tone, from the decimated column buffer.
+///
+/// `columns` is `cols × ntone` in dB, exactly the buffer the percentile bundle
+/// already reads, so this adds a pass rather than an extraction.
+///
+/// **Spread is reported in dB, not as a coefficient of variation.** A CV of a
+/// logarithmic quantity is not a CV of the underlying amplitude, and the two
+/// differ by whatever the mean level happens to be. For small excursions the
+/// conversion is `CV ≈ spread_dB / 8.686`; the panel prints that relation
+/// rather than silently applying it.
+pub fn tone_stats_into(
+    columns: &[f32],
+    ntone: usize,
+    median_db: &mut Vec<f32>,
+    spread_db: &mut Vec<f32>,
+    null_frac: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    out: &mut ToneStats,
+) {
+    median_db.clear();
+    spread_db.clear();
+    null_frac.clear();
+    *out = ToneStats::default();
+    if ntone == 0 || columns.len() < ntone {
+        return;
+    }
+    let cols = columns.len() / ntone;
+    out.n = cols;
+    median_db.resize(ntone, f32::NAN);
+    spread_db.resize(ntone, f32::NAN);
+    null_frac.resize(ntone, 0.0);
+
+    for t in 0..ntone {
+        scratch.clear();
+        let mut zeros = 0usize;
+        let mut sum = 0.0f64;
+        let mut sumsq = 0.0f64;
+        for c in 0..cols {
+            let v = columns[c * ntone + t];
+            if !v.is_finite() {
+                continue;
+            }
+            // An exact zero coefficient reaches the console as 0 dB, the
+            // quantisation floor. It is an absence of measurement, not a very
+            // weak one, and averaging it in would drag the tone's statistics
+            // towards a value the radio never reported.
+            if v <= NULL_TONE_DB {
+                zeros += 1;
+                continue;
+            }
+            scratch.push(v);
+            sum += v as f64;
+            sumsq += (v as f64) * (v as f64);
+        }
+        null_frac[t] = zeros as f32 / cols as f32;
+        if scratch.is_empty() {
+            out.null_tones += 1;
+            continue;
+        }
+        let k = scratch.len() / 2;
+        scratch.select_nth_unstable_by(k, f32::total_cmp);
+        median_db[t] = scratch[k];
+        let m = sum / scratch.len() as f64;
+        let var = (sumsq / scratch.len() as f64 - m * m).max(0.0);
+        let sd = var.sqrt() as f32;
+        spread_db[t] = sd;
+        if sd > out.max_spread_db {
+            out.max_spread_db = sd;
+            out.max_spread_tone = t;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,6 +1962,277 @@ mod tests {
         assert!((s.p50_us - 1000.0).abs() < 1.0);
         assert!(s.max_us > 49_000.0);
         assert!(s.rate_hz > 900.0 && s.rate_hz < 1000.0);
+    }
+
+    // -- the metronome --------------------------------------------------------
+
+    /// Arrivals from a metronomic source that drops whole slots.
+    ///
+    /// `keep` decides, per slot, whether the arrival happened; the clock keeps
+    /// running either way, which is exactly what makes the surviving gaps
+    /// integer multiples.
+    fn slotted(slot_us: u64, n_slots: usize, keep: impl Fn(usize) -> bool) -> Vec<u64> {
+        (0..n_slots)
+            .filter(|&i| keep(i))
+            .map(|i| i as u64 * slot_us * 1000)
+            .collect()
+    }
+
+    /// The 5 GHz control arm: essentially every slot arrives.
+    #[test]
+    fn a_clean_metronome_reads_as_no_deficit() {
+        let t = slotted(10_000, 3000, |_| true);
+        let mut m = Metronome::default();
+        metronome_into(&t, None, &mut Vec::new(), &mut m);
+
+        assert_eq!(m.slot_source, "inferred");
+        assert!((m.slot_us - 10_000.0).abs() < 1.0, "slot {}", m.slot_us);
+        assert!((m.commanded_hz - 100.0).abs() < 0.1);
+        assert!(m.deficit < 0.01, "deficit {}", m.deficit);
+        assert!(m.quantised);
+        assert_eq!(m.verdict(), "on grid");
+        assert!(m.multiples[0] > 0.99, "all mass at 1x: {:?}", &m.multiples[..4]);
+        assert_eq!(m.longest_run, 0);
+    }
+
+    /// The 2.4 GHz arm, reproduced: a 10 ms metronome delivering ~61 Hz, whose
+    /// percentiles land on 1x, 4x and 8x the slot. The console used to report
+    /// this as CV 0.71 and call the Doppler axis qualitative.
+    #[test]
+    fn slot_loss_is_a_deficit_not_jitter() {
+        // Drop ~39% of slots in runs, so the surviving gaps are 1x..8x.
+        let t = slotted(10_000, 6000, |i| !matches!(i % 13, 1 | 2 | 3 | 7 | 11));
+        let mut m = Metronome::default();
+        metronome_into(&t, Some(10_000.0), &mut Vec::new(), &mut m);
+
+        assert_eq!(m.slot_source, "declared");
+        assert!((m.slot_us - 10_000.0).abs() < 1.0);
+        assert!(
+            (m.deficit - 0.385).abs() < 0.02,
+            "deficit {} should be ~5/13",
+            m.deficit
+        );
+        // Every gap is still an exact multiple: the source never jittered.
+        assert!(m.quantised, "off-slot {}", m.off_slot);
+        assert!(m.off_slot < 0.01);
+        assert!(m.multiples[0] > 0.3, "1x share {}", m.multiples[0]);
+        assert!(m.multiples[3] > 0.1, "4x share {}", m.multiples[3]);
+        assert_eq!(m.longest_run, 3);
+        assert_eq!(m.verdict(), "on grid");
+    }
+
+    /// Inference survives half the slots going missing — which is more loss
+    /// than the measured 2.4 GHz arm suffers.
+    #[test]
+    fn the_slot_is_recovered_from_heavily_thinned_arrivals() {
+        let t = slotted(10_000, 4000, |i| i % 2 == 0 || i % 7 == 0);
+        let mut m = Metronome::default();
+        metronome_into(&t, None, &mut Vec::new(), &mut m);
+        assert!((m.slot_us - 10_000.0).abs() < 100.0, "slot {}", m.slot_us);
+        assert!(m.quantised);
+    }
+
+    /// A declared slot beats an inferred one, and this is why: a source that
+    /// lost every other slot infers 20 ms and reports no deficit at all.
+    #[test]
+    fn a_declared_slot_sees_a_deficit_that_inference_hides() {
+        let t = slotted(10_000, 4000, |i| i % 2 == 0);
+
+        let mut inferred = Metronome::default();
+        metronome_into(&t, None, &mut Vec::new(), &mut inferred);
+        assert!((inferred.slot_us - 20_000.0).abs() < 100.0);
+        assert!(inferred.deficit < 0.01, "inference sees a healthy 50 Hz source");
+
+        let mut declared = Metronome::default();
+        metronome_into(&t, Some(10_000.0), &mut Vec::new(), &mut declared);
+        assert!(
+            (declared.deficit - 0.5).abs() < 0.01,
+            "deficit {}",
+            declared.deficit
+        );
+    }
+
+    /// The measured 2.4 GHz arm, whose gaps are a *mixture* — and which is why
+    /// the verdict has three outcomes instead of two.
+    ///
+    /// Reproduced from the archive (`explore-ble-coex-24`, 2026-08-17, injector
+    /// `02:6d:6f:6e:00:10`): 65.8% of gaps sit within 2% of a multiple, 86.5%
+    /// within 25%, and the remainder land at an arbitrary phase — their
+    /// fractional part is uniform, p25/p50/p75 = 0.40/0.52/0.63. That is not
+    /// jitter around the grid, it is CSMA/CA pushing a transmission by a random
+    /// backoff. Calling it `on grid` would overstate the Doppler axis; calling
+    /// it `irregular` would throw away a slot that is plainly there.
+    #[test]
+    fn a_deferred_metronome_is_neither_on_grid_nor_irregular() {
+        let slot_us = 10_000u64;
+        let mut t = Vec::new();
+        let mut clock = 0u64;
+        for i in 0..4000usize {
+            // ~30% of slots are lost outright; of what is left, about one in
+            // six is deferred into the gap by a pseudo-random backoff.
+            if matches!(i % 10, 1 | 4 | 8) {
+                clock += slot_us * 1000;
+                continue;
+            }
+            let deferral = if i % 6 == 0 {
+                // Uniform in the slot, as the archive's fractional parts are.
+                ((i * 7919) % 1000) as u64 * slot_us / 2000
+            } else {
+                0
+            };
+            t.push(clock * 1000 + deferral * 1000);
+            clock += slot_us;
+        }
+        // The clock above advances in slots; rebuild it in nanoseconds.
+        let t: Vec<u64> = t.iter().map(|v| v / 1000).collect();
+
+        let mut m = Metronome::default();
+        metronome_into(&t, Some(slot_us as f64), &mut Vec::new(), &mut m);
+
+        assert!(m.slot_us > 0.0);
+        assert!(
+            m.exact_slot >= 0.40,
+            "a real slot must still be visible: exact {}",
+            m.exact_slot
+        );
+        assert!(!m.quantised, "on-slot was {}", 1.0 - m.off_slot);
+        assert_eq!(m.verdict(), "deferred");
+        assert!(!m.resamples_cleanly());
+    }
+
+    /// Ambient traffic is not a metronome, and must not be described as one.
+    #[test]
+    fn irregular_arrivals_are_refused_rather_than_fitted() {
+        // Gaps spread over a decade with no mode.
+        let mut t = vec![0u64];
+        for i in 1..400u64 {
+            let step = 1_000_000 + (i * 7919 % 40_000) as u64 * 1000;
+            t.push(t[i as usize - 1] + step);
+        }
+        let mut m = Metronome::default();
+        metronome_into(&t, None, &mut Vec::new(), &mut m);
+        assert!(!m.quantised, "off-slot {}", m.off_slot);
+        assert_eq!(m.verdict(), "irregular");
+    }
+
+    #[test]
+    fn too_few_arrivals_produce_nothing_rather_than_a_guess() {
+        let t = slotted(10_000, 5, |_| true);
+        let mut m = Metronome::default();
+        metronome_into(&t, None, &mut Vec::new(), &mut m);
+        assert_eq!(m.slot_us, 0.0);
+        assert_eq!(m.verdict(), "no slot");
+    }
+
+    // -- ratio ----------------------------------------------------------------
+
+    /// The property the ratio exists for: a per-packet phase offset common to
+    /// both chains divides out exactly, where the raw phase carries it.
+    #[test]
+    fn the_ratio_cancels_a_common_phase_offset() {
+        let ntone = 52usize;
+        let build = |offset: f32| {
+            // Chain-major, imaginary-first — see `chain_slice`.
+            let mut iq = Vec::new();
+            for c in 0..2usize {
+                for t in 0..ntone {
+                    // Chain b is chain a rotated by a fixed per-chain angle and
+                    // scaled, plus the common per-packet offset.
+                    let ang = 0.05 * t as f32 + offset + if c == 1 { 0.7 } else { 0.0 };
+                    let mag = if c == 1 { 300.0 } else { 600.0 };
+                    iq.push((mag * ang.sin()) as i16); // im
+                    iq.push((mag * ang.cos()) as i16); // re
+                }
+            }
+            CsiRecord {
+                ftm: 0,
+                us: 0,
+                unix_ts_ns: 0,
+                rnf: 0,
+                phy: None,
+                seq: 0,
+                nrx: 2,
+                ntx: 1,
+                ntone: ntone as u16,
+                rssi: vec![-50; 2],
+                src_mac: [0; 6],
+                channel: 6,
+                width: csiq::Width::Ht20,
+                iq,
+            }
+        };
+
+        let (mut a1, mut p1) = (Vec::new(), Vec::new());
+        let (mut a2, mut p2) = (Vec::new(), Vec::new());
+        assert!(ratio_into(&build(0.0), 0, 1, &mut a1, &mut p1));
+        assert!(ratio_into(&build(1.9), 0, 1, &mut a2, &mut p2));
+
+        // Two "packets" differing only by a common offset give the same ratio.
+        for t in 0..ntone {
+            assert!((p1[t] - p2[t]).abs() < 0.05, "tone {t}: {} vs {}", p1[t], p2[t]);
+            assert!((a1[t] - a2[t]).abs() < 0.5, "tone {t}");
+        }
+        // |H_a/H_b| = 600/300 = 2, i.e. +6 dB.
+        assert!((a1[10] - 6.02).abs() < 0.4, "{}", a1[10]);
+    }
+
+    #[test]
+    fn the_ratio_needs_two_chains_that_exist() {
+        let rec = CsiRecord {
+            ftm: 0,
+            us: 0,
+            unix_ts_ns: 0,
+            rnf: 0,
+            phy: None,
+            seq: 0,
+            nrx: 1,
+            ntx: 1,
+            ntone: 8,
+            rssi: vec![-50],
+            src_mac: [0; 6],
+            channel: 6,
+            width: csiq::Width::Ht20,
+            iq: vec![1; 16],
+        };
+        let (mut a, mut p) = (Vec::new(), Vec::new());
+        assert!(!ratio_into(&rec, 0, 1, &mut a, &mut p));
+        assert!(a.is_empty());
+    }
+
+    // -- tone statistics ------------------------------------------------------
+
+    #[test]
+    fn tone_stats_find_the_moving_tone_and_the_nulls() {
+        let (ntone, cols) = (16usize, 64usize);
+        let mut columns = vec![0.0f32; cols * ntone];
+        for c in 0..cols {
+            for t in 0..ntone {
+                columns[c * ntone + t] = match t {
+                    // A null tone: exactly the quantisation floor, always.
+                    7 => 0.0,
+                    // One tone that swings; the rest are steady.
+                    3 => 40.0 + if c % 2 == 0 { 6.0 } else { -6.0 },
+                    _ => 40.0,
+                };
+            }
+        }
+        let (mut med, mut spread, mut nulls, mut scratch) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut out = ToneStats::default();
+        tone_stats_into(
+            &columns, ntone, &mut med, &mut spread, &mut nulls, &mut scratch, &mut out,
+        );
+
+        assert_eq!(out.n, cols);
+        assert_eq!(out.max_spread_tone, 3);
+        assert!((out.max_spread_db - 6.0).abs() < 0.1, "{}", out.max_spread_db);
+        assert_eq!(out.null_tones, 1);
+        assert_eq!(nulls[7], 1.0);
+        assert!(nulls[3] == 0.0);
+        assert!((med[0] - 40.0).abs() < 0.01);
+        assert!(spread[0] < 0.01, "a steady tone has no spread");
+        // A nulled tone has no median at all; it is not a very weak reading.
+        assert!(med[7].is_nan());
     }
 
     /// The nested selection must give exactly what sorting would, including
