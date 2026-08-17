@@ -106,6 +106,8 @@ mod linux {
     const SOL_HCI: libc::c_int = 0;
     const HCI_FILTER: libc::c_int = 2;
     const HCI_CHANNEL_RAW: u16 = 0;
+    /// `HCIDEVUP` = `_IOW('H', 201, int)`. libc exposes no Bluetooth ioctls.
+    const HCIDEVUP: u32 = 0x4004_48c9;
 
     /// An HCI event is at most 3 + 255 bytes; round up.
     const RECV_BUF: usize = 1024;
@@ -165,9 +167,16 @@ mod linux {
                 "{e} — the HCI socket needs CAP_NET_RAW (add it to the systemd unit's \
                  AmbientCapabilities, or run as root)"
             ),
+            // csid powers the controller itself at open, so reaching ENETDOWN
+            // means that attempt did not take — it went down again underneath
+            // us, or it never came up and we lacked the capability to say so.
             Some(libc::ENETDOWN) => format!(
-                "{e} — {adapter} is down; bring it up with `sudo hciconfig {adapter} up` \
-                 (or `bluetoothctl power on`)"
+                "{e} — {adapter} is not powered even though csid tried to power it. \
+                 Check `rfkill list bluetooth`, then that the unit grants \
+                 CAP_NET_ADMIN; `sudo hciconfig {adapter} up` by hand will say which"
+            ),
+            Some(libc::ERFKILL) => format!(
+                "{e} — {adapter} is rfkill-blocked; `sudo rfkill unblock bluetooth`"
             ),
             Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT) => format!(
                 "{e} — this kernel has no Bluetooth stack (CONFIG_BT); BLE co-capture \
@@ -182,6 +191,48 @@ mod linux {
                  {adapter}; restarting bluetoothd will not help"
             ),
             _ => e.to_string(),
+        }
+    }
+
+    /// Power the controller on, the way `hciconfig <adapter> up` does.
+    ///
+    /// On an ordinary Linux box `bluetoothd` powers the controller at boot. A
+    /// capture node masks `bluetooth.service` on purpose — a discovering
+    /// bluetoothd rewrites the scan parameters underneath us — so on this fleet
+    /// *nothing* powers it, and an unpowered controller rejects every command
+    /// with `ENETDOWN`.
+    ///
+    /// This belongs here rather than in the deploy playbook because a one-shot
+    /// `hciconfig up` at provisioning time does not survive a reboot: the node
+    /// would come back with the unit green, the adapter down, and a night's
+    /// BLE ground truth silently missing. Doing it at open makes every session
+    /// self-sufficient.
+    ///
+    /// Idempotent — `EALREADY` is the healthy steady state, not an error.
+    fn bring_up(fd: RawFd, index: u16, adapter: &str) -> Result<()> {
+        let rc = unsafe { libc::ioctl(fd, HCIDEVUP as _, index as libc::c_ulong) };
+        if rc == 0 {
+            tracing::info!(adapter = %adapter, "HCI controller powered on");
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            // Already up: the overwhelmingly common case.
+            Some(libc::EALREADY) => Ok(()),
+            // Powering up needs CAP_NET_ADMIN, which is a strictly larger ask
+            // than the CAP_NET_RAW that got us this socket. Not fatal on its
+            // own — the adapter may well be up already — so let the scan be
+            // the judge and say why if it is not.
+            Some(libc::EPERM) | Some(libc::EACCES) => {
+                tracing::warn!(
+                    adapter = %adapter,
+                    error = %e,
+                    "cannot power the HCI controller (needs CAP_NET_ADMIN); \
+                     continuing in case it is already up"
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("powering on {adapter}: {}", explain(&e, adapter)),
         }
     }
 
@@ -218,6 +269,11 @@ mod linux {
                 buf: vec![0u8; RECV_BUF],
                 adapter: adapter.clone(),
             };
+
+            // Before anything is sent: the controller has to be powered. The
+            // ioctl takes the raw socket while it is still unbound, which is
+            // exactly how `hciconfig` issues it.
+            bring_up(sc.fd, index, &adapter)?;
 
             // Events only; every event code, so Command Complete for our own
             // commands arrives alongside the advertising reports.
