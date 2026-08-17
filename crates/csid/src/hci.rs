@@ -122,16 +122,28 @@ mod linux {
         hci_channel: u16,
     }
 
+    /// Mirror of the kernel's `struct hci_ufilter`. The trailing pad is a real
+    /// field rather than implicit padding because the whole struct is handed to
+    /// `setsockopt` — writing it keeps those two bytes initialised instead of
+    /// shipping whatever was on the stack.
     #[repr(C)]
     #[derive(Default)]
     struct HciFilter {
         type_mask: u32,
         event_mask: [u32; 2],
         opcode: u16,
+        _pad: u16,
     }
-    /// Bytes of [`HciFilter`] the kernel reads — through `opcode`, excluding
-    /// the struct's trailing alignment padding.
-    const HCI_FILTER_LEN: libc::socklen_t = 14;
+    /// Bytes of [`HciFilter`] the kernel reads.
+    ///
+    /// This is `sizeof(struct hci_ufilter)` — **16**, the padded size, not the
+    /// 14 bytes that reach the end of `opcode`. Kernels before the setsockopt
+    /// input-validation hardening did `len = min(len, sizeof(uf))` and accepted
+    /// a short option, so 14 worked for years. Since that patch (backported into
+    /// 6.8 stable, which is what the fleet runs) `bt_copy_from_sockptr` rejects
+    /// `len < sizeof(uf)` with **EINVAL** — the failure looks like a busy or
+    /// blocked adapter and is neither.
+    const HCI_FILTER_LEN: libc::socklen_t = std::mem::size_of::<HciFilter>() as libc::socklen_t;
 
     /// A bound HCI socket with LE scanning enabled. Scanning is disabled again
     /// on drop, so a stopped session never leaves the controller scanning.
@@ -162,6 +174,13 @@ mod linux {
                  cannot run on this node"
             ),
             Some(libc::ENODEV) => format!("{e} — no such HCI adapter as {adapter}"),
+            // EINVAL here is never a state problem, so say so: an operator who
+            // reads it as "adapter busy" will restart bluetoothd all evening.
+            Some(libc::EINVAL) => format!(
+                "{e} — the kernel rejected the option itself, not the adapter. This is a \
+                 csid/kernel ABI mismatch (see HCI_FILTER_LEN), not a busy or blocked \
+                 {adapter}; restarting bluetoothd will not help"
+            ),
             _ => e.to_string(),
         }
     }
@@ -206,6 +225,7 @@ mod linux {
                 type_mask: 1 << HCI_EVENT_PKT,
                 event_mask: [u32::MAX, u32::MAX],
                 opcode: 0,
+                _pad: 0,
             };
             let rc = unsafe {
                 libc::setsockopt(
@@ -565,14 +585,17 @@ mod linux {
         use super::*;
 
         #[test]
-        fn filter_length_covers_through_the_opcode_field() {
-            // The kernel copies HCI_FILTER_LEN bytes into struct hci_ufilter;
-            // it must reach the end of `opcode` and no further.
+        fn filter_matches_the_kernels_struct_hci_ufilter() {
+            // Layout: u32 type_mask, u32 event_mask[2], __le16 opcode, pad.
             let f = HciFilter::default();
             let base = &f as *const HciFilter as usize;
-            let op = &f.opcode as *const u16 as usize;
-            assert_eq!(op - base, 12);
-            assert_eq!(HCI_FILTER_LEN as usize, 12 + std::mem::size_of::<u16>());
+            assert_eq!(&f.opcode as *const u16 as usize - base, 12);
+
+            // The option length must be the *padded* size. A hardened kernel
+            // rejects anything shorter than sizeof(struct hci_ufilter) with
+            // EINVAL, so 14 (through the end of `opcode`) is not acceptable.
+            assert_eq!(HCI_FILTER_LEN, 16);
+            assert_eq!(HCI_FILTER_LEN as usize, std::mem::size_of::<HciFilter>());
         }
     }
 }
