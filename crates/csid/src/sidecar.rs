@@ -78,6 +78,37 @@ pub struct SummaryMeta {
     /// Time-transfer health — present only when `[timesync].enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timesync: Option<TimesyncSummary>,
+    /// Who transmitted the records in this directory.
+    ///
+    /// Present on **segments**, where it is the only way to read delivery
+    /// mid-run: `timesync` and `ble` describe whole-session artefacts at the
+    /// session root and are therefore computed once at teardown, so a 16 h run
+    /// could report nothing about its own delivery until it ended. A per-MAC
+    /// record count needs no pairing and no second pass — the sealer already
+    /// walks every record — and dividing the injector's count by its commanded
+    /// rate is exactly the delivery fraction.
+    ///
+    /// It is deliberately counts and not a percentage: a receiver does not know
+    /// the injector's commanded rate, and inventing a denominator here would be
+    /// the same mistake as reading a frame rate as a CSI rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transmitters: Option<TransmitterCensus>,
+}
+
+/// Per-source-MAC record counts for one capture directory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransmitterCensus {
+    /// How many distinct source MACs appeared, before `top` was truncated.
+    pub distinct: u64,
+    /// Busiest transmitters, descending. Truncated to keep a sidecar small on
+    /// an ambient channel, which is why `distinct` is reported separately.
+    pub top: Vec<TransmitterCount>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransmitterCount {
+    pub mac: String,
+    pub records: u64,
 }
 
 /// What the injector actually did, for delivery-ratio analysis downstream

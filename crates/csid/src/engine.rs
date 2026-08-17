@@ -904,6 +904,11 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
         inject: None,
         ble: None,
         timesync: None,
+        // Session level: the root's own census would restate what the segments
+        // already carry, and on an unsegmented session there is no mid-run
+        // reader to serve. Left to the segments, which is where it answers a
+        // question that could not otherwise be answered before teardown.
+        transmitters: None,
     }
 }
 

@@ -389,7 +389,7 @@ pub fn stream_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
                     r.ntx,
                     r.rssi,
                     r.phy.map(|p| p.modulation),
-                    fmt_mac(&r.src_mac)
+                    crate::util::format_mac(&r.src_mac)
                 );
             }
             Err(e) => eprintln!("undecodable datagram ({n} bytes): {e}"),
@@ -409,13 +409,6 @@ pub fn stream_cmd(_socket: &Path, _limit: Option<u64>) -> Result<()> {
     anyhow::bail!("`csid stream` requires Unix-domain sockets, unavailable on this platform")
 }
 
-#[cfg(unix)]
-fn fmt_mac(m: &[u8; 6]) -> String {
-    m.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
 
 /// `csid thermal` — the node's current thermal state, for humans or for the
 /// metrics pipeline.

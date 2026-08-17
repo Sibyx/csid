@@ -88,6 +88,21 @@ pub fn run_opt(program: &str, args: &[&str]) -> Option<String> {
     run(program, args).ok()
 }
 
+/// Lowercase colon-separated MAC, the form every sidecar and log line uses.
+///
+/// One implementation on purpose: a census that renders `02:6D:6F:6E:00:13`
+/// and an analysis that scopes to `02:6d:6f:6e:00:13` silently select nothing.
+pub fn format_mac(m: &[u8; 6]) -> String {
+    let mut s = String::with_capacity(17);
+    for (i, b) in m.iter().enumerate() {
+        if i > 0 {
+            s.push(':');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
