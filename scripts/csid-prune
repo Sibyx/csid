@@ -1,41 +1,199 @@
 #!/usr/bin/env bash
-# Delete raw captures that have been verifiably shipped and have aged past the
-# grace window.
+# Reclaim spool bytes that object storage already holds.
 #
-# What is deleted: `capture.raw` and `ble_scan.jsonl` — the two durable
-# intermediates. Their derived, self-describing forms (`capture.csiq`,
-# `ble_rssi.parquet`) are already in object storage by the time this runs.
-# What is kept forever: `metadata.json` and `.synced` — together they form a
-# greppable on-node index of every session the node ever ran.
+# What is deleted: payload files in a session directory that BOTH carries a
+# `.synced` marker AND currently verifies against the bucket.
+# What is kept: `metadata.json` and `.synced`. Together they are a greppable
+# on-node index of every session the node ever ran, at ~1.8 KB per session.
+#
+# ── WHY THE DELETE LIST IS A KEEP LIST ───────────────────────────────────────
+#
+# It used to be an allow-list of two names (`capture.raw`, `ble_scan.jsonl`).
+# `capture.csiq` was never on it and so was never reclaimed — 43-57% of every
+# segment, kept forever. On the 2026-08-17 16 h / 250 Hz night that left ~24 GB
+# per node permanently; monad02 reached 0 bytes free at hour 13, its durable
+# writer failed, and the OOM killer took csid with it.
+#
+# An allow-list of payload names fails silently every time a new artefact type
+# appears, because the failure is a file that is *not* mentioned. A keep-list of
+# the two index files cannot fail that way.
+#
+# ── WHY IT VERIFIES INSTEAD OF TRUSTING THE MARKER ───────────────────────────
+#
+# `.synced` records that `rclone copy --checksum` once succeeded. That is good
+# evidence and it is not proof of the present: a spool restored from a backup, a
+# renamed directory, or a bucket lifecycle rule can all leave a marker whose
+# object is gone. The marker says something WAS shipped; only the bucket says
+# something IS there.
+#
+# So every directory is re-checked immediately before it is stripped, and the
+# check is `--one-way --size-only`: every local file must exist on the remote at
+# the same size. Size rather than checksum because the marker already attests a
+# checksummed copy, and hashing 54 GB of spool on a Pi 5 to re-derive that would
+# cost more IO than the capture it runs beside.
+#
+# FAIL CLOSED, EVERYWHERE. If rclone is missing, the credentials are absent, the
+# network is down, or the check merely returns non-zero for a reason we cannot
+# read — the directory is SKIPPED, never stripped. The failure mode of this
+# script is a full disk and a loud exit, never a deleted measurement.
+#
+# ── TWO PASSES ───────────────────────────────────────────────────────────────
+#
+# 1. GRACE. A verified session whose marker is older than the grace window is
+#    stripped. This is the steady-state policy and the local safety net: for
+#    that window the node still holds the bytes, so a bad ship can be caught by
+#    hand.
+#
+# 2. PRESSURE. If free space is below the floor, strip verified sessions
+#    oldest-marker-first, IGNORING the grace window, until the floor is met or
+#    nothing verified is left to strip.
+#
+# The pressure pass is what makes a long segmented run survivable. Grace and run
+# length are independent quantities and tuning one against the other is a losing
+# game: at a 1-day grace nothing sealed during a 16 h run is eligible while it
+# runs, and at a 30-minute grace every short session loses its safety net to
+# protect the rare long one. The floor decouples them.
+#
+# ── NEVER TOUCHED, in either pass, at any pressure ───────────────────────────
+#
+#   - a directory with no `.synced` marker;
+#   - a directory that does not verify against the bucket right now.
+#
+# That covers the segment currently being written and the SESSION ROOT, which is
+# not shipped until the run closes and which holds the only copy of
+# `time_transfer.jsonl` and `ble_scan.jsonl` for a run still in progress. On
+# 2026-08-17 all six nodes were OOM-killed during teardown, so six roots were
+# left unshipped holding ~14.5 GB of time transfer that exists nowhere else.
+# Those roots must survive until `csid-sync` ships them. This script is the
+# reason they do.
 set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
-GRACE_DAYS="${CSID_PRUNE_GRACE_DAYS:-7}"
+HOST="${CSID_HOSTNAME:-$(hostname)}"
+PREFIX="${CSID_S3_PREFIX:-datasets/ax210-csi-captures}"
+GRACE_DAYS="${CSID_PRUNE_GRACE_DAYS:-1}"
+MIN_FREE_GB="${CSID_PRUNE_MIN_FREE_GB:-10}"
+
+# Escape hatch for the test harness and for a spool with no bucket behind it.
+# Off by default: skipping verification is a deliberate act, not a fallback.
+VERIFY="${CSID_PRUNE_VERIFY:-1}"
 
 # Grace is compared in MINUTES, not days.
 #
 # `find -mtime +N` truncates a file's age to whole 24 h units before comparing,
-# so `-mtime +1` matches only files aged >= 48 h — i.e. a "1 day" grace was
-# silently two days, and "0" was silently one. That off-by-a-day did not matter
-# at the historical 7-day setting, but it does the moment the knob is used to
-# bound disk on a segmented long run, where segments ship within ~15 min of
-# sealing and the whole point is to reclaim promptly.
-#
-# `-mmin +N` truncates to whole minutes instead, so the error is one minute
-# rather than one day and every value means what it says.
+# so `-mtime +1` matched only files aged >= 48 h — a "1 day" grace was silently
+# two days, and "0" was silently one. `-mmin +N` truncates to whole minutes
+# instead, so the error is one minute rather than one day.
 if ! [[ "$GRACE_DAYS" =~ ^[0-9]+$ ]]; then
     echo "csid-prune: CSID_PRUNE_GRACE_DAYS must be a non-negative integer (got '$GRACE_DAYS')" >&2
+    exit 2
+fi
+if ! [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]]; then
+    echo "csid-prune: CSID_PRUNE_MIN_FREE_GB must be a non-negative integer (got '$MIN_FREE_GB')" >&2
     exit 2
 fi
 GRACE_MINUTES=$(( GRACE_DAYS * 1440 ))
 
 [[ -d "$SPOOL" ]] || { echo "csid-prune: spool $SPOOL missing" >&2; exit 0; }
 
+# rclone env-var backend: no rclone.conf on the fleet. Mirrors csid-sync so the
+# two agree by construction about which bucket "shipped" means.
+if [[ "$VERIFY" == "1" ]]; then
+    if ! command -v rclone >/dev/null 2>&1; then
+        echo "csid-prune: rclone not installed — cannot verify, so nothing is deleted" >&2
+        exit 0
+    fi
+    if [[ -z "${CSID_S3_BUCKET:-}" || -z "${CSID_S3_ENDPOINT:-}" || -z "${CSID_S3_ACCESS_KEY:-}" ]]; then
+        echo "csid-prune: no object-storage credentials — cannot verify, so nothing is deleted" >&2
+        exit 0
+    fi
+    export RCLONE_CONFIG_S3_TYPE=s3
+    export RCLONE_CONFIG_S3_PROVIDER=Other
+    export RCLONE_CONFIG_S3_ENDPOINT="${CSID_S3_ENDPOINT}"
+    export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${CSID_S3_ACCESS_KEY}"
+    export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${CSID_S3_SECRET_KEY:-}"
+fi
+
 freed=0
 pruned=0
+skipped=0
+
+# Free bytes on the spool filesystem. `df -P` is the POSIX output format: one
+# record per filesystem on a single line, so field 4 is available 1 K blocks
+# whatever the mount point is called.
+free_bytes() {
+    local kb
+    kb="$(df -P -k "$SPOOL" | awk 'NR==2 {print $4}')"
+    [[ "$kb" =~ ^[0-9]+$ ]] || { echo 0; return; }
+    echo $(( kb * 1024 ))
+}
+
+# Payload = everything except the two index files, one path per line.
+payload_of() {
+    find "$1" -maxdepth 1 -type f \
+        ! -name metadata.json \
+        ! -name .synced \
+        -print 2>/dev/null
+}
+
+# Does the bucket hold this directory, right now, at these sizes?
+#
+# `--one-way` asks only that every LOCAL file is present and matching on the
+# remote; extra remote objects are fine. `.synced` is excluded because it is
+# deliberately never uploaded (csid-sync excludes it), and without the exclude
+# every check would fail on it.
+verified_remote() {
+    local dir="$1" session
+    [[ "$VERIFY" == "1" ]] || return 0
+    session="$(basename "$dir")"
+    # Bounded hard. rclone's defaults retry a dead endpoint for minutes, and this
+    # runs on a timer beside a capture: a verification that hangs is a prune that
+    # never completes, which on a filling disk is the failure we are fixing. One
+    # attempt, short timeouts, and a non-zero exit means "keep the bytes".
+    rclone check "$dir" "s3:${CSID_S3_BUCKET}/${PREFIX}/${HOST}/${session}/" \
+        --one-way --size-only --exclude '.synced' \
+        --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
+        >/dev/null 2>&1
+}
+
+# Strip one directory's payload, but only once the bucket has confirmed it.
+# Reports each file, because the journal is the only record that a specific byte
+# range is now S3-only.
+strip_dir() {
+    local dir="$1" file size
+    if ! verified_remote "$dir"; then
+        skipped=$(( skipped + 1 ))
+        echo "csid-prune: SKIP $(basename "$dir") — the bucket did not confirm it; keeping every local byte" >&2
+        return 0
+    fi
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        size="$(wc -c < "$file" 2>/dev/null || echo 0)"
+        rm -f "$file"
+        freed=$(( freed + size ))
+        pruned=$(( pruned + 1 ))
+        echo "csid-prune: removed $(basename "$dir")/$(basename "$file")"
+    done < <(payload_of "$dir")
+}
+
+# Synced session directories that still hold payload, oldest marker first. The
+# marker's mtime is the ship time, which is the right ordering key: it is when
+# the bucket took responsibility, not when the capture happened.
+synced_dirs_oldest_first() {
+    local dir marker
+    for dir in "$SPOOL"/*/; do
+        [[ -d "$dir" ]] || continue
+        marker="${dir}.synced"
+        [[ -f "$marker" ]] || continue
+        [[ -n "$(payload_of "$dir")" ]] || continue
+        printf '%s\t%s\n' "$(stat -c %Y "$marker" 2>/dev/null || echo 0)" "$dir"
+    done | sort -n -k1,1 | cut -f2-
+}
+
+# -- pass 1: grace ------------------------------------------------------------
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
-    marker="$dir/.synced"
+    marker="${dir}.synced"
 
     # Never prune what was never confirmed shipped.
     [[ -f "$marker" ]] || continue
@@ -45,15 +203,40 @@ for dir in "$SPOOL"/*/; do
         continue
     fi
 
-    for name in capture.raw ble_scan.jsonl; do
-        intermediate="$dir/$name"
-        [[ -f "$intermediate" ]] || continue
-        size=$(wc -c < "$intermediate" 2>/dev/null || echo 0)
-        rm -f "$intermediate"
-        freed=$((freed + size))
-        pruned=$((pruned + 1))
-        echo "csid-prune: removed $(basename "$dir")/$name"
-    done
+    strip_dir "$dir"
 done
 
-echo "csid-prune: pruned $pruned intermediate(s), freed $((freed / 1024 / 1024)) MiB"
+# -- pass 2: pressure --------------------------------------------------------
+#
+# Free space is re-read after every directory rather than predicted. The
+# prediction would be wrong for exactly the reason this pass exists: a capture is
+# writing to the same filesystem while we delete from it, so the only honest
+# stopping condition is a fresh measurement.
+MIN_FREE_BYTES=$(( MIN_FREE_GB * 1000 * 1000 * 1000 ))
+free_now="$(free_bytes)"
+if (( free_now < MIN_FREE_BYTES )); then
+    echo "csid-prune: $(( free_now / 1024 / 1024 )) MiB free is under the ${MIN_FREE_GB} GB floor — ignoring the ${GRACE_DAYS}-day grace, oldest shipped first"
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
+        strip_dir "$dir"
+        free_now="$(free_bytes)"
+        if (( free_now >= MIN_FREE_BYTES )); then
+            break
+        fi
+    done < <(synced_dirs_oldest_first)
+
+    free_now="$(free_bytes)"
+    if (( free_now < MIN_FREE_BYTES )); then
+        # Everything verifiable has been reclaimed and the floor is still not
+        # met, so the rest is unshipped captures or data that is not ours. Say so
+        # loudly and fail: a node in this state cannot be trusted with the next
+        # long run, and a silent success would hide that. Note what this does NOT
+        # do — it does not start deleting unverified sessions to make room.
+        echo "csid-prune: STILL under the floor after reclaiming everything the bucket confirmed — $(( free_now / 1024 / 1024 )) MiB free." >&2
+        echo "csid-prune: the remaining bytes are unshipped sessions or non-csid data. Run csid-sync, then look at the spool by hand. Nothing unverified was deleted." >&2
+        echo "csid-prune: pruned $pruned file(s), freed $(( freed / 1024 / 1024 )) MiB, skipped $skipped unconfirmed"
+        exit 1
+    fi
+fi
+
+echo "csid-prune: pruned $pruned file(s), freed $(( freed / 1024 / 1024 )) MiB, skipped $skipped unconfirmed, $(( $(free_bytes) / 1024 / 1024 )) MiB free"

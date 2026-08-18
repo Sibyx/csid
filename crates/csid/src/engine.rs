@@ -624,19 +624,20 @@ pub fn run_session(
     // transmitters it saw are what scope that walk: `capture.raw` on a busy
     // channel is millions of records, and only the ones from a transmitter we
     // actually took a stamp from can ever be paired.
-    let ts_rows = timesync.map(|h| {
-        let ndjson = h.join();
-        timesync::read_log(&ndjson).unwrap_or_else(|e| {
-            tracing::error!(error = %format!("{e:#}"), "reading the time-transfer log failed");
-            (Vec::new(), 0)
-        })
-    });
-    let ts_macs: std::collections::HashSet<[u8; 6]> = ts_rows
+    //
+    // Only the DISTINCT MACS are needed here, and reading them costs one
+    // streaming pass rather than a resident copy of the log. Materialising it
+    // (`read_log`) is what put ~2.4 GB on a 2.07 GB node with no swap on
+    // 2026-08-17 and got all six OOM-killed mid-teardown — see
+    // `timesync::for_each_batch`.
+    let ts_log: Option<PathBuf> = timesync.map(|h| h.join());
+    let ts_macs: std::collections::HashSet<[u8; 6]> = ts_log
         .as_ref()
-        .map(|(rows, _)| {
-            rows.iter()
-                .filter_map(|r| crate::timesync::payload::parse_mac(&r.tx_mac))
-                .collect()
+        .map(|p| {
+            timesync::distinct_tx_macs(p).unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "reading the time-transfer log failed");
+                Default::default()
+            })
         })
         .unwrap_or_default();
 
@@ -644,7 +645,7 @@ pub fn run_session(
     // The same single pass over `capture.raw` yields the `ftm` ticks, so time
     // transfer costs the teardown nothing extra and the hot path nothing at all.
     let (mut summary, ticks) = if raw_paths.is_empty() {
-        (base_summary(&counters), Vec::new())
+        (base_summary(&counters), timesync::TickIndex::default())
     } else {
         summarize(&raw_paths, cfg, &counters, &ts_macs)
     };
@@ -655,7 +656,7 @@ pub fn run_session(
             &session_id,
             &host,
             cfg,
-            ts_rows,
+            ts_log.as_deref(),
             &ticks,
             &ts_counters,
             ts_error,
@@ -802,8 +803,8 @@ fn finish_timesync(
     session_id: &str,
     host: &str,
     cfg: &ExperimentConfig,
-    rows: Option<(Vec<timesync::Row>, u64)>,
-    ticks: &[timesync::CsiTick],
+    log: Option<&std::path::Path>,
+    ticks: &timesync::TickIndex,
     counters: &TimesyncCounters,
     startup_error: Option<String>,
 ) -> TimesyncSummary {
@@ -820,25 +821,94 @@ fn finish_timesync(
         ..TimesyncSummary::default()
     };
 
-    let Some((mut rows, malformed)) = rows else {
+    let Some(log) = log else {
         return s; // never started; `error` already says why
     };
-    s.malformed_log_lines = malformed;
 
-    let paired = timesync::pair_ftm(&mut rows, ticks, cfg.timesync.ftm_tolerance_ns());
-    s.ftm_paired = paired as u64;
+    // The index refuses to pair when it overflowed its memory budget, because a
+    // partial pairing is indistinguishable in the output from frames that
+    // genuinely had no CSI. Say so in the sidecar rather than shipping a column
+    // that silently means two things.
+    if ticks.overflowed() {
+        tracing::error!(
+            ticks = ticks.len(),
+            "too many CSI ticks to pair within the memory budget — ftm will be null for every row"
+        );
+        s.error.get_or_insert_with(|| {
+            format!(
+                "ftm pairing skipped: the tick index hit its {} -tick budget",
+                ticks.len()
+            )
+        });
+    }
 
+    // STREAMED, not materialised. Pair each batch, note its stamp sources, hand
+    // it to the parquet sink, and drop it. Peak memory is one batch instead of
+    // the whole session — the fix for the 2026-08-17 teardown OOM.
+    let mut sink = match timesync::ParquetSink::create(
+        &dir.join(timesync::PARQUET_NAME),
+        timesync::ParquetContext {
+            host: host.to_string(),
+            session_id: session_id.to_string(),
+        },
+    ) {
+        Ok(sink) => sink,
+        Err(e) => {
+            tracing::error!(
+                error = %format!("{e:#}"),
+                "opening the time-transfer parquet failed ({} is intact)",
+                timesync::NDJSON_NAME
+            );
+            s.error.get_or_insert_with(|| format!("{e:#}"));
+            return s;
+        }
+    };
+
+    let tolerance_ns = cfg.timesync.ftm_tolerance_ns();
+    let mut paired = 0usize;
     // A userspace-stamped session carries the scheduler's wake-up jitter in
     // every stamp; a MIXED one has two jitter causes in one file. Both are
     // reported rather than assumed away.
     let mut kernel = false;
     let mut userspace = false;
-    for r in &rows {
-        match r.rx_stamp_src {
-            timesync::StampSource::Kernel => kernel = true,
-            timesync::StampSource::Userspace => userspace = true,
+
+    let parquet_path = dir.join(timesync::PARQUET_NAME);
+    let export = timesync::for_each_batch(log, timesync::TIMESYNC_BATCH_ROWS, |batch| {
+        paired += ticks.pair(batch.as_mut_slice(), tolerance_ns);
+        for r in batch.iter() {
+            match r.rx_stamp_src {
+                timesync::StampSource::Kernel => kernel = true,
+                timesync::StampSource::Userspace => userspace = true,
+            }
+        }
+        sink.write_batch(batch)
+    })
+    .and_then(|malformed| sink.finish().map(|stats| (stats, malformed)));
+
+    // A streamed writer opens the file FIRST, so a mid-stream failure leaves an
+    // artefact behind where the all-at-once writer would have left none. Two bad
+    // outcomes to avoid: a footerless file, which no reader can open, and a
+    // footered file holding the rows that happened to be written before the
+    // error, which every reader opens happily and which is short. Both are worse
+    // than nothing, because `time_transfer.parquet` existing is what a consumer
+    // takes as "this session exported". The durable log is intact either way, so
+    // the recovery is `csid timesync export`.
+    if export.is_err() {
+        match std::fs::remove_file(&parquet_path) {
+            Ok(()) => tracing::warn!(
+                path = %parquet_path.display(),
+                "removed the partial time-transfer parquet; rebuild it with `csid timesync export`"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(
+                error = %e,
+                path = %parquet_path.display(),
+                "could not remove the partial time-transfer parquet — treat it as invalid"
+            ),
         }
     }
+
+    s.ftm_paired = paired as u64;
     s.rx_stamp_source = match (kernel, userspace) {
         (true, true) => "mixed",
         (true, false) => "kernel",
@@ -847,15 +917,9 @@ fn finish_timesync(
     }
     .to_string();
 
-    match timesync::write_parquet(
-        &rows,
-        &dir.join(timesync::PARQUET_NAME),
-        &timesync::ParquetContext {
-            host: host.to_string(),
-            session_id: session_id.to_string(),
-        },
-    ) {
-        Ok(stats) => {
+    match export {
+        Ok((stats, malformed)) => {
+            s.malformed_log_lines = malformed;
             s.rows = stats.rows;
             s.rows_csid = stats.rows_csid;
             s.rows_app = stats.rows_app;
@@ -932,9 +996,9 @@ fn summarize(
     cfg: &ExperimentConfig,
     counters: &Counters,
     ftm_macs: &std::collections::HashSet<[u8; 6]>,
-) -> (SummaryMeta, Vec<timesync::CsiTick>) {
+) -> (SummaryMeta, timesync::TickIndex) {
     let mut summary = base_summary(counters);
-    let mut ticks: Vec<timesync::CsiTick> = Vec::new();
+    let mut ticks = timesync::TickIndex::new(timesync::TIMESYNC_TICK_BUDGET);
 
     let mut tones: Vec<u16> = Vec::new();
     let mut count: u64 = 0;
@@ -964,15 +1028,12 @@ fn summarize(
             // A record with no wallclock cannot be matched to a received frame,
             // and one from a transmitter we never stamped can never be needed.
             if rec.unix_ts_ns != 0 && ftm_macs.contains(&rec.src_mac) {
-                ticks.push(timesync::CsiTick {
-                    unix_ts_ns: rec.unix_ts_ns,
-                    ftm: rec.ftm,
-                    src_mac: rec.src_mac,
-                });
+                ticks.push(rec.unix_ts_ns, rec.ftm, rec.src_mac);
             }
         }
     }
 
+    ticks.seal();
     tones.sort_unstable();
     summary.records = count;
     summary.tone_counts = tones;

@@ -73,6 +73,24 @@ jobs:
             target/aarch64-unknown-linux-gnu/release/csid
             target/aarch64-unknown-linux-gnu/release/csiscope
 
+  # `csid-prune` is the only thing in this repo that deletes measurements, and
+  # until 2026-08-18 it had no test — which is how it came to keep `capture.csiq`
+  # forever while its own header described a reclaimed spool. The suite asserts
+  # the invariants whose violation loses data, above all that a session with no
+  # `.synced` marker is never touched at any disk pressure.
+  helpers:
+    name: shell helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck rclone
+          shellcheck scripts/csid-sync scripts/csid-prune tests/prune.sh
+      - name: csid-prune invariants
+        run: tests/prune.sh
+
   # The format's cross-language claim is only real if it is tested: Rust writes
   # a CSIQ file, Python reads it back and must agree field for field.
   interop:

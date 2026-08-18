@@ -70,7 +70,7 @@ pub mod payload;
 pub mod rx;
 pub mod skew;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -98,6 +98,26 @@ pub const PARQUET_NAME: &str = "time_transfer.parquet";
 pub const PARQUET_SCHEMA: &str = "time-transfer/1";
 /// Rows per parquet row group.
 const ROW_GROUP_ROWS: usize = 65_536;
+
+/// Rows held in memory while streaming the time-transfer log at session close.
+///
+/// 64 Ki rows is ~12 MB of `Row` and one parquet row group, so the batch costs
+/// about what the writer was going to buffer anyway.
+pub const TIMESYNC_BATCH_ROWS: usize = 65_536;
+
+/// Ticks the close-time pairing index may hold, as a memory budget.
+///
+/// A tick is 12 bytes in [`TickIndex`] (parallel `u64` + `u32`
+/// vectors), so this is ~384 MB at the cap. The node has 2.07 GB and NO SWAP,
+/// and the rest of teardown — one 64 Ki-row batch, the parquet writer's
+/// buffers, the raw reader — is tens of megabytes, so the cap is the only term
+/// that scales with session length and this leaves roughly a gigabyte of head
+/// room.
+///
+/// For scale: the 16 h / 250 Hz night of 2026-08-17 stamped ~14 M ticks per
+/// node, a third of the budget. A session that exceeds it does not crash and
+/// does not pair silently — see [`TickIndex::pair`].
+pub const TIMESYNC_TICK_BUDGET: usize = (384 << 20) / 12;
 
 /// Where the receive stamp came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,10 +292,56 @@ impl RowLog {
 
 /// Read the durable log back. A truncated final line — the signature of a power
 /// cut — costs that line and nothing more.
+///
+/// ⚠️ **This holds the whole log in memory and a long session's log is large.**
+/// A 16 h session at 250 Hz produced a 2.5 GB NDJSON, which is ~12.5 M rows and
+/// ~2.4 GB of `Row` once parsed — on a node with 2.07 GB and no swap. Use it in
+/// tests and on logs of known size; the session-close path uses
+/// [`for_each_batch`], which is bounded. See the note on that function.
 pub fn read_log(path: &Path) -> Result<(Vec<Row>, u64)> {
+    let mut rows = Vec::new();
+    // Moderate batches rather than `usize::MAX`: appending one giant batch would
+    // hold the batch AND the destination at full size for the length of the
+    // memcpy, doubling the peak of the very function whose peak is the problem.
+    let malformed = for_each_batch(path, ROW_GROUP_ROWS, |batch| {
+        rows.append(batch);
+        Ok(())
+    })?;
+    Ok((rows, malformed))
+}
+
+/// Read the durable log in bounded batches, calling `f` with each.
+///
+/// WHY THIS EXISTS. On 2026-08-17 all six nodes were OOM-killed during teardown,
+/// 40 s to 2 min after sealing their last segment of a 16 h / 250 Hz run. The
+/// session root was therefore never closed: its sidecar still reads
+/// `status: "capturing"`, no `time_transfer.parquet` was written, `csid-sync`
+/// skipped it forever, and ~14.5 GB of time transfer was left with one copy on
+/// six SD cards. Teardown allocated roughly:
+///
+/// | what | size |
+/// |---|---|
+/// | `read_log` → `Vec<Row>` | ~2.4 GB |
+/// | `summarize` → `Vec<CsiTick>` | ~830 MB |
+/// | `pair_ftm`'s `by_mac` copy of those ticks | ~415 MB |
+///
+/// against 2.07 GB of RAM and no swap. Every one of those grows with session
+/// length, so the daemon had a maximum run length nothing declared and nothing
+/// measured — it simply died at the end of a long enough capture, losing the
+/// close rather than the capture.
+///
+/// The batch is REUSED between calls (`f` receives `&mut Vec<Row>` and is
+/// expected to drain it), so the allocation is amortised and peak memory is
+/// `batch_rows` rows rather than all of them.
+///
+/// Returns the malformed-line count, exactly as [`read_log`] does.
+pub fn for_each_batch<F>(path: &Path, batch_rows: usize, mut f: F) -> Result<u64>
+where
+    F: FnMut(&mut Vec<Row>) -> Result<()>,
+{
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::with_capacity(256 * 1024, file);
-    let mut rows = Vec::new();
+    let mut batch: Vec<Row> = Vec::new();
     let mut malformed = 0u64;
     for line in reader.lines() {
         let line = line.context("reading the time-transfer log")?;
@@ -283,11 +349,47 @@ pub fn read_log(path: &Path) -> Result<(Vec<Row>, u64)> {
             continue;
         }
         match serde_json::from_str::<Row>(&line) {
-            Ok(r) => rows.push(r),
+            Ok(r) => batch.push(r),
             Err(_) => malformed += 1,
         }
+        if batch.len() >= batch_rows {
+            f(&mut batch)?;
+            batch.clear();
+        }
     }
-    Ok((rows, malformed))
+    if !batch.is_empty() {
+        f(&mut batch)?;
+        batch.clear();
+    }
+    Ok(malformed)
+}
+
+/// Distinct transmitter MACs in the durable log, without holding the log.
+///
+/// The session-close path needs this BEFORE it walks `capture.raw`, so it can
+/// keep only the ticks that could ever be paired. Deserialising one field
+/// instead of thirteen keeps the extra pass cheap: serde still tokenises each
+/// line, but allocates one `String` rather than a whole `Row`.
+pub fn distinct_tx_macs(path: &Path) -> Result<HashSet<[u8; 6]>> {
+    #[derive(Deserialize)]
+    struct MacOnly {
+        tx_mac: String,
+    }
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut macs = HashSet::new();
+    for line in reader.lines() {
+        let line = line.context("reading the time-transfer log")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(m) = serde_json::from_str::<MacOnly>(&line) {
+            if let Some(mac) = payload::parse_mac(&m.tx_mac) {
+                macs.insert(mac);
+            }
+        }
+    }
+    Ok(macs)
 }
 
 // -- ftm pairing --------------------------------------------------------------
@@ -317,47 +419,131 @@ pub struct CsiTick {
 ///
 /// Returns the number of rows paired.
 pub fn pair_ftm(rows: &mut [Row], ticks: &[CsiTick], tolerance_ns: u64) -> usize {
-    if ticks.is_empty() {
-        return 0;
-    }
-    let mut by_mac: HashMap<[u8; 6], Vec<(u64, u32)>> = HashMap::new();
+    let mut index = TickIndex::new(usize::MAX);
     for t in ticks {
-        by_mac
-            .entry(t.src_mac)
-            .or_default()
-            .push((t.unix_ts_ns, t.ftm));
+        index.push(t.unix_ts_ns, t.ftm, t.src_mac);
     }
-    for v in by_mac.values_mut() {
-        v.sort_unstable_by_key(|(ts, _)| *ts);
+    index.seal();
+    index.pair(rows, tolerance_ns)
+}
+
+/// Ticks grouped by transmitter, built once and queried per row.
+///
+/// ## Why this is not a `Vec<CsiTick>`
+///
+/// It used to be two structures. `summarize` collected every candidate tick
+/// into a `Vec<CsiTick>` (24 bytes each after padding) and `pair_ftm` then built
+/// a second, differently-shaped copy to search. On the 2026-08-17 night that was
+/// ~830 MB plus ~415 MB, on a node with 2.07 GB and no swap — and it was pure
+/// duplication, since nothing ever needed the flat vector.
+///
+/// This is the searchable form, filled directly during the raw scan. Parallel
+/// vectors rather than `Vec<(u64, u32)>` because the tuple pads to 16 bytes and
+/// the pair costs 12: a quarter of the memory, for free, on the one structure
+/// here that scales with session length.
+#[derive(Debug, Default)]
+pub struct TickIndex {
+    by_mac: HashMap<[u8; 6], (Vec<u64>, Vec<u32>)>,
+    len: usize,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl TickIndex {
+    /// `cap` bounds the number of ticks held. Past it the index stops growing
+    /// and reports [`Self::overflowed`] — see [`Self::pair`] for why that is a
+    /// refusal to pair rather than a partial pairing.
+    pub fn new(cap: usize) -> Self {
+        TickIndex {
+            cap,
+            ..Default::default()
+        }
     }
 
-    let mut paired = 0usize;
-    for row in rows.iter_mut() {
-        let Some(mac) = payload::parse_mac(&row.tx_mac) else {
-            continue;
-        };
-        let Some(v) = by_mac.get(&mac) else { continue };
-        let i = v.partition_point(|(ts, _)| *ts < row.unix_ts_ns);
-        // The nearest tick is one of the two straddling the row.
-        let mut best: Option<(u64, u32, i64)> = None;
-        for cand in [i.checked_sub(1), Some(i)].into_iter().flatten() {
-            let Some(&(ts, ftm)) = v.get(cand) else {
-                continue;
-            };
-            let lag = ts as i64 - row.unix_ts_ns as i64;
-            if lag.unsigned_abs() <= tolerance_ns
-                && best.is_none_or(|(_, _, b)| lag.abs() < b.abs())
-            {
-                best = Some((ts, ftm, lag));
-            }
+    pub fn push(&mut self, unix_ts_ns: u64, ftm: u32, src_mac: [u8; 6]) {
+        if self.len >= self.cap {
+            self.overflowed = true;
+            return;
         }
-        if let Some((_, ftm, lag)) = best {
-            row.ftm = Some(ftm);
-            row.ftm_lag_ns = Some(lag);
-            paired += 1;
+        let e = self.by_mac.entry(src_mac).or_default();
+        e.0.push(unix_ts_ns);
+        e.1.push(ftm);
+        self.len += 1;
+    }
+
+    /// Put each transmitter's ticks in time order.
+    ///
+    /// Records arrive in time order, so this is normally a scan that finds
+    /// nothing to do. It is not an assertion, because these nodes have no RTC
+    /// and chrony can step the clock mid-session — which reorders wallclock
+    /// stamps within one capture. Sorting via a permutation keeps the parallel
+    /// vectors in step.
+    pub fn seal(&mut self) {
+        for (ts, ftm) in self.by_mac.values_mut() {
+            if ts.windows(2).all(|w| w[0] <= w[1]) {
+                continue;
+            }
+            let mut order: Vec<u32> = (0..ts.len() as u32).collect();
+            order.sort_unstable_by_key(|&i| ts[i as usize]);
+            *ts = order.iter().map(|&i| ts[i as usize]).collect();
+            *ftm = order.iter().map(|&i| ftm[i as usize]).collect();
         }
     }
-    paired
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True when the tick cap was hit and this index is therefore incomplete.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Attribute an `ftm` to each row. Returns how many were paired.
+    ///
+    /// Refuses outright when the index overflowed. A partial index pairs the
+    /// rows whose ticks happened to land under the cap and silently leaves the
+    /// rest unpaired, which is indistinguishable in the output from a session
+    /// where those frames genuinely had no CSI. "Too large to pair on this node"
+    /// and "these frames were not received" must not look the same.
+    pub fn pair(&self, rows: &mut [Row], tolerance_ns: u64) -> usize {
+        if self.is_empty() || self.overflowed {
+            return 0;
+        }
+        let mut paired = 0usize;
+        for row in rows.iter_mut() {
+            let Some(mac) = payload::parse_mac(&row.tx_mac) else {
+                continue;
+            };
+            let Some((ts, ftms)) = self.by_mac.get(&mac) else {
+                continue;
+            };
+            let i = ts.partition_point(|t| *t < row.unix_ts_ns);
+            // The nearest tick is one of the two straddling the row.
+            let mut best: Option<(u32, i64)> = None;
+            for cand in [i.checked_sub(1), Some(i)].into_iter().flatten() {
+                let (Some(&t), Some(&ftm)) = (ts.get(cand), ftms.get(cand)) else {
+                    continue;
+                };
+                let lag = t as i64 - row.unix_ts_ns as i64;
+                if lag.unsigned_abs() <= tolerance_ns
+                    && best.is_none_or(|(_, b)| lag.abs() < b.abs())
+                {
+                    best = Some((ftm, lag));
+                }
+            }
+            if let Some((ftm, lag)) = best {
+                row.ftm = Some(ftm);
+                row.ftm_lag_ns = Some(lag);
+                paired += 1;
+            }
+        }
+        paired
+    }
 }
 
 // -- parquet export -----------------------------------------------------------
@@ -423,42 +609,88 @@ fn parquet_schema() -> Result<Type> {
         .build()?)
 }
 
-/// Write `rows` to `out`.
+/// An open `time_transfer.parquet`, fed a batch at a time.
+///
+/// Parquet is a row-group format and this writer always emitted row groups, so
+/// the only thing standing between it and a bounded-memory export was the
+/// `&[Row]` in the signature: the caller had to materialise every row first.
+/// Feeding batches instead lets session close hold one batch rather than a
+/// 16-hour session — see [`for_each_batch`] for what that cost on 2026-08-17.
+///
+/// Stats accumulate across batches, so the sidecar numbers are identical to
+/// those the all-at-once path produced.
+pub struct ParquetSink {
+    writer: SerializedFileWriter<File>,
+    ctx: ParquetContext,
+    stats: ExportStats,
+    /// Distinct `tx_id`s. Owned rather than borrowed because no batch outlives
+    /// the sink; bounded by the number of transmitters, not by rows.
+    seen: HashSet<String>,
+    wrote_any: bool,
+}
+
+impl ParquetSink {
+    pub fn create(out: &Path, ctx: ParquetContext) -> Result<Self> {
+        let schema = Arc::new(parquet_schema()?);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+        let writer = SerializedFileWriter::new(file, schema, props)
+            .context("opening the time_transfer.parquet writer")?;
+        Ok(ParquetSink {
+            writer,
+            ctx,
+            stats: ExportStats::default(),
+            seen: HashSet::new(),
+            wrote_any: false,
+        })
+    }
+
+    pub fn write_batch(&mut self, rows: &[Row]) -> Result<()> {
+        for r in rows {
+            if !self.seen.contains(r.tx_id.as_str()) {
+                self.seen.insert(r.tx_id.clone());
+            }
+            match r.tx_kind {
+                TxKind::Csid => self.stats.rows_csid += 1,
+                TxKind::App => self.stats.rows_app += 1,
+            }
+            if r.ftm.is_some() {
+                self.stats.ftm_paired += 1;
+            }
+        }
+        for chunk in rows.chunks(ROW_GROUP_ROWS) {
+            self.stats.rows += write_row_group(&mut self.writer, chunk, &self.ctx)? as u64;
+            self.wrote_any = true;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<ExportStats> {
+        // A session that received nothing still gets a schema-correct empty
+        // file: "no stamped frames" and "no artefact" are different diagnoses.
+        if !self.wrote_any {
+            write_row_group(&mut self.writer, &[], &self.ctx)?;
+        }
+        self.stats.distinct_transmitters = self.seen.len() as u64;
+        self.writer
+            .close()
+            .context("closing time_transfer.parquet")?;
+        Ok(self.stats)
+    }
+}
+
+/// Write `rows` to `out` in one call.
+///
+/// A thin wrapper over [`ParquetSink`], kept because tests and any caller with a
+/// log of known size are clearer this way. The session-close path streams.
 pub fn write_parquet(rows: &[Row], out: &Path, ctx: &ParquetContext) -> Result<ExportStats> {
-    let schema = Arc::new(parquet_schema()?);
-    let props = Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build(),
-    );
-    let sink = File::create(out).with_context(|| format!("creating {}", out.display()))?;
-    let mut writer = SerializedFileWriter::new(sink, schema, props)
-        .context("opening the time_transfer.parquet writer")?;
-
-    let mut stats = ExportStats::default();
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for r in rows {
-        seen.insert(r.tx_id.as_str());
-        match r.tx_kind {
-            TxKind::Csid => stats.rows_csid += 1,
-            TxKind::App => stats.rows_app += 1,
-        }
-        if r.ftm.is_some() {
-            stats.ftm_paired += 1;
-        }
-    }
-    stats.distinct_transmitters = seen.len() as u64;
-
-    for chunk in rows.chunks(ROW_GROUP_ROWS) {
-        stats.rows += write_row_group(&mut writer, chunk, ctx)? as u64;
-    }
-    // A session that received nothing still gets a schema-correct empty file:
-    // "no stamped frames" and "no artefact" are different diagnoses.
-    if rows.is_empty() {
-        write_row_group(&mut writer, &[], ctx)?;
-    }
-    writer.close().context("closing time_transfer.parquet")?;
-    Ok(stats)
+    let mut sink = ParquetSink::create(out, ctx.clone())?;
+    sink.write_batch(rows)?;
+    sink.finish()
 }
 
 fn write_row_group<W: std::io::Write + Send>(
@@ -785,6 +1017,245 @@ mod tests {
         let csid = serde_json::to_string(&csid_row(1, T0)).unwrap();
         assert!(!csid.contains("ftm"), "{csid}");
         assert!(!csid.contains("tx_wall_ns"), "{csid}");
+    }
+
+    /// A brute-force nearest-within-tolerance search, written independently of
+    /// the index. If `TickIndex` and this ever disagree, the index is wrong —
+    /// the whole point of streaming is that it changes memory, not results.
+    fn reference_pair(rows: &mut [Row], ticks: &[CsiTick], tol: u64) -> usize {
+        let mut paired = 0;
+        for row in rows.iter_mut() {
+            let Some(mac) = payload::parse_mac(&row.tx_mac) else {
+                continue;
+            };
+            let mut best: Option<(u32, i64)> = None;
+            for t in ticks.iter().filter(|t| t.src_mac == mac) {
+                let lag = t.unix_ts_ns as i64 - row.unix_ts_ns as i64;
+                if lag.unsigned_abs() <= tol && best.is_none_or(|(_, b)| lag.abs() < b.abs()) {
+                    best = Some((t.ftm, lag));
+                }
+            }
+            if let Some((ftm, lag)) = best {
+                row.ftm = Some(ftm);
+                row.ftm_lag_ns = Some(lag);
+                paired += 1;
+            }
+        }
+        paired
+    }
+
+    /// Streaming the log must yield exactly what reading it whole yielded, at
+    /// every batch size — including one that divides the row count exactly, one
+    /// that does not, and one larger than the file.
+    #[test]
+    fn batched_reads_are_indistinguishable_from_whole_ones() {
+        let dir = tmpdir("batched");
+        let mut log = RowLog::create(&dir, 1).unwrap();
+        for i in 0..50u64 {
+            log.append(&csid_row(i, T0 + i * 40_000_000)).unwrap();
+        }
+        let path = log.finish().unwrap();
+        // A torn tail, so the malformed count is exercised too.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"unix_ts_ns\":1,\"tx_ki");
+        std::fs::write(&path, text).unwrap();
+
+        let (whole, whole_malformed) = read_log(&path).unwrap();
+        assert_eq!(whole.len(), 50);
+        assert_eq!(whole_malformed, 1);
+
+        for batch_rows in [1usize, 7, 10, 49, 50, 51, 10_000] {
+            let mut seen = Vec::new();
+            let mut sizes = Vec::new();
+            let malformed = for_each_batch(&path, batch_rows, |b| {
+                sizes.push(b.len());
+                seen.append(b);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, whole, "batch_rows={batch_rows}");
+            assert_eq!(malformed, whole_malformed, "batch_rows={batch_rows}");
+            assert!(
+                sizes.iter().all(|n| *n <= batch_rows),
+                "a batch exceeded its bound: {sizes:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The index is a memory optimisation. It must pair identically to a
+    /// brute-force search, including when ticks arrive out of order — which
+    /// these nodes can produce, having no RTC and a chrony that steps.
+    #[test]
+    fn the_tick_index_pairs_exactly_as_a_brute_force_search_does() {
+        let mac = payload::parse_mac(SENTINEL).unwrap();
+        let other = [0x02, 0x6d, 0x6f, 0x6e, 0x00, 0x13];
+
+        let mut ticks = Vec::new();
+        for i in 0..200u64 {
+            ticks.push(CsiTick {
+                unix_ts_ns: T0 + i * 4_000_000,
+                ftm: 1000 + i as u32,
+                src_mac: if i % 5 == 0 { other } else { mac },
+            });
+        }
+        // A clock step: a block of ticks lands out of order.
+        ticks[120..140].reverse();
+
+        let mut rows: Vec<Row> = (0..60u64)
+            .map(|i| csid_row(i, T0 + i * 13_000_000 + 500_000))
+            .collect();
+        let mut expect = rows.clone();
+
+        let tol = 2_000_000u64;
+        let want = reference_pair(&mut expect, &ticks, tol);
+
+        let mut index = TickIndex::new(usize::MAX);
+        for t in &ticks {
+            index.push(t.unix_ts_ns, t.ftm, t.src_mac);
+        }
+        index.seal();
+        let got = index.pair(&mut rows, tol);
+
+        assert_eq!(got, want, "paired count");
+        assert_eq!(rows, expect, "per-row ftm attribution");
+        assert!(want > 0, "the fixture must actually pair something");
+    }
+
+    /// An index that hit its budget must pair NOTHING. A partial pairing is
+    /// indistinguishable in the output from frames that had no CSI, and those
+    /// are different facts.
+    #[test]
+    fn an_overflowed_index_refuses_to_pair_rather_than_pairing_some() {
+        let mac = payload::parse_mac(SENTINEL).unwrap();
+        let mut index = TickIndex::new(4);
+        for i in 0..50u64 {
+            index.push(T0 + i * 1_000_000, i as u32, mac);
+        }
+        index.seal();
+        assert!(index.overflowed());
+        assert_eq!(index.len(), 4);
+
+        let mut rows = vec![csid_row(0, T0), csid_row(1, T0 + 1_000_000)];
+        assert_eq!(index.pair(&mut rows, 2_000_000), 0);
+        assert!(rows.iter().all(|r| r.ftm.is_none()));
+
+        // ...and an index inside its budget still pairs.
+        let mut ok = TickIndex::new(1000);
+        for i in 0..50u64 {
+            ok.push(T0 + i * 1_000_000, i as u32, mac);
+        }
+        ok.seal();
+        assert!(!ok.overflowed());
+        assert!(ok.pair(&mut rows, 2_000_000) > 0);
+    }
+
+    /// The sink fed in batches must produce the same file and the same stats as
+    /// one all-at-once call. This is what lets session close stream.
+    #[test]
+    fn the_batched_sink_matches_the_all_at_once_writer() {
+        let dir = tmpdir("sink");
+        let ctx = ParquetContext {
+            host: "monad05".into(),
+            session_id: "monad05_test_20260818-000000".into(),
+        };
+        let mut rows: Vec<Row> = (0..300u64)
+            .map(|i| csid_row(i, T0 + i * 40_000_000))
+            .collect();
+        rows.extend((0..120u64).map(|i| app_row(i, T0 + i * 50_000_000, 900_000_000_000 + i)));
+        rows[7].ftm = Some(4242);
+        rows[7].ftm_lag_ns = Some(-1234);
+
+        let whole_path = dir.join("whole.parquet");
+        let whole = write_parquet(&rows, &whole_path, &ctx).unwrap();
+
+        let batched_path = dir.join("batched.parquet");
+        let mut sink = ParquetSink::create(&batched_path, ctx.clone()).unwrap();
+        for chunk in rows.chunks(37) {
+            sink.write_batch(chunk).unwrap();
+        }
+        let batched = sink.finish().unwrap();
+
+        assert_eq!(batched.rows, whole.rows);
+        assert_eq!(batched.rows_csid, whole.rows_csid);
+        assert_eq!(batched.rows_app, whole.rows_app);
+        assert_eq!(batched.ftm_paired, whole.ftm_paired);
+        assert_eq!(batched.distinct_transmitters, whole.distinct_transmitters);
+        assert_eq!(batched.rows, 420);
+        assert_eq!(batched.ftm_paired, 1);
+
+        // Both files must be readable and carry every row.
+        for path in [&whole_path, &batched_path] {
+            let f = File::open(path).unwrap();
+            let r = parquet::file::reader::SerializedFileReader::new(f).unwrap();
+            use parquet::file::reader::FileReader;
+            let total: i64 = r.metadata().row_groups().iter().map(|g| g.num_rows()).sum();
+            assert_eq!(total, 420, "{path:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A streamed writer opens its file before it knows the read will succeed.
+    /// A failure must not leave a parquet behind: a footerless one cannot be
+    /// opened, and a footered short one is opened happily and is wrong. Both
+    /// read as "this session exported" to anything that checks for the file.
+    #[test]
+    fn a_failed_stream_leaves_no_parquet_to_mistake_for_an_export() {
+        let dir = tmpdir("partial");
+        let out = dir.join(PARQUET_NAME);
+        let ctx = ParquetContext {
+            host: "monad05".into(),
+            session_id: "monad05_test_20260818-000000".into(),
+        };
+
+        // The sink opens the file...
+        let mut sink = ParquetSink::create(&out, ctx).unwrap();
+        sink.write_batch(&[csid_row(0, T0)]).unwrap();
+        assert!(out.is_file(), "the sink must have opened its file");
+
+        // ...and a stream that never finishes leaves it without a footer.
+        drop(sink);
+        let f = File::open(&out).unwrap();
+        assert!(
+            parquet::file::reader::SerializedFileReader::new(f).is_err(),
+            "a dropped sink should leave an unreadable file — if this ever \
+             starts passing, the cleanup in finish_timesync is still right but \
+             this test no longer proves why"
+        );
+
+        // Which is why the caller removes it. Reading a log that does not exist
+        // is the cheapest way to reach that path.
+        assert!(for_each_batch(&dir.join("absent.jsonl"), 10, |_| Ok(())).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Distinct MACs must be recoverable without holding the log.
+    #[test]
+    fn the_mac_scan_finds_every_transmitter_without_reading_rows() {
+        let dir = tmpdir("macs");
+        let mut log = RowLog::create(&dir, 1).unwrap();
+        for i in 0..10u64 {
+            log.append(&csid_row(i, T0 + i)).unwrap();
+        }
+        let mut other = csid_row(99, T0);
+        other.tx_mac = "02:6d:6f:6e:00:13".into();
+        log.append(&other).unwrap();
+        let path = log.finish().unwrap();
+
+        let macs = distinct_tx_macs(&path).unwrap();
+        assert_eq!(macs.len(), 2);
+        assert!(macs.contains(&payload::parse_mac(SENTINEL).unwrap()));
+        assert!(macs.contains(&[0x02, 0x6d, 0x6f, 0x6e, 0x00, 0x13]));
+
+        // It must agree with what a full read would have found.
+        let (rows, _) = read_log(&path).unwrap();
+        let from_rows: HashSet<[u8; 6]> = rows
+            .iter()
+            .filter_map(|r| payload::parse_mac(&r.tx_mac))
+            .collect();
+        assert_eq!(macs, from_rows);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

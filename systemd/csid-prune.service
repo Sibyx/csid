@@ -1,5 +1,5 @@
 [Unit]
-Description=Prune synced CSI raw captures past the grace window
+Description=Reclaim spool bytes that object storage already holds
 Documentation=https://github.com/Sibyx/csid
 # Config management writes /etc/csid/sync.env only where object-storage
 # credentials exist. Without it there is nothing to ship, so skip cleanly

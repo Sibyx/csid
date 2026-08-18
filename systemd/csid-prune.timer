@@ -1,11 +1,32 @@
 [Unit]
-Description=Daily CSI spool prune
+Description=CSI spool prune
 Documentation=https://github.com/Sibyx/csid
 
 [Timer]
-OnCalendar=daily
+# WHY NOT `OnCalendar=daily`, which this was until 2026-08-18.
+#
+# The prune has two jobs. Applying the grace window is a daily-scale job and
+# `daily` served it fine. Enforcing the free-space floor is not: a 250 Hz HT20
+# segmented run writes ~1.7 GB per 30-minute segment, so a node can go from
+# comfortable to zero bytes between two firings of a daily timer. That is what
+# happened to monad02 on 2026-08-17 — it filled at hour 13 of 16, the durable
+# writer failed, and the OOM killer took csid with it.
+#
+# A floor that is checked once a day is not a floor. This cadence is matched to
+# the segment duration the fleet actually uses, so at most one segment's worth
+# of bytes can accumulate past the floor before the pass runs.
+#
+# The pass is cheap when there is nothing to do: one `df`, one `find` per
+# session directory, and it exits having written nothing. Nice=15 and
+# IOSchedulingClass=idle in the service keep it behind the RX thread.
+OnBootSec=10min
+OnUnitActiveSec=15min
+# Catch up after downtime rather than silently skipping — a node that was off
+# for a day comes back with a spool that needs the grace pass applied.
 Persistent=yes
-RandomizedDelaySec=30min
+# Stagger the fleet: fifteen nodes running `find` over their spools in the same
+# second is pointless synchronised IO.
+RandomizedDelaySec=2min
 
 [Install]
 WantedBy=timers.target

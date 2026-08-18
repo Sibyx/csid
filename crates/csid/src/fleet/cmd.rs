@@ -382,18 +382,13 @@ pub fn timesync_report_cmd(
 /// export, and the way to re-pair `ftm` after a `capture.raw` was restored.
 pub fn timesync_export_cmd(session: PathBuf, tolerance_us: u64) -> Result<()> {
     let log = session.join(crate::timesync::NDJSON_NAME);
-    let (mut rows, malformed) = crate::timesync::read_log(&log)?;
-    println!(
-        "{}: {} row(s){}",
-        log.display(),
-        rows.len(),
-        if malformed > 0 {
-            format!(", {malformed} malformed line(s) skipped")
-        } else {
-            String::new()
-        }
-    );
 
+    // STREAMED, like session close, and for the same reason. This is the
+    // RECOVERY command — the one an operator reaches for after a session whose
+    // teardown died — so it runs against exactly the logs that are too big to
+    // hold. Reading a 2.5 GB log whole needs ~2.4 GB of `Row` on a node with
+    // 2.07 GB and no swap, which would make the recovery fail the same way the
+    // failure it recovers from did.
     let sidecar_path = session.join("metadata.json");
     let sidecar: crate::sidecar::Sidecar = serde_json::from_str(
         &std::fs::read_to_string(&sidecar_path)
@@ -404,40 +399,37 @@ pub fn timesync_export_cmd(session: PathBuf, tolerance_us: u64) -> Result<()> {
     // verified sync still exports — with every `ftm` null, which is the honest
     // outcome rather than a silent failure.
     let raw = session.join("capture.raw");
-    let paired = if raw.is_file() {
+    let mut ticks = crate::timesync::TickIndex::new(crate::timesync::TIMESYNC_TICK_BUDGET);
+    if raw.is_file() {
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&sidecar_path)?)?;
         let width = crate::export::width_from_sidecar(&value).unwrap_or(csiq::Width::Unknown(0));
-        let macs: std::collections::HashSet<[u8; 6]> = rows
-            .iter()
-            .filter_map(|r| crate::timesync::payload::parse_mac(&r.tx_mac))
-            .collect();
+        let macs = crate::timesync::distinct_tx_macs(&log)?;
         let file = std::fs::File::open(&raw)?;
         let mut rr = csiq::raw::RawReader::new(std::io::BufReader::new(file), width);
-        let mut ticks = Vec::new();
         while let Ok(Some(rec)) = rr.next_record() {
             if rec.unix_ts_ns != 0 && macs.contains(&rec.src_mac) {
-                ticks.push(crate::timesync::CsiTick {
-                    unix_ts_ns: rec.unix_ts_ns,
-                    ftm: rec.ftm,
-                    src_mac: rec.src_mac,
-                });
+                ticks.push(rec.unix_ts_ns, rec.ftm, rec.src_mac);
             }
         }
-        crate::timesync::pair_ftm(&mut rows, &ticks, tolerance_us.saturating_mul(1000))
+        ticks.seal();
+        if ticks.overflowed() {
+            println!(
+                "  {} ticks exceeded the pairing budget — every ftm will be null",
+                ticks.len()
+            );
+        }
     } else {
         println!(
             "  {} is absent (pruned after sync?) — every ftm will be null",
             raw.display()
         );
-        0
-    };
+    }
 
     let out = session.join(crate::timesync::PARQUET_NAME);
-    let stats = crate::timesync::write_parquet(
-        &rows,
+    let mut sink = crate::timesync::ParquetSink::create(
         &out,
-        &crate::timesync::ParquetContext {
+        crate::timesync::ParquetContext {
             host: sidecar
                 .environment
                 .hostname
@@ -446,6 +438,24 @@ pub fn timesync_export_cmd(session: PathBuf, tolerance_us: u64) -> Result<()> {
             session_id: sidecar.session_id.clone(),
         },
     )?;
+    let tolerance_ns = tolerance_us.saturating_mul(1000);
+    let mut paired = 0usize;
+    let malformed =
+        crate::timesync::for_each_batch(&log, crate::timesync::TIMESYNC_BATCH_ROWS, |batch| {
+            paired += ticks.pair(batch.as_mut_slice(), tolerance_ns);
+            sink.write_batch(batch)
+        })?;
+    let stats = sink.finish()?;
+    println!(
+        "{}: {} row(s){}",
+        log.display(),
+        stats.rows,
+        if malformed > 0 {
+            format!(", {malformed} malformed line(s) skipped")
+        } else {
+            String::new()
+        }
+    );
     println!(
         "wrote {} — {} row(s) ({} csid, {} app), {} with a paired ftm, {} transmitter(s)",
         out.display(),

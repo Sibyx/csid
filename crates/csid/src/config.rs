@@ -100,13 +100,20 @@ pub struct SyncConfig {
     /// Key prefix; the session lands at `<prefix>/<host>/<session_id>/`.
     #[serde(default)]
     pub prefix: String,
-    /// Delete `capture.raw` this long after a verified sync.
-    #[serde(default = "default_prune_days")]
+    /// ACCEPTED AND IGNORED. Retention is not implemented in this binary.
+    ///
+    /// The live knob is `CSID_PRUNE_GRACE_DAYS` in the systemd environment,
+    /// read by `scripts/csid-prune`; the floor beside it is
+    /// `CSID_PRUNE_MIN_FREE_GB`. This field is parsed only so a `config.toml`
+    /// written before 2026-08-18 still loads — `SyncConfig` is
+    /// `deny_unknown_fields`, so dropping it would make old configs a hard
+    /// startup error rather than a no-op.
+    ///
+    /// It was worse than dead: csiscope rendered it as "prune after N days", so
+    /// the one retention number an operator could see was the one that did
+    /// nothing. Do not add a reader for it — give the script the knob.
+    #[serde(default)]
     pub prune_after_days: u32,
-}
-
-fn default_prune_days() -> u32 {
-    7
 }
 
 /// OpenTelemetry export (off by default — journald always works).
@@ -903,10 +910,12 @@ on_close = true
             "duration = \"30m\"\nsegment_duration = \"5m\"",
         );
         let cfg: ExperimentConfig = toml::from_str(&segmented).unwrap();
-        cfg.validate().expect("5m segments inside a 30m session are fine");
+        cfg.validate()
+            .expect("5m segments inside a 30m session are fine");
 
         // Shorten the session below the segment — what bench did.
-        let bench_shaped = segmented.replace("duration = \"30m\"\nsegment", "duration = \"30s\"\nsegment");
+        let bench_shaped =
+            segmented.replace("duration = \"30m\"\nsegment", "duration = \"30s\"\nsegment");
         let cfg: ExperimentConfig = toml::from_str(&bench_shaped).unwrap();
         assert!(
             cfg.validate().is_err(),
@@ -1155,6 +1164,9 @@ monad04 = "monad.local"
         let rendered = toml::to_string(&cfg).unwrap();
         assert!(rendered.contains("segment_duration"), "{rendered}");
         let back: ExperimentConfig = toml::from_str(&rendered).unwrap();
-        assert_eq!(back.capture.segment_duration, Some(Duration::from_secs(1800)));
+        assert_eq!(
+            back.capture.segment_duration,
+            Some(Duration::from_secs(1800))
+        );
     }
 }

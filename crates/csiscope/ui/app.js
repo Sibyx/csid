@@ -1461,7 +1461,11 @@ async function loadConfig() {
     ['spool', g.node.spool],
     ['hostname', g.node.hostname || S.overview.hostname || '—'],
     ['sync', g.sync.enabled ? `${g.sync.remote}:${g.sync.bucket}/${g.sync.prefix}` : 'disabled'],
-    ['prune after', `${g.sync.prune_after_days} days`],
+    // `sync.prune_after_days` is deliberately NOT shown. It is parsed and
+    // ignored (see SyncConfig), while the retention that actually runs lives in
+    // csid-prune's systemd environment. Showing it meant the only retention
+    // number an operator could read was the one with no effect — which is how a
+    // spool that kept every capture.csiq forever looked correctly configured.
     ['otel', g.otel.enabled ? g.otel.endpoint : 'disabled'],
     ['driver oui', '0x' + g.driver.vendor_oui.toString(16).padStart(6, '0')],
     ['csi subcmd', '0x' + g.driver.csi_event_subcmd.toString(16)],
