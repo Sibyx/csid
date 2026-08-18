@@ -106,6 +106,25 @@ pub fn validate(experiment: &str, experiment_dir: &Path, probe: bool) -> Result<
             "disabled".into()
         }
     );
+    // Say whether anything is KEPT. An operator reading this for the console
+    // profile should not have to infer "writes nothing" from an absence, and an
+    // operator reading it for a measurement profile should see the opposite
+    // stated. `persist = false` on a profile whose data an experiment claims is
+    // the mistake this line exists to make visible.
+    println!(
+        "records kept  : {}",
+        if cfg.capture.persist {
+            match cfg.capture.segment_duration {
+                Some(seg) => format!(
+                    "capture.raw, rolled every {}",
+                    humantime_serde::re::humantime::format_duration(seg)
+                ),
+                None => "capture.raw (one file for the whole session)".to_string(),
+            }
+        } else {
+            "NOTHING — stream only; the sidecar is the only artefact".to_string()
+        }
+    );
     println!("csiq on close : {}", cfg.export.on_close);
     println!(
         "ble co-capture: {}",
@@ -408,7 +427,6 @@ pub fn stream_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
 pub fn stream_cmd(_socket: &Path, _limit: Option<u64>) -> Result<()> {
     anyhow::bail!("`csid stream` requires Unix-domain sockets, unavailable on this platform")
 }
-
 
 /// `csid thermal` — the node's current thermal state, for humans or for the
 /// metrics pipeline.

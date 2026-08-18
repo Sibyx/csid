@@ -27,9 +27,15 @@ use crate::source::RawCsiMessage;
 /// Shared counters, readable by the session loop for logging/metrics.
 #[derive(Debug, Default)]
 pub struct Counters {
-    /// Records durably written.
+    /// Records the capture produced, counted by the RX thread.
+    ///
+    /// NOT "records durably written", which is what it used to be. A session
+    /// with `capture.persist = false` has no durable sink and would otherwise
+    /// report zero while streaming at full rate. A persisted sidecar's `records`
+    /// is recounted from `capture.raw` by `engine::summarize`, so moving this
+    /// changed no archived number.
     pub records: AtomicU64,
-    /// Bytes durably written.
+    /// Bytes durably written. Zero when `capture.persist = false`.
     pub bytes: AtomicU64,
     /// Records dropped on the live path (bounded queue full).
     pub live_dropped: AtomicU64,
@@ -85,7 +91,10 @@ impl DurableSink {
         self.out.write_all(&(msg.csi.len() as u32).to_be_bytes())?;
         self.out.write_all(&msg.csi)?;
 
-        self.counters.records.fetch_add(1, Ordering::Relaxed);
+        // `records` is counted by the RX thread, not here: a session with
+        // `capture.persist = false` has no DurableSink and must still report
+        // what it captured. `bytes` stays, because bytes-on-disk is exactly what
+        // this sink knows and nobody else does.
         self.counters
             .bytes
             .fetch_add(4 + msg_len as u64, Ordering::Relaxed);
@@ -110,7 +119,9 @@ impl DurableSink {
     /// the rotation queue in the unbounded durable channel and drain
     /// immediately after, so a rotation costs latency, never data.
     pub fn rotate(&mut self, dir: &Path) -> Result<PathBuf> {
-        self.out.flush().context("flushing capture.raw before rotation")?;
+        self.out
+            .flush()
+            .context("flushing capture.raw before rotation")?;
         self.out
             .get_ref()
             .sync_all()
@@ -271,7 +282,21 @@ mod tests {
         let rec = rr.next_record().unwrap().unwrap();
         assert_eq!(rec.nrx, 2);
         assert_eq!(rec.ntone, 52);
-        assert_eq!(counters.records.load(Ordering::Relaxed), 1);
+        // The sink counts BYTES; the RX thread counts records (a session with
+        // `capture.persist = false` has no sink and must still report what it
+        // captured). Tying the counter to the file's own length is a stronger
+        // check than the record tally it replaced, which the read-back above
+        // already establishes.
+        assert_eq!(
+            counters.bytes.load(Ordering::Relaxed),
+            bytes.len() as u64,
+            "bytes counted must equal bytes on disk"
+        );
+        assert_eq!(
+            counters.records.load(Ordering::Relaxed),
+            0,
+            "the sink must not count records — the RX thread does"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -328,13 +353,22 @@ mod tests {
         while let Ok(Some(_)) = rr2.next_record() {
             next_count += 1;
         }
-        assert_eq!(next_count, 1, "post-rotation records belong to the new segment");
+        assert_eq!(
+            next_count, 1,
+            "post-rotation records belong to the new segment"
+        );
 
         // The sealed file is untouched by later writes.
         assert_eq!(std::fs::read(&sealed).unwrap().len(), bytes.len());
 
-        // Counters are session-wide, spanning the rotation.
-        assert_eq!(counters.records.load(Ordering::Relaxed), 3);
+        // The byte counter is session-wide and spans the rotation, so it must
+        // equal the sum of the segments it wrote — the invariant that makes
+        // `capture_bytes` in a segmented sidecar trustworthy.
+        assert_eq!(
+            counters.bytes.load(Ordering::Relaxed),
+            (bytes.len() + bytes2.len()) as u64,
+            "session bytes must equal the sum of the segment files"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

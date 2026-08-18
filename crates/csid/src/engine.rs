@@ -14,6 +14,27 @@
 //! Nothing on the live side can apply backpressure to the RX thread: its
 //! channel is bounded and the producer uses `try_send`.
 //!
+//! ## Persisting is a choice, not a property of capturing
+//!
+//! With `capture.persist = false` the durable branch above does not exist: no
+//! thread, no `capture.raw`, no segments, no CSIQ export. Records go to the live
+//! socket and nowhere else, and the session still writes its sidecar — what ran,
+//! on which channel, from when to when, how many records.
+//!
+//! That is the shape the `console` profile always wanted and could not express.
+//! It declares no `duration`, so it runs for as long as the node is up, and it
+//! used to write a `capture.raw` the whole time: 13.34 GB from one session on
+//! monad02 by 2026-08-18, on a 58 GB card. The overnight measurement run then
+//! ran out of the space a live-view utility had taken, its durable writer failed
+//! at hour 13, and the OOM killer took csid during teardown — losing the session
+//! CLOSE, which is what seals the sidecar and writes the Parquet.
+//!
+//! The trade is explicit: with no durable branch, a record the live queue drops
+//! is gone. Right for a liveness feed, wrong for a measurement — hence the
+//! default is `true`, a session that neither persists nor streams is rejected at
+//! validation, and [`refuse_if_spool_is_low`] refuses to OPEN a persisting
+//! session that cannot fit.
+//!
 //! With `capture.segment_duration` set, the durable thread rolls its output
 //! file on a wall-clock deadline and hands each sealed file to the sealer,
 //! which writes that segment's sidecar and CSIQ export. The rotation itself is
@@ -79,6 +100,13 @@ pub fn run_session(
 ) -> Result<SessionOutcome> {
     cfg.validate().context("configuration is invalid")?;
     let tuning = radio::resolve(&cfg.radio)?;
+
+    // Before the radio, before the directory: can this session's output fit?
+    refuse_if_spool_is_low(
+        crate::fleet::probe::disk_health(&global.node.spool, None).map(|d| d.free_gb),
+        global.node.min_free_gb,
+        cfg.capture.persist,
+    )?;
 
     // -- session identity + directory -------------------------------------
     let host = global
@@ -276,7 +304,14 @@ pub fn run_session(
 
     // -- channels ----------------------------------------------------------
     // Durable: unbounded (lossless). Live: bounded (best-effort).
+    //
+    // `capture.persist = false` runs with no durable side at all — see the field
+    // docs for why that exists. The channel is still created (an unused pair
+    // costs nothing) but the SENDER is dropped, so the RX thread has nothing to
+    // hand records to and no receiver to outlive.
+    let persist = cfg.capture.persist;
     let (durable_tx, durable_rx) = mpsc::channel::<Arc<RawCsiMessage>>();
+    let durable_tx = if persist { Some(durable_tx) } else { None };
     let live_enabled = cfg.stream.enabled;
     let (live_tx, live_rx) = mpsc::sync_channel::<Arc<RawCsiMessage>>(if live_enabled {
         cfg.stream.max_queue
@@ -304,8 +339,13 @@ pub fn run_session(
     let durable_counters = counters.clone();
     let durable_dir = dir.clone();
     let durable_session_id = session_id.clone();
-    let durable = thread::Builder::new()
-        .name("csid-durable".into())
+    let durable = if !persist {
+        drop(durable_rx);
+        None
+    } else {
+        Some(
+            thread::Builder::new()
+                .name("csid-durable".into())
         .spawn(move || -> Result<Vec<PathBuf>> {
             // With rotation on, the CSI stream never lands in the session root:
             // segment 0001 is a directory in its own right, so the root holds
@@ -393,7 +433,9 @@ pub fn run_session(
                 None => Ok(vec![last]),
             }
         })
-        .context("spawning durable writer thread")?;
+                .context("spawning durable writer thread")?,
+        )
+    };
 
     // -- live publisher thread --------------------------------------------
     let live_counters = counters.clone();
@@ -446,10 +488,25 @@ pub fn run_session(
                 match source.recv() {
                     Ok(Some(msg)) => {
                         let msg = Arc::new(msg);
-                        // Durable first, and it must never be skipped.
-                        if durable_tx.send(msg.clone()).is_err() {
-                            tracing::error!("durable writer went away; stopping capture");
-                            break;
+                        // Counted HERE, where records are produced, not in the
+                        // durable sink where it used to live. A non-persisting
+                        // session has no sink, and a session reporting 0 records
+                        // while streaming hundreds a second would be a sidecar
+                        // and a status document that lie in the same breath.
+                        //
+                        // This does not change what a persisted sidecar says:
+                        // `summarize` counts the records IN capture.raw and
+                        // overwrites this number. The counter feeds the live
+                        // status document, the heartbeat log, and the summary of
+                        // a session that has no file to count.
+                        rx_counters.records.fetch_add(1, Ordering::Relaxed);
+                        // Durable first, and it must never be skipped — when
+                        // there is one.
+                        if let Some(tx) = &durable_tx {
+                            if tx.send(msg.clone()).is_err() {
+                                tracing::error!("durable writer went away; stopping capture");
+                                break;
+                            }
                         }
                         // Live is strictly best-effort.
                         if live_enabled {
@@ -600,16 +657,23 @@ pub fn run_session(
     let _ = rx.join();
     // One entry for an unsegmented session; one per segment, in index order,
     // for a rotated one.
-    let raw_paths: Vec<PathBuf> = match durable.join() {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "durable writer failed");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::error!("durable writer panicked");
-            Vec::new()
-        }
+    let raw_paths: Vec<PathBuf> = match durable {
+        // Nothing was persisted, so there is nothing to walk. Every consumer of
+        // `raw_paths` downstream already handles the empty case: `summarize` is
+        // skipped for `base_summary`, the CSIQ export has no input, and the ftm
+        // pairing gets an empty tick index and reports null rather than guessing.
+        None => Vec::new(),
+        Some(h) => match h.join() {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "durable writer failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::error!("durable writer panicked");
+                Vec::new()
+            }
+        },
     };
     // The session root only owns a `capture.raw` when rotation is off; with
     // segments the root keeps just the whole-session artefacts.
@@ -649,6 +713,18 @@ pub fn run_session(
     } else {
         summarize(&raw_paths, cfg, &counters, &ts_macs)
     };
+
+    // A persisted session gets its rate from the FTM span across `capture.raw`,
+    // which is the better clock. A stream-only session has no file to span, so
+    // without this its sidecar would report the records it captured beside a rate
+    // of zero — the same half-truth that moving the record counter fixed. Wall
+    // clock is the only axis available here, and it is stated as such.
+    if !persist && summary.records > 0 {
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            summary.mean_rate_hz = summary.records as f64 / elapsed;
+        }
+    }
 
     if cfg.timesync.enabled {
         summary.timesync = Some(finish_timesync(
@@ -957,6 +1033,33 @@ fn finish_timesync(
     s
 }
 
+/// Refuse to open a persisting session on a spool that is nearly full.
+///
+/// Separated from [`run_session`] so the decision is testable without a
+/// filesystem: `free` is `None` when the platform cannot answer, which must
+/// PERMIT the session rather than block it — a missing measurement is not
+/// evidence of a full disk, and refusing on it would make csid unusable
+/// anywhere `statvfs` is unavailable.
+fn refuse_if_spool_is_low(free_gb: Option<f64>, min_free_gb: f64, persist: bool) -> Result<()> {
+    if !persist || min_free_gb <= 0.0 {
+        return Ok(());
+    }
+    let Some(free) = free_gb else {
+        return Ok(());
+    };
+    if free < min_free_gb {
+        anyhow::bail!(
+            "only {free:.2} GB free on the spool, below the {min_free_gb:.2} GB floor \
+             (node.min_free_gb). A capture that runs out of disk does not stop cleanly: it \
+             loses the session CLOSE, so the sidecar is never sealed, time_transfer.parquet is \
+             never written and csid-sync skips the directory forever. Reclaim space first — \
+             `systemctl start csid-prune` — or set capture.persist = false if this session's \
+             records only need to reach the live socket."
+        );
+    }
+    Ok(())
+}
+
 fn base_summary(counters: &Counters) -> SummaryMeta {
     let (records, bytes, _sent, dropped) = counters.snapshot();
     SummaryMeta {
@@ -1068,3 +1171,46 @@ fn apply_realtime_scheduling() {
 
 #[cfg(not(target_os = "linux"))]
 fn apply_realtime_scheduling() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard exists to turn "died at hour thirteen" into "refused at second
+    /// zero, with the number in the message".
+    #[test]
+    fn a_nearly_full_spool_refuses_a_persisting_session() {
+        let err = refuse_if_spool_is_low(Some(1.9), 5.0, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1.90 GB free"), "{err}");
+        assert!(err.contains("5.00 GB floor"), "{err}");
+        // It must say what to DO, not merely that it refused.
+        assert!(err.contains("csid-prune"), "{err}");
+    }
+
+    #[test]
+    fn a_roomy_spool_permits_it() {
+        refuse_if_spool_is_low(Some(28.1), 5.0, true).unwrap();
+    }
+
+    /// A stream-only session writes its sidecar and nothing else, so no amount
+    /// of disk pressure should stop csiscope getting a feed.
+    #[test]
+    fn a_stream_only_session_is_never_refused() {
+        refuse_if_spool_is_low(Some(0.0), 5.0, false).unwrap();
+    }
+
+    /// An UNMEASURABLE disk must permit. A missing reading is not evidence of a
+    /// full one, and refusing on it would make csid unusable wherever statvfs is
+    /// unavailable.
+    #[test]
+    fn an_unmeasurable_spool_permits_rather_than_blocks() {
+        refuse_if_spool_is_low(None, 5.0, true).unwrap();
+    }
+
+    #[test]
+    fn a_zero_floor_disables_the_check() {
+        refuse_if_spool_is_low(Some(0.0), 0.0, true).unwrap();
+    }
+}

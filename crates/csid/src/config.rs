@@ -68,6 +68,31 @@ pub struct NodeConfig {
     /// An empty path disables publication.
     #[serde(default = "default_status_path")]
     pub status_path: PathBuf,
+
+    /// Refuse to OPEN a persisting session with less than this much free space
+    /// on the spool filesystem, in gigabytes. `0` disables the check.
+    ///
+    /// The last line of defence, and the one that was missing on 2026-08-17. The
+    /// fleet started a 16 h capture on nodes holding between 843 MB and 5.2 GB
+    /// free. monad02 filled at hour 13: its durable writer failed, the OOM
+    /// killer took csid during teardown, and the session was never closed — so
+    /// the sidecar was never sealed, `time_transfer.parquet` was never written,
+    /// and `csid-sync` skipped the directory forever. Three hours of one of five
+    /// receivers, and the whole run's time transfer left with a single copy.
+    ///
+    /// Every part of that was predictable BEFORE the radio was tuned. A capture
+    /// that cannot fit should fail at second zero with a number in the message,
+    /// not at hour thirteen with an OOM. Refusing costs a re-run; the other way
+    /// costs the night.
+    ///
+    /// Not checked when `capture.persist = false` — such a session writes only
+    /// its sidecar and cannot fill anything.
+    #[serde(default = "default_min_free_gb")]
+    pub min_free_gb: f64,
+}
+
+fn default_min_free_gb() -> f64 {
+    5.0
 }
 
 fn default_status_path() -> PathBuf {
@@ -82,6 +107,7 @@ impl Default for NodeConfig {
             spool: PathBuf::from("/var/lib/csid"),
             hostname: None,
             status_path: default_status_path(),
+            min_free_gb: default_min_free_gb(),
         }
     }
 }
@@ -282,6 +308,47 @@ pub struct CaptureConfig {
     /// retune gap and no capture hole at a segment boundary.
     #[serde(default, with = "humantime_serde::option")]
     pub segment_duration: Option<Duration>,
+
+    /// Write `capture.raw` at all. Default `true`.
+    ///
+    /// ## What `false` is for
+    ///
+    /// csid's product is the RECORD STREAM. A session publishes every record to
+    /// the live socket, and what happens next is the consumer's business:
+    /// `csiscope` renders it, and a profile that is running an experiment stores
+    /// it. Persisting is therefore a CHOICE a profile makes, not a property of
+    /// capturing — and until 2026-08-18 there was no way to decline it.
+    ///
+    /// That gap is what filled the fleet's SD cards, and the culprit was not a
+    /// measurement. The `console` profile exists purely so csiscope always has a
+    /// feed to attach to: it declares no `duration`, so it runs for as long as
+    /// the node is up, and it wrote a `capture.raw` the whole time. On monad02 a
+    /// single console session started 2026-07-29 had reached **13.34 GB** by
+    /// 2026-08-18, on a 58 GB card, and the fleet was carrying four more. The
+    /// overnight measurement run then needed the space that a live-view utility
+    /// had quietly eaten, and both died.
+    ///
+    /// With `persist = false` there is no durable thread, no `capture.raw`, no
+    /// segments and no CSIQ export. The SIDECAR IS STILL WRITTEN: what ran, on
+    /// which channel, from when to when, and how many records it produced remain
+    /// a recorded fact, because "this node was watching ch44 all week" is worth
+    /// knowing even when the samples were not kept. The directory holds only
+    /// `metadata.json`, so `csid-sync` ships ~1 KB and `csid-prune` finds nothing
+    /// to reclaim.
+    ///
+    /// ## The cost, stated plainly
+    ///
+    /// A record dropped by the live path is GONE — there is no durable copy
+    /// behind it. That is correct for a liveness feed and wrong for a
+    /// measurement, which is why this defaults to `true` and why a session that
+    /// neither persists nor streams is rejected by [`ExperimentConfig::validate`]
+    /// rather than run as an expensive no-op.
+    #[serde(default = "default_persist")]
+    pub persist: bool,
+}
+
+fn default_persist() -> bool {
+    true
 }
 
 fn default_mode() -> String {
@@ -294,6 +361,7 @@ impl Default for CaptureConfig {
             mode: default_mode(),
             duration: None,
             segment_duration: None,
+            persist: default_persist(),
         }
     }
 }
@@ -759,6 +827,32 @@ impl ExperimentConfig {
         // segment just closed); a segment longer than the session never fires
         // and is almost certainly a units mistake — both are cheap to catch
         // here and expensive to discover at hour six of an unattended run.
+        // A session that neither keeps its records nor publishes them tunes a
+        // radio, burns a core and produces nothing. Cheap to catch here; on the
+        // node it looks exactly like a working capture.
+        if !self.capture.persist && !self.stream.enabled {
+            anyhow::bail!(
+                "capture.persist = false with stream.enabled = false: this session would \
+                 discard every record it captured. Enable the stream (so a consumer such as \
+                 csiscope receives them) or set capture.persist = true."
+            );
+        }
+        // Rotation is a property of the file being written, so it means nothing
+        // without one. Silently ignoring it would leave a profile that reads as
+        // if it were bounding disk while it wrote nothing at all.
+        if !self.capture.persist && self.capture.segment_duration.is_some() {
+            anyhow::bail!(
+                "capture.segment_duration is set with capture.persist = false: there is no \
+                 capture.raw to roll. Drop one of the two."
+            );
+        }
+        if !self.capture.persist && self.export.on_close {
+            anyhow::bail!(
+                "export.on_close = true with capture.persist = false: a CSIQ export reads \
+                 capture.raw, which this session does not write. Set export.on_close = false."
+            );
+        }
+
         if let Some(seg) = self.capture.segment_duration {
             if seg < Duration::from_secs(60) {
                 anyhow::bail!(
@@ -1114,6 +1208,68 @@ monad04 = "monad.local"
         cfg.capture.duration = duration.map(parse);
         cfg.capture.segment_duration = segment.map(parse);
         cfg
+    }
+
+    /// Persisting must stay the default. A profile that says nothing about
+    /// storage keeps its data — the opposite default would turn every existing
+    /// experiment profile into a stream-only session on upgrade.
+    #[test]
+    fn persist_defaults_to_true() {
+        let cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        assert!(cfg.capture.persist);
+        assert!(CaptureConfig::default().persist);
+    }
+
+    /// The live-view case this exists for: stream on, storage off.
+    #[test]
+    fn a_stream_only_session_is_valid() {
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.persist = false;
+        cfg.capture.segment_duration = None;
+        cfg.stream.enabled = true;
+        cfg.export.on_close = false;
+        cfg.validate().unwrap();
+    }
+
+    /// Neither kept nor published is a radio tuned for nothing, and on the node
+    /// it looks exactly like a working capture.
+    #[test]
+    fn a_session_that_neither_persists_nor_streams_is_rejected() {
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.persist = false;
+        cfg.capture.segment_duration = None;
+        cfg.stream.enabled = false;
+        cfg.export.on_close = false;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("discard every record"), "{err}");
+    }
+
+    /// Rotation and export both read a file this session does not write. Failing
+    /// loudly beats ignoring them, which would leave a profile that reads as if
+    /// it were bounding disk while writing nothing at all.
+    #[test]
+    fn stream_only_rejects_the_knobs_that_need_a_file() {
+        let base = || {
+            let mut c: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+            c.capture.persist = false;
+            c.capture.segment_duration = None;
+            c.stream.enabled = true;
+            c.export.on_close = false;
+            c
+        };
+
+        let mut with_segments = base();
+        with_segments.capture.segment_duration = Some(Duration::from_secs(1800));
+        let err = with_segments.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("no \ncapture.raw to roll") || err.contains("capture.raw to roll"),
+            "{err}"
+        );
+
+        let mut with_export = base();
+        with_export.export.on_close = true;
+        let err = with_export.validate().unwrap_err().to_string();
+        assert!(err.contains("CSIQ export"), "{err}");
     }
 
     #[test]
