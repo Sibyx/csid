@@ -829,15 +829,28 @@ fn finish_ble(
         host: host.to_string(),
         session_id: session_id.to_string(),
         adapter: cfg.ble.adapter.clone(),
+        lab_namespace_uuid: cfg
+            .ble
+            .lab_matcher()
+            .ok()
+            .flatten()
+            .map(|m| m.namespace().to_string()),
+        scan_interval_ms: cfg.ble.scan_interval_ms,
+        scan_window_ms: cfg.ble.scan_window_ms,
+        hash_bytes: cfg.ble.hash_bytes,
     };
     match crate::ble::export_parquet(&ndjson, &dir.join(crate::ble::PARQUET_NAME), &ctx) {
         Ok(stats) => {
             s.parquet_rows = stats.rows;
             s.distinct_device_hashes = stats.distinct_device_hashes;
             s.malformed_log_lines = stats.malformed_lines;
+            s.lab_frames = stats.lab_frames;
+            s.distinct_lab_participants = stats.distinct_lab_participants;
             tracing::info!(
                 rows = stats.rows,
                 devices = stats.distinct_device_hashes,
+                lab_frames = stats.lab_frames,
+                lab_participants = stats.distinct_lab_participants,
                 "exported {}",
                 crate::ble::PARQUET_NAME
             );

@@ -49,13 +49,39 @@
 //! the rotation-inflated one (`rpa_resolvable`, `rpa_non_resolvable`). The
 //! reader-side counter reports both.
 //!
+//! ## Lab identity frames (`ble-rssi/2`)
+//!
+//! The MonadCount app (and any lab emitter) advertises a single **128-bit
+//! service UUID** whose first twelve bytes are the deployment's namespace and
+//! whose last four carry a 16-bit participant key and a 16-bit session key.
+//! When `ble.lab_namespace_uuid` is configured, the scanner matches that prefix
+//! in the advertisement payload and the row carries `lab_uuid`,
+//! `lab_participant_key` and `lab_session_key`. This is the only payload
+//! inspection the scanner does, and it is match-or-forget:
+//!
+//! - **A matching frame is ours by construction** — the namespace is
+//!   lab-chosen, so storing its identity bytes identifies a consented session,
+//!   not a person, and the session sidecar on the phone side holds the mapping.
+//! - **A non-matching payload is dropped unparsed.** No service UUID, local
+//!   name, or manufacturer data of a bystander device is ever stored, so the
+//!   count-without-identify posture is unchanged: bystanders remain salted
+//!   pseudonyms exactly as in `ble-rssi/1`.
+//!
+//! Byte order, stated once because it is the classic bug: AD structures carry
+//! 128-bit UUIDs **little-endian**, so the matcher reverses each 16-byte chunk
+//! before comparing against the canonical (big-endian) namespace.
+//!
 //! ## Durability
 //!
 //! The scanner appends NDJSON to `ble_scan.jsonl` as it goes — crash-safe, the
 //! same reasoning that makes `capture.raw` the durable CSI artefact. At session
 //! close that log is streamed into `ble_rssi.parquet` (the contract artefact the
 //! analysis side consumes) in row groups; the log is kept, exactly as
-//! `capture.raw` is kept beside `capture.csiq`.
+//! `capture.raw` is kept beside `capture.csiq`. The parquet is
+//! **self-describing**: its footer key-value metadata carries the schema id,
+//! the scan parameters, the pseudonymisation scheme, the lab namespace and the
+//! identity-byte layout, so the file can be interpreted with nothing but the
+//! file.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -80,8 +106,14 @@ use crate::config::BleConfig;
 pub const NDJSON_NAME: &str = "ble_scan.jsonl";
 /// The contract artefact the analysis side consumes.
 pub const PARQUET_NAME: &str = "ble_rssi.parquet";
-/// Schema identifier, mirrored into the sidecar. Bump on any column change.
-pub const PARQUET_SCHEMA: &str = "ble-rssi/1";
+/// Schema identifier, mirrored into the sidecar and the parquet footer. Bump on
+/// any column change. `/2` adds the nullable lab-identity columns (`lab_uuid`,
+/// `lab_participant_key`, `lab_session_key`) and the self-describing footer.
+pub const PARQUET_SCHEMA: &str = "ble-rssi/2";
+/// How the last four bytes of a matched lab UUID are laid out. Written into the
+/// parquet footer so the file explains its own join keys.
+pub const LAB_UUID_LAYOUT: &str =
+    "bytes 0-11 namespace, 12-13 participant_key (big-endian u16), 14-15 session_key (big-endian u16)";
 /// Rows per parquet row group. Small enough that a long session never has to
 /// be held in memory, large enough that dictionary encoding still pays.
 const ROW_GROUP_ROWS: usize = 65_536;
@@ -202,15 +234,20 @@ impl PduType {
     }
 }
 
-/// One received advertisement, still carrying its address. Never leaves the
-/// parser: [`DeviceHasher::observe`] is the only consumer and it returns an
-/// [`Observation`], which has no address field to leak.
+/// One received advertisement, still carrying its address and raw payload.
+/// Never leaves the parser's caller: [`DeviceHasher::observe`] consumes the
+/// address into a pseudonym, [`LabMatcher::extract`] consumes the payload into
+/// a lab identity or nothing, and the resulting [`Observation`] has neither an
+/// address nor a payload field to leak.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawAdv {
     pub event_type: u8,
     pub addr_type: u8,
     pub addr: [u8; 6],
     pub rssi: i8,
+    /// The AD payload as received. Inspected only by [`LabMatcher::extract`];
+    /// never serialised.
+    pub data: Vec<u8>,
 }
 
 /// One row of the durable log — the address has already been replaced by its
@@ -225,6 +262,17 @@ pub struct Observation {
     pub pdu_type: PduType,
     /// `None` when the controller reported the "unavailable" sentinel.
     pub rssi_dbm: Option<i8>,
+    /// Canonical 128-bit service UUID of a matched lab identity frame
+    /// (`ble-rssi/2`). `None` for every non-lab advertisement — and for every
+    /// row of a `ble-rssi/1` log, which is why all three fields are
+    /// serde-defaulted: the segment cursor and the export must keep reading
+    /// logs written before this schema existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_participant_key: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_session_key: Option<u16>,
 }
 
 // -- hashing ------------------------------------------------------------------
@@ -296,16 +344,157 @@ impl DeviceHasher {
     }
 
     /// Pseudonymise one advertisement. The address is consumed here and never
-    /// travels further.
-    pub fn observe(&self, adv: &RawAdv, unix_ts_ns: u64) -> Observation {
+    /// travels further. Lab identity, when a matcher is configured and the
+    /// payload carries the namespace, rides on the same row.
+    pub fn observe(
+        &self,
+        adv: &RawAdv,
+        unix_ts_ns: u64,
+        matcher: Option<&LabMatcher>,
+    ) -> Observation {
+        let lab = matcher.and_then(|m| m.extract(&adv.data));
         Observation {
             unix_ts_ns,
             device_hash: self.hash(adv.addr_type, &adv.addr),
             addr_kind: AddrKind::classify(adv.addr_type, &adv.addr),
             pdu_type: PduType::from_event_type(adv.event_type),
             rssi_dbm: (adv.rssi != RSSI_UNAVAILABLE).then_some(adv.rssi),
+            lab_uuid: lab.as_ref().map(|f| f.uuid.clone()),
+            lab_participant_key: lab.as_ref().map(|f| f.participant_key),
+            lab_session_key: lab.map(|f| f.session_key),
         }
     }
+}
+
+// -- lab identity matching (portable, so it is testable off-Linux) ------------
+
+/// A matched lab identity frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabFrame {
+    /// Canonical (big-endian, dashed, lowercase) form of the advertised UUID.
+    pub uuid: String,
+    pub participant_key: u16,
+    pub session_key: u16,
+}
+
+/// Matches the lab identity frame in an advertisement payload.
+///
+/// The frame is a 128-bit service UUID: the first twelve bytes are the
+/// deployment namespace, the last four the participant and session keys (see
+/// [`LAB_UUID_LAYOUT`]). Three AD types can legitimately carry it — 0x06 and
+/// 0x07 (incomplete / complete list of 128-bit service UUIDs, the shape both
+/// mobile platforms emit) and 0x21 (128-bit service data, the shape a
+/// firmware emitter may prefer).
+///
+/// Everything that does not carry the namespace is ignored *unparsed* — this
+/// matcher is the privacy boundary for payloads, exactly as [`DeviceHasher`]
+/// is for addresses.
+#[derive(Debug, Clone)]
+pub struct LabMatcher {
+    prefix: [u8; 12],
+    namespace: String,
+}
+
+impl LabMatcher {
+    /// Build from the canonical namespace UUID. `Err` on a malformed string —
+    /// a misconfigured namespace must fail the setup loudly, because "matching
+    /// silently off" would look identical to "nobody broadcast".
+    pub fn from_namespace(namespace: &str) -> Result<Self> {
+        let hex: String = namespace
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_lowercase();
+        if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!("malformed ble.lab_namespace_uuid: {namespace:?}");
+        }
+        let mut prefix = [0u8; 12];
+        for (i, byte) in prefix.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("checked hex");
+        }
+        Ok(LabMatcher {
+            prefix,
+            namespace: canonical_uuid_from_hex(&hex),
+        })
+    }
+
+    /// The configured namespace in canonical form — sidecar / footer provenance.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Walk the AD structures and return the first lab frame, if any.
+    ///
+    /// Malformed structures (zero length, declared length past the buffer) end
+    /// the walk without panicking: radio payloads are attacker-adjacent input
+    /// and a bad byte must cost one match attempt, never the scanner.
+    pub fn extract(&self, data: &[u8]) -> Option<LabFrame> {
+        let mut i = 0usize;
+        while i < data.len() {
+            let ad_len = data[i] as usize; // length of type byte + payload
+            if ad_len == 0 || i + 1 + ad_len > data.len() {
+                return None;
+            }
+            let ad_type = data[i + 1];
+            let payload = &data[i + 2..i + 1 + ad_len];
+            match ad_type {
+                // Lists of 128-bit service UUIDs: consecutive 16-byte entries.
+                0x06 | 0x07 => {
+                    for chunk in payload.chunks_exact(16) {
+                        if let Some(frame) = self.match_uuid_le(chunk) {
+                            return Some(frame);
+                        }
+                    }
+                }
+                // 128-bit service data: the UUID is the first 16 bytes.
+                0x21 if payload.len() >= 16 => {
+                    if let Some(frame) = self.match_uuid_le(&payload[..16]) {
+                        return Some(frame);
+                    }
+                }
+                _ => {}
+            }
+            i += 1 + ad_len;
+        }
+        None
+    }
+
+    /// Match one 16-byte UUID as it appears **on air (little-endian)**.
+    fn match_uuid_le(&self, le: &[u8]) -> Option<LabFrame> {
+        debug_assert_eq!(le.len(), 16);
+        let mut be = [0u8; 16];
+        for (i, b) in le.iter().rev().enumerate() {
+            be[i] = *b;
+        }
+        if be[..12] != self.prefix {
+            return None;
+        }
+        Some(LabFrame {
+            uuid: canonical_uuid(&be),
+            participant_key: u16::from_be_bytes([be[12], be[13]]),
+            session_key: u16::from_be_bytes([be[14], be[15]]),
+        })
+    }
+}
+
+fn canonical_uuid(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    canonical_uuid_from_hex(&hex)
+}
+
+fn canonical_uuid_from_hex(hex: &str) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 // -- HCI event parsing (portable, so it is testable off-Linux) ----------------
@@ -393,6 +582,7 @@ pub fn parse_hci_event(buf: &[u8]) -> ParsedEvent {
             addr_type,
             addr,
             rssi: d[rssi_at] as i8,
+            data: d[off + REPORT_FIXED..rssi_at].to_vec(),
         });
         off = rssi_at + 1;
     }
@@ -495,6 +685,8 @@ pub struct BleCounters {
     pub unparsed_events: AtomicU64,
     /// Advertisements whose controller RSSI was the "unavailable" sentinel.
     pub rssi_unavailable: AtomicU64,
+    /// Advertisements that matched the lab identity namespace (`ble-rssi/2`).
+    pub lab_frames: AtomicU64,
     /// Longest observed gap between consecutive advertisements, milliseconds.
     pub max_gap_ms: AtomicU64,
     /// Gaps longer than `ble.gap_alert_s`.
@@ -594,14 +786,24 @@ impl ObservationLog {
 
 // -- parquet export -----------------------------------------------------------
 
-/// Session-constant columns. They are repeated on every row on purpose:
-/// dictionary encoding makes them nearly free, and it means a ten-node lab
-/// session concatenates into one dataframe with no bookkeeping.
+/// Session-constant columns plus the provenance written into the parquet
+/// footer. The columns are repeated on every row on purpose: dictionary
+/// encoding makes them nearly free, and it means a ten-node lab session
+/// concatenates into one dataframe with no bookkeeping. The footer is what
+/// makes the file self-describing — a reader with nothing but `ble_rssi.parquet`
+/// learns the schema id, the scan posture, the pseudonymisation scheme and the
+/// lab-identity layout without opening any sidecar.
 #[derive(Debug, Clone)]
 pub struct ParquetContext {
     pub host: String,
     pub session_id: String,
     pub adapter: String,
+    /// Canonical lab namespace when matching was configured; `None` = v1-style
+    /// scan with no identity matching.
+    pub lab_namespace_uuid: Option<String>,
+    pub scan_interval_ms: f64,
+    pub scan_window_ms: f64,
+    pub hash_bytes: usize,
 }
 
 /// What the export produced — folded into the sidecar summary.
@@ -611,6 +813,11 @@ pub struct ExportStats {
     pub distinct_device_hashes: u64,
     pub rssi_null: u64,
     pub malformed_lines: u64,
+    /// Rows carrying a matched lab identity frame.
+    pub lab_frames: u64,
+    /// Distinct `lab_participant_key` values seen — the number of consented
+    /// handsets this node heard, exact rather than address-bracketed.
+    pub distinct_lab_participants: u64,
 }
 
 /// The `ble_rssi.parquet` schema. **This is a contract** — the analysis side
@@ -642,10 +849,82 @@ fn parquet_schema() -> Result<Type> {
                 .with_repetition(Repetition::OPTIONAL)
                 .build()?,
         ),
+        // ble-rssi/2 — lab identity, null on every non-lab advertisement.
+        Arc::new(
+            Type::primitive_type_builder("lab_uuid", PhysicalType::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_logical_type(Some(LogicalType::String))
+                .build()?,
+        ),
+        Arc::new(
+            Type::primitive_type_builder("lab_participant_key", PhysicalType::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()?,
+        ),
+        Arc::new(
+            Type::primitive_type_builder("lab_session_key", PhysicalType::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()?,
+        ),
     ];
     Ok(Type::group_type_builder("ble_rssi")
         .with_fields(fields)
         .build()?)
+}
+
+/// The footer key-value metadata that makes `ble_rssi.parquet` self-describing.
+///
+/// Everything a reader needs to interpret the file with nothing but the file:
+/// the schema id, what stamped the clock, how `device_hash` was derived (and
+/// that the salt is gone), and how to decode a matched lab UUID. Keys are
+/// namespaced `csid.` so they survive concatenation with other tooling's
+/// metadata.
+fn footer_metadata(ctx: &ParquetContext) -> Vec<parquet::file::metadata::KeyValue> {
+    let kv =
+        |k: &str, v: String| parquet::file::metadata::KeyValue::new(format!("csid.{k}"), Some(v));
+    let mut meta = vec![
+        kv("schema", PARQUET_SCHEMA.to_string()),
+        kv("artefact", PARQUET_NAME.to_string()),
+        kv("durable_log", NDJSON_NAME.to_string()),
+        kv("host", ctx.host.clone()),
+        kv("session_id", ctx.session_id.clone()),
+        kv("adapter", ctx.adapter.clone()),
+        kv("scan_type", "passive".to_string()),
+        kv("scan_interval_ms", format!("{}", ctx.scan_interval_ms)),
+        kv("scan_window_ms", format!("{}", ctx.scan_window_ms)),
+        kv(
+            "clock",
+            "unix_ts_ns = host wallclock (ns), same call site as the CSI stream's t_ns".to_string(),
+        ),
+        kv(
+            "hash_algorithm",
+            "sha256(salt || addr_type || addr)[:hash_bytes], hex".to_string(),
+        ),
+        kv("hash_bytes", format!("{}", ctx.hash_bytes)),
+        kv("salt_persisted", "false".to_string()),
+        kv(
+            "pseudonym_scope",
+            "per-session; unlinkable across sessions by construction".to_string(),
+        ),
+        kv(
+            "rssi_null_means",
+            "controller reported the RSSI-unavailable sentinel (127)".to_string(),
+        ),
+        kv("writer", format!("csid {}", env!("CARGO_PKG_VERSION"))),
+        kv("created_unix_ns", format!("{}", crate::util::now_unix_ns())),
+    ];
+    match &ctx.lab_namespace_uuid {
+        Some(ns) => {
+            meta.push(kv("lab_namespace_uuid", ns.clone()));
+            meta.push(kv("lab_uuid_layout", LAB_UUID_LAYOUT.to_string()));
+            meta.push(kv(
+                "lab_match_ad_types",
+                "0x06, 0x07 (128-bit service UUID lists), 0x21 (128-bit service data)".to_string(),
+            ));
+        }
+        None => meta.push(kv("lab_namespace_uuid", String::new())),
+    }
+    meta
 }
 
 /// Stream `ble_scan.jsonl` into `ble_rssi.parquet`.
@@ -662,6 +941,7 @@ pub fn export_parquet(ndjson: &Path, out: &Path, ctx: &ParquetContext) -> Result
     let props = Arc::new(
         WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_key_value_metadata(Some(footer_metadata(ctx)))
             .build(),
     );
     let sink = File::create(out).with_context(|| format!("creating {}", out.display()))?;
@@ -670,6 +950,7 @@ pub fn export_parquet(ndjson: &Path, out: &Path, ctx: &ParquetContext) -> Result
 
     let mut stats = ExportStats::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut lab_participants: std::collections::HashSet<u16> = std::collections::HashSet::new();
     let mut batch: Vec<Observation> = Vec::with_capacity(ROW_GROUP_ROWS);
 
     for line in reader.lines() {
@@ -682,6 +963,10 @@ pub fn export_parquet(ndjson: &Path, out: &Path, ctx: &ParquetContext) -> Result
                 seen.insert(obs.device_hash.clone());
                 if obs.rssi_dbm.is_none() {
                     stats.rssi_null += 1;
+                }
+                if let Some(key) = obs.lab_participant_key {
+                    stats.lab_frames += 1;
+                    lab_participants.insert(key);
                 }
                 batch.push(obs);
             }
@@ -697,6 +982,7 @@ pub fn export_parquet(ndjson: &Path, out: &Path, ctx: &ParquetContext) -> Result
     }
     writer.close().context("closing ble_rssi.parquet")?;
     stats.distinct_device_hashes = seen.len() as u64;
+    stats.distinct_lab_participants = lab_participants.len() as u64;
     Ok(stats)
 }
 
@@ -758,6 +1044,36 @@ fn write_row_group<W: std::io::Write + Send>(
     col.typed::<Int32Type>()
         .write_batch(&vals, Some(&def), None)?;
     col.close()?;
+
+    // ble-rssi/2 lab identity columns, all OPTIONAL with the same encoding as
+    // rssi_dbm: definition level 1 = present, 0 = null.
+    let mut col = rg.next_column()?.context("column lab_uuid missing")?;
+    let def: Vec<i16> = batch
+        .iter()
+        .map(|o| if o.lab_uuid.is_some() { 1 } else { 0 })
+        .collect();
+    let vals: Vec<ByteArray> = batch
+        .iter()
+        .filter_map(|o| o.lab_uuid.as_deref().map(ByteArray::from))
+        .collect();
+    col.typed::<ByteArrayType>()
+        .write_batch(&vals, Some(&def), None)?;
+    col.close()?;
+
+    for key in [
+        |o: &Observation| o.lab_participant_key,
+        |o: &Observation| o.lab_session_key,
+    ] {
+        let mut col = rg.next_column()?.context("lab key column missing")?;
+        let def: Vec<i16> = batch
+            .iter()
+            .map(|o| if key(o).is_some() { 1 } else { 0 })
+            .collect();
+        let vals: Vec<i32> = batch.iter().filter_map(|o| key(o).map(i32::from)).collect();
+        col.typed::<Int32Type>()
+            .write_batch(&vals, Some(&def), None)?;
+        col.close()?;
+    }
 
     rg.close()?;
     Ok(batch.len())
@@ -839,7 +1155,8 @@ mod tests {
                 event_type: 0x00,
                 addr_type: 0x01,
                 addr,
-                rssi: -63
+                rssi: -63,
+                data: vec![0x02, 0x01, 0x06],
             }]
         );
     }
@@ -1010,10 +1327,11 @@ mod tests {
             addr_type: 1,
             addr: [1, 2, 3, 4, 5, 6],
             rssi: 127,
+            data: vec![],
         };
-        assert_eq!(h.observe(&adv, 42).rssi_dbm, None);
+        assert_eq!(h.observe(&adv, 42, None).rssi_dbm, None);
         let ok = RawAdv { rssi: -70, ..adv };
-        assert_eq!(h.observe(&ok, 42).rssi_dbm, Some(-70));
+        assert_eq!(h.observe(&ok, 42, None).rssi_dbm, Some(-70));
     }
 
     #[test]
@@ -1031,11 +1349,121 @@ mod tests {
         assert_eq!(c.silence_ns(t0 + 10_000_000_000), Some(1_000_000_000));
     }
 
+    /// The canonical test namespace and its on-air (little-endian) rendering.
+    const NAMESPACE: &str = "6d6f6e61-6461-4076-b100-000000000000";
+
+    /// AD payload carrying the lab frame for `participant_key`/`session_key`,
+    /// preceded by a Flags structure, exactly as a phone emits it.
+    fn lab_adv_data(participant_key: u16, session_key: u16, ad_type: u8) -> Vec<u8> {
+        let mut be = [
+            0x6d, 0x6f, 0x6e, 0x61, 0x64, 0x61, 0x40, 0x76, 0xb1, 0x00, 0x00, 0x00, 0, 0, 0, 0,
+        ];
+        be[12..14].copy_from_slice(&participant_key.to_be_bytes());
+        be[14..16].copy_from_slice(&session_key.to_be_bytes());
+        let mut data = vec![0x02, 0x01, 0x06]; // Flags AD first
+        data.push(17); // length = type byte + 16
+        data.push(ad_type);
+        data.extend(be.iter().rev()); // ON AIR: little-endian
+        data
+    }
+
+    fn test_ctx() -> ParquetContext {
+        ParquetContext {
+            host: "monad02".into(),
+            session_id: "monad02_lab_20260808-100000".into(),
+            adapter: "hci0".into(),
+            lab_namespace_uuid: Some(NAMESPACE.to_string()),
+            scan_interval_ms: 100.0,
+            scan_window_ms: 100.0,
+            hash_bytes: 8,
+        }
+    }
+
+    #[test]
+    fn lab_matcher_reads_the_frame_off_the_air_byte_order() {
+        let m = LabMatcher::from_namespace(NAMESPACE).unwrap();
+        for ad_type in [0x06u8, 0x07, 0x21] {
+            let frame = m
+                .extract(&lab_adv_data(0xABCD, 0x1234, ad_type))
+                .unwrap_or_else(|| panic!("AD type {ad_type:#x} must match"));
+            assert_eq!(frame.participant_key, 0xABCD);
+            assert_eq!(frame.session_key, 0x1234);
+            assert_eq!(frame.uuid, "6d6f6e61-6461-4076-b100-0000abcd1234");
+        }
+    }
+
+    #[test]
+    fn lab_matcher_ignores_foreign_and_malformed_payloads() {
+        let m = LabMatcher::from_namespace(NAMESPACE).unwrap();
+        // A different namespace: same shape, different prefix.
+        let mut foreign = lab_adv_data(1, 2, 0x07);
+        *foreign.last_mut().unwrap() ^= 0xFF; // MSB on air = first namespace byte
+        assert_eq!(m.extract(&foreign), None);
+        // Manufacturer data (an iBeacon, a Continuity frame) is never inspected.
+        let ibeacon = [0x1A, 0xFF, 0x4C, 0x00, 0x02, 0x15, 1, 2, 3];
+        assert_eq!(m.extract(&ibeacon), None);
+        // Malformed: zero-length AD, and a declared length past the buffer.
+        assert_eq!(m.extract(&[0x00, 0x07]), None);
+        assert_eq!(m.extract(&[0x20, 0x07, 0x01]), None);
+        assert_eq!(m.extract(&[]), None);
+        // A 16-byte UUID split short (list truncated mid-entry) must not match.
+        let mut short = lab_adv_data(1, 2, 0x07);
+        short.truncate(short.len() - 1);
+        short[3] = 16; // re-declare the shorter length so the walk stays valid
+        assert_eq!(m.extract(&short), None);
+    }
+
+    #[test]
+    fn lab_matcher_refuses_a_malformed_namespace() {
+        assert!(LabMatcher::from_namespace("").is_err());
+        assert!(LabMatcher::from_namespace("not-a-uuid").is_err());
+        assert!(LabMatcher::from_namespace("6d6f6e61-6461-4076-b100-00000000000g").is_err());
+        assert!(LabMatcher::from_namespace(NAMESPACE).is_ok());
+    }
+
+    #[test]
+    fn observe_carries_lab_identity_only_for_matching_frames() {
+        let h = DeviceHasher::with_salt([0u8; 32], 8);
+        let m = LabMatcher::from_namespace(NAMESPACE).unwrap();
+        let lab = RawAdv {
+            event_type: 0x03,
+            addr_type: 0x01,
+            addr: [1, 2, 3, 4, 5, 0x40],
+            rssi: -55,
+            data: lab_adv_data(7, 9, 0x07),
+        };
+        let obs = h.observe(&lab, 42, Some(&m));
+        assert_eq!(obs.lab_participant_key, Some(7));
+        assert_eq!(obs.lab_session_key, Some(9));
+        assert!(obs.lab_uuid.as_deref().unwrap().starts_with("6d6f6e61-"));
+
+        let ambient = RawAdv {
+            data: vec![0x02, 0x01, 0x06],
+            ..lab
+        };
+        let obs = h.observe(&ambient, 42, Some(&m));
+        assert_eq!(obs.lab_uuid, None);
+        assert_eq!(obs.lab_participant_key, None);
+    }
+
+    #[test]
+    fn v1_log_lines_still_parse() {
+        // A line written by ble-rssi/1, verbatim shape: no lab fields at all.
+        let line = "{\"unix_ts_ns\":1786959444439374442,\"device_hash\":\"a1b2c3d4e5f60708\",\
+                    \"addr_kind\":\"rpa_resolvable\",\"pdu_type\":\"adv_ind\",\"rssi_dbm\":-63}";
+        let obs: Observation = serde_json::from_str(line).unwrap();
+        assert_eq!(obs.rssi_dbm, Some(-63));
+        assert_eq!(obs.lab_uuid, None);
+        assert_eq!(obs.lab_participant_key, None);
+        assert_eq!(obs.lab_session_key, None);
+    }
+
     #[test]
     fn parquet_roundtrips_through_the_log() {
         let dir = std::env::temp_dir().join(format!("csid-ble-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let hasher = DeviceHasher::with_salt([3u8; 32], 8);
+        let matcher = LabMatcher::from_namespace(NAMESPACE).unwrap();
 
         let mut log = ObservationLog::create(&dir, 1).unwrap();
         let t0 = 1_800_000_000_000_000_000u64;
@@ -1045,43 +1473,57 @@ mod tests {
                 addr_type: 0x01,
                 addr: [1, 2, 3, 4, 5, 0x40 | (i as u8 & 1)],
                 rssi: if i == 3 { 127 } else { -60 - i as i8 },
+                // Rows 0 and 2 are the lab handset; the rest are ambient.
+                data: if i % 2 == 0 && i < 4 {
+                    lab_adv_data(0x0007, 0x0009, 0x07)
+                } else {
+                    vec![0x02, 0x01, 0x06]
+                },
             };
-            log.append(&hasher.observe(&adv, t0 + i * 100_000_000))
+            log.append(&hasher.observe(&adv, t0 + i * 100_000_000, Some(&matcher)))
                 .unwrap();
         }
         let ndjson = log.finish().unwrap();
 
         let out = dir.join(PARQUET_NAME);
-        let stats = export_parquet(
-            &ndjson,
-            &out,
-            &ParquetContext {
-                host: "monad02".into(),
-                session_id: "monad02_lab_20260808-100000".into(),
-                adapter: "hci0".into(),
-            },
-        )
-        .unwrap();
+        let stats = export_parquet(&ndjson, &out, &test_ctx()).unwrap();
         assert_eq!(stats.rows, 5);
         assert_eq!(stats.distinct_device_hashes, 2);
         assert_eq!(stats.rssi_null, 1);
         assert_eq!(stats.malformed_lines, 0);
+        assert_eq!(stats.lab_frames, 2);
+        assert_eq!(stats.distinct_lab_participants, 1);
         assert!(out.metadata().unwrap().len() > 0);
+
+        // Self-description: the footer alone must identify the file.
+        use parquet::file::reader::FileReader;
+        let reader =
+            parquet::file::reader::SerializedFileReader::new(File::open(&out).unwrap()).unwrap();
+        let file_meta = reader.metadata().file_metadata().clone();
+        assert_eq!(
+            file_meta.schema_descr().num_columns(),
+            11,
+            "ble-rssi/2 is eleven columns"
+        );
+        let kvs = file_meta.key_value_metadata().expect("footer metadata");
+        let get = |key: &str| {
+            kvs.iter()
+                .find(|kv| kv.key == format!("csid.{key}"))
+                .and_then(|kv| kv.value.clone())
+                .unwrap_or_else(|| panic!("footer key csid.{key} missing"))
+        };
+        assert_eq!(get("schema"), PARQUET_SCHEMA);
+        assert_eq!(get("host"), "monad02");
+        assert_eq!(get("session_id"), "monad02_lab_20260808-100000");
+        assert_eq!(get("lab_namespace_uuid"), NAMESPACE);
+        assert_eq!(get("salt_persisted"), "false");
+        assert_eq!(get("lab_uuid_layout"), LAB_UUID_LAYOUT);
 
         // A truncated trailing line (power cut) costs that line, nothing more.
         let mut text = std::fs::read_to_string(&ndjson).unwrap();
         text.push_str("{\"unix_ts_ns\":1,\"devi");
         std::fs::write(&ndjson, text).unwrap();
-        let stats = export_parquet(
-            &ndjson,
-            &out,
-            &ParquetContext {
-                host: "monad02".into(),
-                session_id: "s".into(),
-                adapter: "hci0".into(),
-            },
-        )
-        .unwrap();
+        let stats = export_parquet(&ndjson, &out, &test_ctx()).unwrap();
         assert_eq!(stats.rows, 5);
         assert_eq!(stats.malformed_lines, 1);
 

@@ -501,6 +501,15 @@ pub struct BleConfig {
     /// Flush the durable log every N observations (also flushed on a timer).
     #[serde(default = "default_ble_flush_every")]
     pub flush_every: usize,
+    /// Namespace of the lab identity frame (`ble-rssi/2`): the canonical
+    /// 128-bit UUID whose **first twelve bytes** mark an advertised service
+    /// UUID as ours; the last four bytes of a matched frame carry the
+    /// participant and session keys. Empty (the default) disables matching and
+    /// the scanner behaves exactly as `ble-rssi/1` — no payload is inspected.
+    /// A malformed value fails the scanner setup loudly, because matching that
+    /// is silently off is indistinguishable from a room where nobody broadcast.
+    #[serde(default)]
+    pub lab_namespace_uuid: String,
 }
 
 fn default_ble_adapter() -> String {
@@ -541,7 +550,19 @@ impl Default for BleConfig {
             backoff_s: default_ble_backoff_s(),
             gap_alert_s: default_ble_gap_alert_s(),
             flush_every: default_ble_flush_every(),
+            lab_namespace_uuid: String::new(),
         }
+    }
+}
+
+impl BleConfig {
+    /// The lab matcher this config asks for: `None` when matching is not
+    /// configured, `Err` when the namespace is malformed.
+    pub fn lab_matcher(&self) -> anyhow::Result<Option<crate::ble::LabMatcher>> {
+        if self.lab_namespace_uuid.trim().is_empty() {
+            return Ok(None);
+        }
+        crate::ble::LabMatcher::from_namespace(self.lab_namespace_uuid.trim()).map(Some)
     }
 }
 

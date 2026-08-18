@@ -487,6 +487,9 @@ mod linux {
         counters: Arc<BleCounters>,
     ) -> Result<BleHandle> {
         // Fail fast, on the caller's thread, so `ble.required` can act on it.
+        // The lab matcher is part of that: a malformed namespace is a setup
+        // error, never a silent v1 scan.
+        let matcher = cfg.lab_matcher()?;
         let scanner = Scanner::open(cfg)?;
         let hasher = DeviceHasher::new_random(cfg.hash_bytes)?;
         let log = ObservationLog::create(dir, cfg.flush_every)?;
@@ -495,7 +498,7 @@ mod linux {
 
         let thread: JoinHandle<()> = std::thread::Builder::new()
             .name("csid-ble".into())
-            .spawn(move || run_loop(scanner, log, hasher, &cfg, stop, counters))
+            .spawn(move || run_loop(scanner, log, hasher, matcher, &cfg, stop, counters))
             .context("spawning the BLE scan thread")?;
         Ok(BleHandle::new(thread, ndjson))
     }
@@ -504,6 +507,7 @@ mod linux {
         first: Scanner,
         mut log: ObservationLog,
         hasher: DeviceHasher,
+        matcher: Option<crate::ble::LabMatcher>,
         cfg: &BleConfig,
         stop: Arc<AtomicBool>,
         counters: Arc<BleCounters>,
@@ -552,9 +556,12 @@ mod linux {
                             counters.unparsed_events.fetch_add(1, Ordering::Relaxed);
                         }
                         for adv in &parsed.advs {
-                            let obs = hasher.observe(adv, unix_ts_ns);
+                            let obs = hasher.observe(adv, unix_ts_ns, matcher.as_ref());
                             if obs.rssi_dbm.is_none() {
                                 counters.rssi_unavailable.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if obs.lab_uuid.is_some() {
+                                counters.lab_frames.fetch_add(1, Ordering::Relaxed);
                             }
                             counters.note_observation(unix_ts_ns, cfg.gap_alert_s);
                             if let Err(e) = log.append(&obs) {

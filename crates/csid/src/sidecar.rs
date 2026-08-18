@@ -153,6 +153,11 @@ pub struct BleMeta {
     pub hash_bytes: usize,
     pub salt_bits: usize,
     pub salt_persisted: bool,
+    /// Lab identity namespace (`ble-rssi/2`), canonical form. `None` = matching
+    /// was not configured, so `lab_*` columns are structurally all-null rather
+    /// than "nobody broadcast" — a reader must distinguish those two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_namespace_uuid: Option<String>,
 }
 
 /// BLE co-capture outcome. Every field exists so that a *silently* degraded
@@ -179,6 +184,15 @@ pub struct BleSummary {
     pub rssi_unavailable: u64,
     pub parquet_rows: u64,
     pub malformed_log_lines: u64,
+    /// Advertisements matching the lab identity namespace (`ble-rssi/2`).
+    /// Zero with a configured namespace means no consented handset was heard,
+    /// which for a quest session is a finding, not a formality.
+    #[serde(default)]
+    pub lab_frames: u64,
+    /// Distinct `lab_participant_key` values — exact consented-handset count,
+    /// immune to the address-rotation bracket above.
+    #[serde(default)]
+    pub distinct_lab_participants: u64,
 }
 
 /// Time-transfer configuration as applied — the provenance a reader needs to
@@ -340,6 +354,15 @@ impl Sidecar {
             hash_bytes: cfg.ble.hash_bytes,
             salt_bits: 256,
             salt_persisted: false,
+            // Canonicalised through the matcher so the sidecar and the parquet
+            // footer carry the identical string; a malformed namespace already
+            // failed the scanner setup before a sidecar existed.
+            lab_namespace_uuid: cfg
+                .ble
+                .lab_matcher()
+                .ok()
+                .flatten()
+                .map(|m| m.namespace().to_string()),
         });
 
         let timesync = cfg.timesync.enabled.then(|| TimesyncMeta {

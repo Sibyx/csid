@@ -302,7 +302,9 @@ impl BleCursor {
         let mut observations: u64 = 0;
         let mut malformed: u64 = 0;
         let mut rssi_unavailable: u64 = 0;
+        let mut lab_frames: u64 = 0;
         let mut hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lab_participants: std::collections::HashSet<u16> = std::collections::HashSet::new();
         let mut first_seen: u64 = 0;
         let mut last_seen: u64 = 0;
         let mut max_gap_ms: u64 = 0;
@@ -338,6 +340,10 @@ impl BleCursor {
                     if obs.rssi_dbm.is_none() {
                         rssi_unavailable += 1;
                     }
+                    if let Some(key) = obs.lab_participant_key {
+                        lab_frames += 1;
+                        lab_participants.insert(key);
+                    }
                     if first_seen == 0 {
                         first_seen = obs.unix_ts_ns;
                     }
@@ -371,6 +377,8 @@ impl BleCursor {
             max_gap_s: max_gap_ms as f64 / 1000.0,
             rssi_unavailable,
             malformed_log_lines: malformed,
+            lab_frames,
+            distinct_lab_participants: lab_participants.len() as u64,
             // Cumulative counters (restarts, adapter errors, unparsed events)
             // and the parquet row count are session-scoped and land at close;
             // a per-segment value for them would be a fabrication.
