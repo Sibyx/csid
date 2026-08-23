@@ -71,6 +71,18 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_EXPERIMENT_DIR)]
     experiments: PathBuf,
 
+    /// Accepted and ignored.
+    ///
+    /// The console has no write surface at all any more — see
+    /// [`csiscope::server`] — so there is nothing for this to switch off. It
+    /// stays accepted because the fleet's deployed unit files pass it, and a
+    /// binary that rejects its own unit's arguments turns a routine upgrade
+    /// into every node's console failing to start at once. Ansible removes the
+    /// flag on its next configuration pass; this outlives that by one release
+    /// and then goes.
+    #[arg(long, hide = true)]
+    read_only: bool,
+
     /// The `csid` binary used for `doctor`.
     #[arg(long, default_value = "csid")]
     csid_bin: String,
@@ -122,6 +134,12 @@ fn run(cli: Cli) -> Result<()> {
         status,
     );
     ingest::spawn(source, hub.clone())?;
+
+    if cli.read_only {
+        tracing::info!(
+            "--read-only is accepted and ignored: the console has no write surface"
+        );
+    }
 
     if !cli.bind.ip().is_loopback() {
         // Still worth saying. The console cannot change anything any more, but
