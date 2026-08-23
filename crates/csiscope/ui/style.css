@@ -293,3 +293,56 @@ body.present .panel .sub { font-size: 11px; }
 body.present .tile .v { font-size: 16px; }
 body.present .tile { min-width: 104px; }
 body.present #topbar { min-height: 54px; }
+
+/* -- the Help tab ---------------------------------------------------------
+ *
+ * Prose, so it obeys prose rules: a measure of about 70 characters, room
+ * between paragraphs, and headings that are hierarchy rather than decoration.
+ * The rest of this console is an instrument panel and is laid out as one; this
+ * page is the only thing here anybody reads a sentence of.
+ */
+.prose {
+  max-width: 72ch;
+  margin: 0;
+  padding: 4px 0 60px;
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--ink);
+}
+.prose h2 {
+  margin: 34px 0 10px;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.prose h2:first-child { margin-top: 0; }
+.prose h3 {
+  margin: 22px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.prose p { margin: 0 0 12px; }
+.prose b { color: var(--ink); font-weight: 600; }
+.prose code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--muted);
+}
+
+/* A definition list is the right shape for "panel -> what it shows", and it
+ * keeps the panel name scannable while the explanation stays prose. */
+.glossary { margin: 0; }
+.glossary dt {
+  margin: 16px 0 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+.glossary dd {
+  margin: 0 0 0 18px;
+  color: var(--ink-dim);
+}
+.glossary dd p { margin: 8px 0 0; }
+.glossary dd b { color: var(--ink); }

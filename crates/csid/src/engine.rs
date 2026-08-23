@@ -161,6 +161,7 @@ pub fn run_session(
         center_freq_mhz: tuning.center,
         interval_us: cfg.radio.interval_us,
         records: 0,
+        empty_records: 0,
         frames_seen: 0,
         rate_hz: 0.0,
         capture_bytes: 0,
@@ -500,6 +501,15 @@ pub fn run_session(
                         // status document, the heartbeat log, and the summary of
                         // a session that has no file to count.
                         rx_counters.records.fetch_add(1, Ordering::Relaxed);
+                        // And, of those, how many carried nothing. A frame the
+                        // driver delivered with an all-zero I/Q matrix is a
+                        // record by every count the daemon keeps and a
+                        // measurement by none of them. Counted on the raw bytes
+                        // so the check short-circuits and no parse is needed;
+                        // see `sinks::payload_is_empty`.
+                        if crate::sinks::payload_is_empty(&msg.csi) {
+                            rx_counters.empty_records.fetch_add(1, Ordering::Relaxed);
+                        }
                         // Durable first, and it must never be skipped — when
                         // there is one.
                         if let Some(tx) = &durable_tx {
@@ -573,6 +583,7 @@ pub fn run_session(
                 let window = last_status.elapsed().as_secs_f64();
                 let (records, bytes, sent, dropped) = counters.snapshot();
                 status_snap.records = records;
+                status_snap.empty_records = counters.empty();
                 // `frames_seen` is the time-transfer receiver's count of frames
                 // the radio delivered, CSI-bearing or not. Without it there is
                 // no denominator, and a session with `timesync.enabled = false`
@@ -776,6 +787,7 @@ pub fn run_session(
         session_id,
         ?status,
         records = summary.records,
+        empty_records = summary.empty_records,
         bytes = summary.capture_bytes,
         "session closed"
     );
@@ -1078,6 +1090,7 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
     SummaryMeta {
         capture_bytes: bytes,
         records,
+        empty_records: counters.empty(),
         mean_rate_hz: 0.0,
         live_dropped: dropped,
         tone_counts: Vec::new(),
@@ -1118,6 +1131,7 @@ fn summarize(
 
     let mut tones: Vec<u16> = Vec::new();
     let mut count: u64 = 0;
+    let mut empty: u64 = 0;
     let mut first_ftm: Option<u32> = None;
     let mut unwrapper = csiq::FtmUnwrapper::new();
     let mut last_unwrapped: u64 = 0;
@@ -1132,6 +1146,12 @@ fn summarize(
 
         while let Ok(Some(rec)) = rr.next_record() {
             count += 1;
+            // Recounted from the file rather than trusted from the RX counter,
+            // for the same reason `records` is: the raw stream is the artefact
+            // an analysis will actually read.
+            if rec.iq.is_empty() || rec.iq.iter().all(|&v| v == 0) {
+                empty += 1;
+            }
             if !tones.contains(&rec.ntone) {
                 tones.push(rec.ntone);
             }
@@ -1152,6 +1172,7 @@ fn summarize(
     ticks.seal();
     tones.sort_unstable();
     summary.records = count;
+    summary.empty_records = empty;
     summary.tone_counts = tones;
 
     if let Some(first) = first_ftm {

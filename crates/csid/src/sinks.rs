@@ -35,6 +35,26 @@ pub struct Counters {
     /// is recounted from `capture.raw` by `engine::summarize`, so moving this
     /// changed no archived number.
     pub records: AtomicU64,
+    /// Records whose entire I/Q payload is zero.
+    ///
+    /// A subset of `records`, not a separate population: the driver delivered a
+    /// frame, the header is intact, the declared dimensions match the payload
+    /// length — and every coefficient in it is `(0, 0)`. It is a record that
+    /// carries no channel estimate.
+    ///
+    /// Counted because nothing else could see it. Measured 2026-08-23 on four
+    /// nodes of the fleet simultaneously, 15.2–16.0% of delivered records were
+    /// in this state, interleaved as isolated singletons among good ones, each
+    /// carrying the node's strongest RSSI. The capture yield
+    /// (`records / frames_seen`) read 97–99% throughout, because a record that
+    /// carries nothing still counts as a record. Without this counter the loss
+    /// is invisible in the status document, in the sidecar, and in every
+    /// downstream reduction that trusts `records`.
+    ///
+    /// The test is on the raw bytes, before any parse: an i16 I/Q pair is zero
+    /// exactly when both its bytes are, so the scan short-circuits on the first
+    /// non-zero byte and costs a good record almost nothing.
+    pub empty_records: AtomicU64,
     /// Bytes durably written. Zero when `capture.persist = false`.
     pub bytes: AtomicU64,
     /// Records dropped on the live path (bounded queue full).
@@ -53,6 +73,20 @@ impl Counters {
             self.live_dropped.load(Ordering::Relaxed),
         )
     }
+
+    /// Records delivered with an all-zero payload, so far this session.
+    pub fn empty(&self) -> u64 {
+        self.empty_records.load(Ordering::Relaxed)
+    }
+}
+
+/// Does this raw CSI payload carry any channel estimate at all?
+///
+/// `false` for an empty payload and for one whose every byte is zero. The
+/// caller counts the `false` cases; see [`Counters::empty_records`].
+#[inline]
+pub fn payload_is_empty(csi: &[u8]) -> bool {
+    csi.is_empty() || csi.iter().all(|&b| b == 0)
 }
 
 /// Lossless writer of the driver-native raw stream.
@@ -253,6 +287,39 @@ impl LiveSink {
 mod tests {
     use super::*;
     use crate::source::RawCsiMessage;
+
+    /// The empty-payload test runs on raw bytes, before any parse, so it has to
+    /// agree with what the parser would have produced.
+    #[test]
+    fn an_all_zero_payload_is_the_only_empty_one() {
+        assert!(payload_is_empty(&[]));
+        assert!(payload_is_empty(&[0u8; 208]));
+
+        // One bit anywhere is a measurement, however weak: |H| = 1 is a real
+        // reading of a very small coefficient, and 15% of a fleet's records
+        // reading exactly zero is not.
+        let mut one_lsb = [0u8; 208];
+        one_lsb[207] = 1;
+        assert!(!payload_is_empty(&one_lsb));
+
+        let mut first_byte = [0u8; 208];
+        first_byte[0] = 1;
+        assert!(!payload_is_empty(&first_byte));
+    }
+
+    #[test]
+    fn the_empty_counter_is_a_subset_of_the_record_counter() {
+        let c = Counters::default();
+        for csi in [vec![0u8; 8], vec![1u8, 0, 0, 0, 0, 0, 0, 0], vec![0u8; 8]] {
+            c.records.fetch_add(1, Ordering::Relaxed);
+            if payload_is_empty(&csi) {
+                c.empty_records.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (records, ..) = c.snapshot();
+        assert_eq!(records, 3);
+        assert_eq!(c.empty(), 2);
+    }
 
     #[test]
     fn durable_framing_is_readable_by_csiq_raw() {

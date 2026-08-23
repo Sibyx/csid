@@ -14,15 +14,15 @@
 
   <nav class="tabs" id="tabs">
     <button data-tab="scope" class="on">Scope</button>
-    <button data-tab="config">Config</button>
-    <button data-tab="sessions">Sessions</button>
+    <button data-tab="help">Help</button>
     <button data-tab="node">Node</button>
   </nav>
 
   <div class="strip" id="strip">
-    <div class="tile" id="tile-yield" title="records / frames_seen — an empty census is not evidence of a quiet channel"><span class="k">yield</span><span class="v" id="t-yield">—</span></div>
+    <div class="tile" id="tile-yield" title="records that carried a channel estimate, over frames the radio delivered — an empty census is not evidence of a quiet channel"><span class="k">yield</span><span class="v" id="t-yield">—</span></div>
+    <div class="tile" id="tile-empty" title="share of this window's records that arrived with an all-zero I/Q matrix — delivered, but not a measurement"><span class="k">empty</span><span class="v" id="t-empty">—</span></div>
     <div class="tile"><span class="k">rate</span><span class="v" id="t-rate">—</span></div>
-    <div class="tile" id="tile-deficit" title="delivered vs commanded rate for the scoped transmitter"><span class="k">deficit</span><span class="v" id="t-deficit">—</span></div>
+    <div class="tile" id="tile-deficit" title="delivered against commanded rate — blank unless a rate was actually commanded"><span class="k">deficit</span><span class="v" id="t-deficit">—</span></div>
     <div class="tile"><span class="k">class</span><span class="v" id="t-class">—</span></div>
     <div class="tile"><span class="k">mimo</span><span class="v" id="t-mimo">—</span></div>
     <div class="tile"><span class="k">mcs</span><span class="v" id="t-phy">—</span></div>
@@ -156,7 +156,7 @@
       <figure class="panel" id="p-metronome">
         <figcaption>
           <span class="title">Metronome</span>
-          <span class="sub">delivered against commanded, for the scoped transmitter — inter-arrival as slot multiples</span>
+          <span class="sub">is this transmitter a metronome? — inter-arrival as multiples of its slot</span>
           <span class="readout" id="r-metronome"></span>
         </figcaption>
         <canvas></canvas>
@@ -203,7 +203,7 @@
       <figure class="panel" id="p-cir">
         <figcaption>
           <span class="title">Impulse response</span>
-          <span class="sub">power–delay profile from the Hann-windowed IFFT of H(f)</span>
+          <span class="sub">Hann-windowed IFFT of H(f), aligned on the strongest tap · delay is relative</span>
           <span class="readout" id="r-cir"></span>
         </figcaption>
         <canvas></canvas>
@@ -239,7 +239,7 @@
       <figure class="panel" id="p-rssi">
         <figcaption>
           <span class="title">RSSI</span>
-          <span class="sub">per chain · the only absolute amplitude anchor (|H| is AGC-normalised)</span>
+          <span class="sub">per chain · the only absolute amplitude anchor (|H| is AGC-relative)</span>
           <span class="readout" id="r-rssi"></span>
         </figcaption>
         <canvas></canvas>
@@ -248,7 +248,7 @@
       <figure class="panel" id="p-jitter">
         <figcaption>
           <span class="title">Inter-arrival</span>
-          <span class="sub">measured on the 320 MHz baseband clock</span>
+          <span class="sub">measured on the 320 MHz baseband clock · log axis, because the gaps span decades</span>
           <span class="readout" id="r-jitter"></span>
         </figcaption>
         <canvas></canvas>
@@ -319,7 +319,7 @@
       <figure class="panel" id="p-validation">
         <figcaption>
           <span class="title">Extraction checks</span>
-          <span class="sub">is this really CSI? — the qualitative tests from Free Your CSI</span>
+          <span class="sub">is this really CSI? — the qualitative tests from Free Your CSI, over the window</span>
         </figcaption>
         <div class="scroll"><table id="tbl-validation"></table></div>
       </figure>
@@ -335,70 +335,336 @@
     </div>
   </section>
 
-  <!-- -------------------------------------------------------------- config -->
-  <section id="tab-config" class="tab">
-    <div class="cols">
-      <div class="col-narrow">
-        <h2>Experiments</h2>
-        <table class="list" id="tbl-experiments"></table>
-        <div class="row-actions">
-          <input id="new-exp-name" placeholder="new-experiment" spellcheck="false">
-          <button id="btn-new-exp">create</button>
-        </div>
+  <!-- ---------------------------------------------------------------- help -->
+  <section id="tab-help" class="tab">
+    <article class="prose">
 
-        <h2>Node configuration</h2>
-        <table class="list" id="tbl-node-config"></table>
-        <button id="btn-edit-global" class="wide">edit /etc/csid/config.toml</button>
-      </div>
+      <h2>What you are looking at</h2>
+      <p>
+        A Wi-Fi radio in monitor mode reports, for every frame it decodes, the
+        <b>channel state information</b>: one complex number per subcarrier per
+        antenna pair, describing how the air between the transmitter and this
+        node changed that frame. csiscope reads that stream live and draws it.
+        It never touches the capture — every record still lands in
+        <code>capture.raw</code> whatever this page shows.
+      </p>
+      <p>
+        Three things decide whether a plot on this page means anything. Read
+        these before reading the panels.
+      </p>
 
-      <div class="col-wide">
-        <h2 id="editor-title">Editor</h2>
-        <div class="editor-bar">
-          <span id="editor-path" class="path"></span>
-          <span class="spacer"></span>
-          <button id="btn-validate">validate</button>
-          <button id="btn-save" class="primary">save</button>
-          <button id="btn-delete" class="danger">delete</button>
-        </div>
-        <textarea id="editor" spellcheck="false" wrap="off"></textarea>
-        <div id="editor-verdict" class="verdict"></div>
+      <h3>1. A record is not a measurement</h3>
+      <p>
+        The driver can deliver a frame with an intact header, the right payload
+        length, a plausible signal strength — and every coefficient equal to
+        zero. It is not a very weak channel. It is the absence of a reading.
+        Measured across four nodes of this fleet on 23 August 2026, one record
+        in six arrived that way.
+      </p>
+      <p>
+        csiscope removes those records from every windowed view and tells you
+        how many it removed. That is the <b>empty</b> tile in the header strip
+        and the <i>records used</i> line in the Capture panel. The capture yield
+        beside it now counts only records that measured something, so it reads
+        lower than it used to and it is the number that was always meant.
+      </p>
 
-        <h3>Resolved tuning</h3>
-        <table class="list" id="tbl-tuning"></table>
+      <h3>2. Everything is scoped to one class and one transmitter</h3>
+      <p>
+        A busy channel interleaves several PHY types packet by packet — legacy
+        52-tone, HT 56-tone, HE 242-tone — and their arrays are different widths.
+        A plot that mixes them is not a measurement of anything. An illuminated
+        channel interleaves a metronomic injector with whoever else is talking,
+        and pooling their arrival times produces timing statistics that belong to
+        neither.
+      </p>
+      <p>
+        So the spectrum, phase, impulse response, Doppler and metronome panels
+        all describe <b>one record class from one transmitter</b>, chosen in the
+        rail on the left. The census that fills those selectors is taken
+        <i>before</i> the scope is applied, so choosing one transmitter can never
+        hide the others from you. The waterfall can still show every class at
+        once, placed by frequency.
+      </p>
 
-        <h3>Units</h3>
-        <table class="list" id="tbl-units"></table>
+      <h3>3. Amplitude is relative, phase is not the channel</h3>
+      <p>
+        <code>|H|</code> carries the receiver's own automatic gain control. Two
+        frames of an unchanged channel can differ by several decibels because the
+        radio changed its gain, not because anything moved. Read <b>shape</b> off
+        an amplitude axis, never absolute power. The only absolute anchor on this
+        page is the per-chain RSSI, which has its own panel.
+      </p>
+      <p>
+        Raw phase is dominated by carrier and sampling frequency offsets, which
+        have nothing to do with the room. The sanitised view fits a straight line
+        across the subcarriers and subtracts it — and that removes any genuinely
+        linear part of the channel with it, including the common flight time of
+        every path. The residual is a change indicator, not a delay.
+      </p>
 
-        <h3>Journal</h3>
-        <div class="editor-bar">
-          <select id="c-journal-unit"></select>
-          <button id="btn-journal">refresh</button>
-        </div>
-        <pre id="journal-out" class="term"></pre>
-      </div>
-    </div>
-  </section>
+      <h2>Panel by panel</h2>
 
-  <!-- ------------------------------------------------------------ sessions -->
-  <section id="tab-sessions" class="tab">
-    <h2>Spool <span id="spool-path" class="path"></span></h2>
-    <div class="scroll"><table class="list" id="tbl-sessions"></table></div>
-    <h3>Sidecar</h3>
-    <pre id="sidecar-out" class="term">Select a session.</pre>
+      <dl class="glossary">
+        <dt>Capture</dt>
+        <dd>
+          What <code>csid</code> says about itself, which the live stream cannot
+          report. The important line is the yield: records that measured
+          something, over frames the radio delivered. A low yield on 2.4 GHz
+          usually means DSSS/CCK traffic — frames with no OFDM preamble, so
+          nothing to report a channel estimate from. That is a busy channel, not
+          a quiet one.
+        </dd>
+
+        <dt>Metronome</dt>
+        <dd>
+          Is this transmitter periodic? If a rate was commanded, the panel
+          compares what arrived against it and the difference is the delivery
+          deficit. If no rate was commanded, the slot is inferred from the
+          arrivals themselves — and when they turn out not to be periodic at all,
+          the panel says <i>irregular</i> and reports <b>no</b> deficit. A deficit
+          against a rate nobody commanded is not a measurement.
+        </dd>
+
+        <dt>Waterfall</dt>
+        <dd>
+          Amplitude in dB, subcarrier across, time down, newest at the top. This
+          is the panel to watch for motion: a person walking through the link
+          draws bright and dark banding that sweeps across the subcarriers. A
+          still room draws vertical stripes that do not move. The readout says
+          how many rows reached the display and how many the frame rate could not
+          carry.
+        </dd>
+
+        <dt>Spectrum &amp; bundle</dt>
+        <dd>
+          The current frequency response, over the 5th–95th percentile envelope
+          of the window behind it. The width of that envelope is the crowd-sensing
+          feature: a static channel gives a tight bundle, motion widens it.
+        </dd>
+
+        <dt>Doppler spectrogram</dt>
+        <dd>
+          Time across, frequency shift up and down. Motion towards the receiver
+          shifts the reflected path up in frequency, motion away shifts it down,
+          and the panel converts that to a radial speed using the tuned centre
+          frequency.
+          <p>
+            <b>Read the CV first.</b> A Doppler axis assumes evenly spaced
+            samples, and packets arrive when somebody transmits. The coefficient
+            of variation of the gaps says how far from even they were: below about
+            0.5 the axis is quantitative, above 1.2 treat it as a picture rather
+            than a measurement. The <i>fill</i> figure says what share of the
+            frequency analysis had no sample near it and was filled in. To make
+            this panel trustworthy, throttle the capture to a fixed rate.
+          </p>
+          <p>
+            The frequency axis is deliberately held still across columns, even
+            when the packet rate moves, so that the left of the image can be
+            compared with the right.
+          </p>
+        </dd>
+
+        <dt>Phase</dt>
+        <dd>
+          Phase across the subcarriers, in one of three views. <i>Raw</i> is what
+          the radio reported and is dominated by offsets. <i>Unwrapped</i> undoes
+          the ±π wrapping. <i>Sanitised</i> subtracts the fitted straight line and
+          is the only one worth reading for shape — see point 3 above.
+        </dd>
+
+        <dt>Impulse response</dt>
+        <dd>
+          The same channel seen as delay rather than frequency: each peak is a
+          path, and later peaks are longer paths — reflections.
+          <p>
+            <b>Delay here is relative.</b> The radio starts its analysis at a
+            packet boundary it detected, and that detection moves from packet to
+            packet, so the whole profile slides. The panel therefore centres it on
+            the strongest tap and the axis runs negative to positive around that.
+          </p>
+          <p>
+            <b>Smooth does not mean detailed.</b> Resolution is set by bandwidth
+            alone: two paths closer together than <code>1/B</code> are one tap. On
+            a 20 MHz capture that is about 60 nanoseconds — roughly 18 metres of
+            path difference. The panel draws that interval so you can see how much
+            of the curve is interpolation.
+          </p>
+        </dd>
+
+        <dt>Complex plane</dt>
+        <dd>
+          Every subcarrier's complex value plotted as a point, coloured by
+          subcarrier index. A clean capture traces a smooth arc or spiral; a
+          scatter with no structure means the extraction is wrong.
+        </dd>
+
+        <dt>Chains</dt>
+        <dd>
+          One trace per receive/transmit antenna pair. They should differ — they
+          are different antennas seeing different geometry. Traces that lie
+          exactly on top of each other mean the parser is reading the same bytes
+          twice, which is what the <i>chains are distinct</i> check tests.
+        </dd>
+
+        <dt>Subcarrier time series</dt>
+        <dd>
+          Three subcarriers followed across the window. This is the raw material
+          of every occupancy feature: motion in the room appears here as
+          correlated wobble across all three.
+        </dd>
+
+        <dt>RSSI</dt>
+        <dd>
+          Received signal strength per chain, in dBm. The one absolute amplitude
+          on the page. Below about −80 dBm the channel estimate is noisy enough
+          that fine structure elsewhere should be distrusted.
+        </dd>
+
+        <dt>Inter-arrival</dt>
+        <dd>
+          How the gaps between this transmitter's frames are distributed, on a
+          logarithmic axis because they routinely span three decades. One narrow
+          mode means a metronome. Two modes means bursts: a spacing inside a
+          burst and a much longer gap between bursts. Two modes are why an
+          inferred slot cannot be trusted, and why the Doppler axis needs the CV
+          beside it.
+        </dd>
+
+        <dt>Clock divergence</dt>
+        <dd>
+          The host clock and the firmware clock, each minus the baseband clock,
+          across the window. Steady lines mean the three agree; a step means one
+          of them jumped, which matters when captures from several nodes have to
+          be aligned afterwards.
+        </dd>
+
+        <dt>Band plan</dt>
+        <dd>
+          Where Bluetooth Low Energy's advertising channels fall inside this
+          capture's subcarriers, for coexistence work. On a 5 GHz capture it
+          reports that BLE cannot appear at all, which makes the capture a clean
+          negative control.
+        </dd>
+
+        <dt>CSI ratio</dt>
+        <dd>
+          One chain divided by another. The two share a radio and therefore share
+          the frequency offsets, so those divide out exactly and what is left is a
+          ratio of two air channels. This is the trick behind FarSense and
+          Widar3's Doppler processing, and it is why the Doppler panel wants a
+          second chain selected.
+        </dd>
+
+        <dt>Subcarrier statistics</dt>
+        <dd>
+          Per-tone median level and how much each tone varied over the window.
+          Tones that never vary carry no information; tones that vary a lot carry
+          the motion. The band is not flat, and this shows which parts of it are
+          worth using.
+        </dd>
+
+        <dt>Who is sounding the channel</dt>
+        <dd>
+          Every transmitter in the window, busiest first. On a passive capture the
+          record rate is somebody else's transmit rate, so this table is the
+          honest answer to "why is the rate what it is". Click <i>scope</i> to
+          point every deep view at one of them.
+        </dd>
+
+        <dt>Everything on the channel</dt>
+        <dd>
+          The record classes present, as tone count and modulation. Click one to
+          scope the deep views to it. On an ambient channel there are usually
+          several; on an illuminated one there is often exactly one, and then the
+          transmitter selector is the axis that matters.
+        </dd>
+
+        <dt>Extraction checks</dt>
+        <dd>
+          Is this really CSI? Adapted from the "Free Your CSI" tests. These catch
+          a driver or parser that is handing over something other than a channel
+          estimate — wrong dimensions, duplicated chains, a stream of zeros. A
+          check that cannot apply to this tone grid says so rather than failing.
+        </dd>
+
+        <dt>Stream health</dt>
+        <dd>
+          The path between <code>csid</code> and this page. It is best-effort by
+          construction: a slow browser drops frames here and the capture is
+          unaffected. Sender-side drops and decode errors both rising means the
+          node is loaded, not that the radio is failing.
+        </dd>
+      </dl>
+
+      <h2>Reading the controls</h2>
+      <dl class="glossary">
+        <dt>window</dt>
+        <dd>How many records the windowed statistics look back over. Longer is
+        smoother and slower to respond.</dd>
+        <dt>frame rate</dt>
+        <dd>How often this page redraws. It costs CPU on the capturing node;
+        lower it if the capture matters more than the view.</dd>
+        <dt>waterfall rows/frame</dt>
+        <dd>How many records each redraw may draw. The stream can far exceed the
+        frame rate, and this decides how much of it you actually see. The readout
+        says what was skipped.</dd>
+        <dt>dB floor / ceiling</dt>
+        <dd>The range the waterfall's colours span. <i>auto-scale to signal</i>
+        fits them to the current window.</dd>
+        <dt>chain / pair with</dt>
+        <dd>Which antenna pair the single-chain views use, and which second one
+        the Doppler view divides by. Leaving the pair unset leaves the Doppler
+        spectrum contaminated by carrier offset.</dd>
+        <dt>centre frequency</dt>
+        <dd>Pins the frequency used to turn Doppler shift into speed. Inference
+        from the channel number cannot resolve 6 GHz, whose channel numbers
+        overlap 2.4 GHz, so pin it when it matters.</dd>
+      </dl>
+
+      <h2>This console cannot change anything</h2>
+      <p>
+        There is no configuration editor, no start or stop button, no export
+        trigger. Arming a capture is done by merging a plan; configuration is
+        managed by Ansible; the archive is read by the tools that own it. This
+        page reads the live socket and the node's own status file, and that is
+        all it can do.
+      </p>
+    </article>
   </section>
 
   <!-- ---------------------------------------------------------------- node -->
   <section id="tab-node" class="tab">
     <div class="cols">
       <div class="col-narrow">
-        <h2>Node</h2>
+        <h2>This node</h2>
         <table class="list" id="tbl-node"></table>
+
         <h2>Capability envelope</h2>
+        <p class="hint">What this hardware and driver can be asked for. Compiled
+        in, not probed.</p>
         <table class="list" id="tbl-caps"></table>
         <ul id="caps-notes" class="notes"></ul>
       </div>
+
       <div class="col-wide">
+        <h2>Experiments on this node</h2>
+        <p class="hint">The profiles under the experiment directory, with the
+        tuning <code>csid</code> would resolve for each and the state of its
+        unit. Read-only — a profile is edited in the repository and deployed by
+        Ansible.</p>
+        <div class="scroll"><table class="list" id="tbl-experiments"></table></div>
+
+        <h2>Journal</h2>
+        <div class="editor-bar">
+          <select id="c-journal-unit"></select>
+          <button id="btn-journal">read</button>
+        </div>
+        <pre id="journal-out" class="term">Pick a unit.</pre>
+
         <h2>csid doctor</h2>
+        <p class="hint">The daemon's own pre-flight checks, run against an
+        interface. Reads the driver and the system; changes nothing.</p>
         <div class="editor-bar">
           <input id="c-doctor-iface" placeholder="wlp1s0" spellcheck="false">
           <button id="btn-doctor">run</button>
@@ -416,7 +682,7 @@
   <span id="s-session">—</span>
   <span id="s-skip">—</span>
   <span class="spacer"></span>
-  <span id="s-mode"></span>
+  <span id="s-mode">read-only</span>
   <span id="s-version">—</span>
 </footer>
 

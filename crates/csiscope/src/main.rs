@@ -3,7 +3,7 @@
 //! One binary that subscribes to the CSIQ live stream, computes every
 //! representation the Wi-Fi sensing literature actually uses (waterfall,
 //! spectrum bundle, sanitised phase, impulse response, Doppler), and serves
-//! them to a browser alongside the configuration surface for the node.
+//! them to a browser alongside a read-only description of the node.
 //!
 //! It is a strict **consumer**. It never touches the radio, never writes to the
 //! capture path, and holds nothing the daemon needs. If `csiscope` dies
@@ -14,8 +14,10 @@
 //! $ csiscope                              # http://127.0.0.1:8088
 //! $ csiscope --bind 0.0.0.0:8088          # reachable from a laptop
 //! $ csiscope --udp-bind 0.0.0.0:5599      # off-node, via [stream] transport = "udp"
-//! $ csiscope --read-only                  # views only, no config or unit control
 //! ```
+//!
+//! The console has no write surface: nothing it serves can change the node, the
+//! radio or the capture. See [`csiscope::server`].
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,12 +71,7 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_EXPERIMENT_DIR)]
     experiments: PathBuf,
 
-    /// Serve the views but refuse every write: no config edits, no unit
-    /// control, no exports. The safe mode on an untrusted network.
-    #[arg(long)]
-    read_only: bool,
-
-    /// The `csid` binary used for `doctor` and `export`.
+    /// The `csid` binary used for `doctor`.
     #[arg(long, default_value = "csid")]
     csid_bin: String,
 
@@ -126,12 +123,13 @@ fn run(cli: Cli) -> Result<()> {
     );
     ingest::spawn(source, hub.clone())?;
 
-    if cli.read_only {
-        tracing::info!("read-only: configuration, unit control and export are disabled");
-    } else if !cli.bind.ip().is_loopback() {
+    if !cli.bind.ip().is_loopback() {
+        // Still worth saying. The console cannot change anything any more, but
+        // it does describe the node, its experiments and its journal, and that
+        // is a disclosure even when it is not a risk to the capture.
         tracing::warn!(
             bind = %cli.bind,
-            "serving an unauthenticated write-capable console on a non-loopback address"
+            "serving an unauthenticated console on a non-loopback address"
         );
     }
 
@@ -140,7 +138,6 @@ fn run(cli: Cli) -> Result<()> {
         hub,
         config_path: cli.config,
         experiment_dir: cli.experiments,
-        read_only: cli.read_only,
         csid_bin: cli.csid_bin,
         interface: cli.interface,
     });

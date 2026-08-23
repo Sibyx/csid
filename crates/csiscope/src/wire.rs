@@ -228,10 +228,21 @@ pub struct CaptureInfo {
     pub uptime_s: u64,
     pub band: String,
     pub records: u64,
+    /// Of `records`, how many arrived with an all-zero I/Q matrix — csid's own
+    /// count, over the whole session. The window-scoped equivalent the console
+    /// measures for itself is [`NullInfo`].
+    pub empty_records: u64,
     pub frames_seen: u64,
     /// `records / frames_seen`, or `null` when no frames have arrived — which
     /// is a different fact from a yield of zero.
     pub yield_ratio: Option<f64>,
+    /// The same ratio counting only records that carry a channel estimate.
+    ///
+    /// Reported beside `yield_ratio` rather than instead of it: the first says
+    /// the radio delivered, the second says we measured, and on this fleet they
+    /// differ by fifteen points. A panel that showed only the first called a
+    /// stream healthy while one record in six carried nothing.
+    pub useful_yield_ratio: Option<f64>,
     /// `ok` / `low` / `bad` / `no frames`, banded per band.
     pub yield_verdict: &'static str,
     /// The sentence a bad yield deserves, empty when there is nothing to say.
@@ -266,13 +277,44 @@ pub struct GeometryInfo {
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct RadioInfo {
+    /// The channel the *record* carries — what the driver stamped on it.
     pub channel: u32,
+    /// The channel `csid` says the session is tuned to, when a status document
+    /// is being read. `None` on an off-node console.
+    pub tuned_channel: Option<u32>,
+    /// The two disagree.
+    ///
+    /// ## Why this is worth a field of its own
+    ///
+    /// Found while replaying the archive on 2026-08-23. Segment
+    /// `monad01_illum-coex-03_20260823-102958-seg0003` is the treatment arm of a
+    /// BLE coexistence experiment: its sidecar declares channel 3 at 2422 MHz,
+    /// and every one of its 2433 records carries channel **48** in the driver
+    /// header. The offset is not misread — three other archived captures on
+    /// channels 1, 36 and 100 report exactly those numbers at the same byte.
+    ///
+    /// Two panels were quietly wrong because of it, and neither could have shown
+    /// it: the Doppler view takes its wavelength from the channel, so every
+    /// speed on that capture was out by the ratio of 5240 to 2422 — a factor of
+    /// 2.16 — and the band plan announced "BLE cannot appear in this capture at
+    /// all, which makes it a clean negative control" on a capture whose entire
+    /// purpose was to measure BLE coexistence.
+    ///
+    /// The console cannot say which of the two is right. It can say that they
+    /// disagree, and refuse to derive anything from either until they do not.
+    pub channel_mismatch: bool,
     pub width: String,
     pub freq_mhz: f64,
     /// True while the frequency is inferred from the channel number rather
     /// than pinned by the operator — 6 GHz channel numbering overlaps 2.4 GHz,
     /// so the inference genuinely cannot resolve it.
     pub freq_assumed: bool,
+    /// May anything be derived from [`RadioInfo::freq_mhz`]?
+    ///
+    /// False when the record and the daemon disagree about the channel. A speed
+    /// axis and a band plan are both functions of frequency, and a frequency
+    /// nobody agrees on is not one to compute with.
+    pub freq_trusted: bool,
     pub spacing_hz: f64,
     pub bw_mhz: f64,
 }
@@ -306,6 +348,29 @@ pub struct PhaseFit {
     pub tau_ns: f32,
 }
 
+/// Records the analysis refused, and why it matters that it says so.
+///
+/// The console excludes records with an all-zero I/Q matrix from every windowed
+/// view (see [`crate::dsp::is_measurement`]). Excluding them silently would
+/// replace one wrong number with another: a spectrum computed over 155 records
+/// when 184 arrived is a different measurement, and an operator has to be able
+/// to see the difference between a quiet channel and a channel the driver is
+/// failing to report.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct NullInfo {
+    /// Records dropped from the analysis window.
+    pub dropped: usize,
+    /// Records the window held before the drop.
+    pub considered: usize,
+    /// `dropped / considered`.
+    pub frac: f64,
+    /// True when *every* record in the window was empty, so there was nothing
+    /// to analyse and the views below are drawn from a record that carries no
+    /// channel estimate. The panels blank themselves on this rather than
+    /// rendering a flat line at the quantisation floor.
+    pub no_measurement: bool,
+}
+
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct BundleInfo {
     pub width_db: f32,
@@ -314,17 +379,43 @@ pub struct BundleInfo {
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct CirInfo {
+    /// Spacing between plotted taps. Interpolation, not resolution.
     pub bin_ns: f32,
+    /// `1/B` — the smallest delay difference the occupied bandwidth can
+    /// distinguish. The panel draws this as an interval, because a profile
+    /// plotted at `bin_ns` looks like it resolves forty times more than it does.
+    pub resolution_ns: f32,
+    /// Delay of the first plotted tap. Negative: the axis is centred on the
+    /// strongest tap, because absolute delay is not recoverable here.
+    pub axis_start_ns: f32,
+    /// Index within the plotted taps where the strongest one sits.
+    pub peak_index: usize,
+    /// Index within the un-aligned transform of the strongest tap — the
+    /// packet-detection delay, in bins.
     pub peak_bin: usize,
     pub rms_delay_ns: f32,
+    /// Is `rms_delay_ns` larger than `resolution_ns`? When false the number
+    /// describes the Hann window rather than the channel, and the panel says so
+    /// instead of printing it as a measurement.
+    pub spread_resolvable: bool,
     pub taps: usize,
 }
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct DopplerInfo {
+    /// The pinned rate the frequency axis is built from. Held across columns,
+    /// so the spectrogram is one image rather than a stack of unrelated ones.
     pub fs_hz: f32,
+    /// What this window actually delivered. Diagnostic; never the axis.
+    pub fs_window_hz: f32,
+    /// `"tracked"` while a rate is held, `"none"` before one exists.
+    pub fs_source: &'static str,
     pub max_hz: f32,
     pub max_speed_ms: f32,
+    /// Share of resample slots that had no sample near them and were filled.
+    pub gap_frac: f32,
+    /// Seconds of history one column covers.
+    pub span_s: f32,
     pub arrival_cv: f32,
     pub conjugate_pair: bool,
     pub nfft: usize,
@@ -334,6 +425,10 @@ pub struct DopplerInfo {
 pub struct TimingInfo {
     pub ftm: dsp::Timing,
     pub host: dsp::Timing,
+    /// Decade bounds of the log-spaced inter-arrival histogram, in
+    /// microseconds. Bin `i` of `n` covers
+    /// `[lo·(hi/lo)^(i/n), lo·(hi/lo)^((i+1)/n))`.
+    pub hist_min_us: f32,
     pub hist_max_us: f32,
 }
 
@@ -434,6 +529,7 @@ pub struct SharedHeader {
     pub class: ClassInfo,
     pub transmitter: TransmitterInfo,
     pub capture: CaptureInfo,
+    pub nulls: NullInfo,
     pub metronome: dsp::Metronome,
     pub tone_stats: dsp::ToneStats,
     pub bandplan: crate::bandplan::Bandplan,
@@ -473,6 +569,13 @@ pub struct ClientHeader {
     /// by a scope was never meant to be drawn, while a record in `skipped` is
     /// one the display could not keep up with.
     pub other_transmitter: u64,
+    /// Records of the right class and transmitter that carried no channel
+    /// estimate, and so had nothing to draw.
+    ///
+    /// A fourth outcome, counted apart from the three above for the same reason
+    /// they are counted apart from each other: this is not a shortfall of the
+    /// display and not an exclusion by a scope. The row arrived and was empty.
+    pub empty: u64,
     pub wf_rows: usize,
     pub u8: ArrayMap,
     pub n_u8: usize,

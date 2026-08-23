@@ -1,18 +1,26 @@
 //! HTTP + WebSocket surface.
 //!
-//! One WebSocket carries the live analysis; a small REST surface carries
-//! everything that is not per-frame (configuration, unit control, sessions,
-//! diagnostics). The UI is compiled into the binary, so deployment is still
-//! "copy one file".
+//! One WebSocket carries the live analysis; a small REST surface carries the
+//! few things that are not per-frame — what this node is, what it is running,
+//! and what its journal says.
 //!
-//! ## No authentication, on purpose
+//! ## Nothing here writes
 //!
-//! This is a lab instrument. It has no login, no sessions and no CSRF tokens,
-//! and it will happily start and stop capture units for whoever can reach the
-//! port. That is a deployment constraint, not an oversight: bind it to
-//! localhost or a management VLAN, or run with `--read-only` to serve the views
-//! without the write surface. `--bind` defaults to loopback so the unsafe
-//! choice is the explicit one.
+//! There is no route that mutates anything: no configuration editor, no unit
+//! control, no export trigger, no session browser. That is a property of the
+//! router rather than of a flag, which is the point — the console used to serve
+//! all of those unauthenticated, with `--read-only` as the only thing between
+//! the port and the radio, and the safe configuration was the one you had to
+//! remember to ask for.
+//!
+//! An arm is authorised by merging a plan (IP-136), a session is read out of
+//! the spool by the tools that own the archive, and configuration is Ansible's.
+//! None of them wanted a text box on a lab network.
+//!
+//! It still has no authentication, and it is still a lab instrument: bind it to
+//! loopback or a management VLAN. `--bind` defaults to loopback so the exposed
+//! choice stays the explicit one. What has changed is what an exposed port can
+//! do, which is now: look.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,10 +28,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -41,11 +49,8 @@ pub struct App {
     pub pipeline: Pipeline,
     pub config_path: PathBuf,
     pub experiment_dir: PathBuf,
-    /// Refuse every mutating route. The views stay live.
-    pub read_only: bool,
-    /// The `csid` binary used for `doctor` and `export` — the CLI is the
-    /// façade, so the console reports exactly what the operator would see on
-    /// the shell.
+    /// The `csid` binary used for `doctor` — the CLI is the façade, so the
+    /// console reports exactly what the operator would see on the shell.
     pub csid_bin: String,
     /// Default interface for `csid doctor`.
     pub interface: String,
@@ -62,20 +67,9 @@ pub fn router(app: Shared) -> Router {
         .route("/style.css", get(asset_css))
         .route("/ws", get(ws_upgrade))
         .route("/api/overview", get(overview))
-        .route("/api/experiments", get(experiments))
-        .route("/api/experiments/{name}", get(experiment_get))
-        .route("/api/experiments/{name}", put(experiment_put))
-        .route("/api/experiments/{name}", delete(experiment_delete))
-        .route("/api/experiments/{name}/validate", post(experiment_check))
-        .route("/api/config", get(config_get))
-        .route("/api/config", put(config_put))
-        .route("/api/units", get(units))
-        .route("/api/units/{unit}/{action}", post(unit_action))
         .route("/api/journal", get(journal))
         .route("/api/doctor", get(doctor))
         .route("/api/caps", get(caps))
-        .route("/api/sessions", get(sessions))
-        .route("/api/sessions/{id}/export", post(session_export))
         .with_state(app)
 }
 
@@ -127,7 +121,7 @@ async fn bind_when_available(bind: SocketAddr) -> Result<tokio::net::TcpListener
 /// Serve the console.
 pub async fn serve(app: Shared, bind: SocketAddr) -> Result<()> {
     let listener = bind_when_available(bind).await?;
-    tracing::info!(%bind, read_only = app.read_only, "console listening (no authentication)");
+    tracing::info!(%bind, "console listening (read-only, no authentication)");
     axum::serve(listener, router(app))
         .with_graceful_shutdown(shutdown())
         .await
@@ -199,7 +193,6 @@ async fn live(mut socket: WebSocket, app: Shared) {
     let hello = json!({
         "t": "hello",
         "source": app.hub.source,
-        "read_only": app.read_only,
         "csid_version": csid::VERSION,
         "csiscope_version": env!("CARGO_PKG_VERSION"),
         "settings": settings,
@@ -291,21 +284,6 @@ impl From<anyhow::Error> for ApiError {
 
 type ApiResult = std::result::Result<Json<serde_json::Value>, ApiError>;
 
-fn writable(app: &App) -> std::result::Result<(), ApiError> {
-    if app.read_only {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "csiscope is running with --read-only".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct TomlBody {
-    toml: String,
-}
-
 async fn overview(State(app): State<Shared>) -> ApiResult {
     let global = csid::config::GlobalConfig::load(&app.config_path).unwrap_or_default();
     let exps = console::list_experiments(&app.experiment_dir);
@@ -317,7 +295,6 @@ async fn overview(State(app): State<Shared>) -> ApiResult {
     Ok(Json(json!({
         "csid_version": csid::VERSION,
         "csiscope_version": env!("CARGO_PKG_VERSION"),
-        "read_only": app.read_only,
         "source": app.hub.source,
         "config_path": app.config_path.display().to_string(),
         "experiment_dir": app.experiment_dir.display().to_string(),
@@ -343,80 +320,6 @@ fn which(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|p| p.join(bin))
         .find(|p| p.is_file())
-}
-
-async fn experiments(State(app): State<Shared>) -> ApiResult {
-    Ok(Json(json!(console::list_experiments(&app.experiment_dir))))
-}
-
-async fn experiment_get(State(app): State<Shared>, Path(name): Path<String>) -> ApiResult {
-    let e = console::read_experiment(&app.experiment_dir, &name)?;
-    Ok(Json(json!(e)))
-}
-
-async fn experiment_check(Json(body): Json<TomlBody>) -> ApiResult {
-    Ok(Json(json!(console::check_experiment(&body.toml))))
-}
-
-async fn experiment_put(
-    State(app): State<Shared>,
-    Path(name): Path<String>,
-    Json(body): Json<TomlBody>,
-) -> ApiResult {
-    writable(&app)?;
-    let check = console::write_experiment(&app.experiment_dir, &name, &body.toml)?;
-    tracing::info!(experiment = name, "experiment written");
-    Ok(Json(json!({"written": true, "check": check})))
-}
-
-async fn experiment_delete(State(app): State<Shared>, Path(name): Path<String>) -> ApiResult {
-    writable(&app)?;
-    console::delete_experiment(&app.experiment_dir, &name)?;
-    tracing::info!(experiment = name, "experiment deleted");
-    Ok(Json(json!({"deleted": true})))
-}
-
-async fn config_get(State(app): State<Shared>) -> ApiResult {
-    let toml = std::fs::read_to_string(&app.config_path).unwrap_or_default();
-    Ok(Json(json!({
-        "path": app.config_path.display().to_string(),
-        "toml": toml,
-        "check": console::check_global(&toml),
-    })))
-}
-
-async fn config_put(State(app): State<Shared>, Json(body): Json<TomlBody>) -> ApiResult {
-    writable(&app)?;
-    let check = console::write_global(&app.config_path, &body.toml)?;
-    tracing::info!(path = %app.config_path.display(), "node configuration written");
-    Ok(Json(json!({"written": true, "check": check})))
-}
-
-async fn units(State(app): State<Shared>) -> ApiResult {
-    let mut out: Vec<_> = console::list_experiments(&app.experiment_dir)
-        .iter()
-        .map(|e| console::unit_status(&format!("csid@{}.service", e.name)))
-        .collect();
-    for u in ["csid-sync.timer", "csid-prune.timer"] {
-        out.push(console::unit_status(u));
-    }
-    Ok(Json(json!(out)))
-}
-
-async fn unit_action(
-    State(app): State<Shared>,
-    Path((unit, action)): Path<(String, String)>,
-) -> ApiResult {
-    writable(&app)?;
-    let run = console::unit_action(&unit, &action)?;
-    tracing::info!(unit, action, ok = run.ok, "unit action");
-    // The action is reported with the unit's resulting state, because
-    // `systemctl start` succeeding says nothing about whether the unit stayed up.
-    let resolved = console::resolve_unit(&unit)?;
-    Ok(Json(json!({
-        "run": run,
-        "status": console::unit_status(&resolved),
-    })))
 }
 
 #[derive(Deserialize)]
@@ -450,22 +353,6 @@ async fn caps() -> ApiResult {
     // Computed in-process: the envelope is a compiled-in constant, and shelling
     // out for it would only add a way to fail.
     Ok(Json(json!(csid::caps::Envelope::default())))
-}
-
-async fn sessions(State(app): State<Shared>) -> ApiResult {
-    let global = csid::config::GlobalConfig::load(&app.config_path).unwrap_or_default();
-    Ok(Json(json!({
-        "spool": global.node.spool.display().to_string(),
-        "sessions": console::list_sessions(&global.node.spool, 200),
-    })))
-}
-
-async fn session_export(State(app): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    writable(&app)?;
-    let global = csid::config::GlobalConfig::load(&app.config_path).unwrap_or_default();
-    let dir = console::session_dir(&global.node.spool, &id)?;
-    let run = console::run(&app.csid_bin, &["export", &dir.display().to_string()]);
-    Ok(Json(json!(run)))
 }
 
 #[cfg(test)]

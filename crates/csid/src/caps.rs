@@ -268,7 +268,8 @@ impl Default for Envelope {
                 "CSI type follows the received frame; monitor width only bounds decodability.",
                 "996-tone (HE80) requires monitor width >= the PPDU width.",
                 "Wider monitor width lowers total frame rate (~371 Hz at 20/40 vs ~215-225 Hz at 80/160).",
-                "Amplitude is AGC-normalised: |H| carries shape only; absolute scale comes from RSSI.",
+                "Amplitude is AGC-RELATIVE: |H| carries the receiver's own gain setting as well as \
+                 the channel, so read shape from it and never level; the absolute anchor is RSSI.",
                 "interval_us is a clean rate cap: 10 ms -> ~88 Hz, 100 ms -> ~9.8 Hz.",
                 "First 6 GHz tune after a 5 GHz retune can return -EIO; csid retries once.",
             ],

@@ -65,6 +65,19 @@ pub struct EnvironmentMeta {
 pub struct SummaryMeta {
     pub capture_bytes: u64,
     pub records: u64,
+    /// Of `records`, how many carried an all-zero I/Q matrix.
+    ///
+    /// The durable counterpart of `status.empty_records`. On a persisting
+    /// session it is recounted from `capture.raw` by `engine::summarize`,
+    /// exactly as `records` is, so the sidecar and the raw stream cannot
+    /// disagree. On a non-persisting one it is the RX thread's own count.
+    ///
+    /// Present so a corpus size can be quoted honestly after the fact: a
+    /// session's useful record count is `records - empty_records`, and before
+    /// this field existed the difference was unrecoverable from the archive
+    /// without re-reading every segment.
+    #[serde(default)]
+    pub empty_records: u64,
     pub mean_rate_hz: f64,
     pub live_dropped: u64,
     /// Distinct tone counts observed (52 / 242 / 996 …).

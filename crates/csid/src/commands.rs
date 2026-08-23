@@ -34,11 +34,16 @@ pub fn run(
         }
     }
     let outcome = engine::run_session(global, &cfg, stop)?;
+    // The empty count is printed beside the record count, never subtracted from
+    // it: `records` is what the driver delivered and stays comparable with every
+    // number already in the archive. What a reader wants is the difference, and
+    // the difference is only visible if both are shown.
     println!(
-        "{} {:?} — {} records, {} bytes -> {}",
+        "{} {:?} — {} records ({} empty), {} bytes -> {}",
         outcome.session_id,
         outcome.status,
         outcome.summary.records,
+        outcome.summary.empty_records,
         outcome.summary.capture_bytes,
         outcome.dir.display()
     );

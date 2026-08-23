@@ -1,12 +1,19 @@
 // csiscope console.
 //
 // Three responsibilities, kept apart:
-//   1. the live socket  — decode binary frames, keep the settings in sync
-//   2. the views        — one render function per panel, all reading one frame
-//   3. the operator tab — REST against the config / unit / session surface
+//   1. the live socket — decode binary frames, keep the settings in sync
+//   2. the views       — one render function per panel, all reading one frame
+//   3. the node tab    — a read-only description of the host, over REST
 //
 // Every view states its units and its assumptions on the panel itself. A CSI
 // plot with an unlabelled axis is decoration; this is an instrument.
+//
+// One rule governs every readout below, and most of the bugs this file has
+// carried were a breach of it: **a panel whose input does not support its
+// statistic prints the reason, not the statistic**. A deficit against a rate
+// nobody commanded, a percentile resting on a null, a velocity axis derived
+// from a packet rate that moved — each of those was a number rendered where a
+// sentence belonged.
 
 import { Panel, Heatmap, drawRampLegend, ramp, rampColor, CATEGORICAL, THEME } from '/plot.js';
 
@@ -18,6 +25,28 @@ function readout(id, html, tip) {
   const n = $(id);
   n.innerHTML = html;
   n.title = tip || n.textContent;
+}
+
+/**
+ * Blank an analytical panel when the window held no measurement at all.
+ *
+ * Returns true when the caller must stop. Every record in the window carried an
+ * all-zero I/Q matrix, so the arrays behind these views are the quantisation
+ * floor — and a flat line at the floor reads as "the channel is dead" rather
+ * than "the driver reported nothing". The band-plan panel has always handled
+ * an inapplicable input this way; this is the same move, applied to the rest.
+ */
+function blanked(panel, readoutId, h, what) {
+  if (!h.nulls || !h.nulls.no_measurement) return false;
+  panel.begin({ x0: 0, x1: 1, y0: 0, y1: 1, xticks: 1, yticks: 1 });
+  panel.note('no channel estimate in this window', 'tl');
+  panel.end();
+  readout(readoutId, '<span class="bad">no measurement</span>',
+    `Every one of the ${h.nulls.considered} records in this window arrived with ` +
+    'an all-zero I/Q matrix: the radio delivered them, the headers are intact ' +
+    `and none of them measured the channel. There is nothing for ${what} to ` +
+    'describe. Check the driver — this is not a quiet room.');
+  return true;
 }
 
 // ---------------------------------------------------------------- utilities
@@ -88,14 +117,6 @@ async function api(path, opts) {
   return body;
 }
 
-async function post(path, payload) {
-  return api(path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: payload === undefined ? undefined : JSON.stringify(payload),
-  });
-}
-
 // ------------------------------------------------------------ frame decoding
 
 /**
@@ -122,10 +143,11 @@ const S = {
   settings: null,          // authoritative copy, echoed by the server
   frame: null,             // last decoded frame
   overview: null,
-  experiments: [],
-  sessions: [],
-  editing: null,           // {kind:'experiment'|'global', name}
   ramp: 'viridis',
+  // Doppler frequency axis the spectrogram image was drawn on. When the server
+  // moves the pinned rate the image is started again, because two rates in one
+  // picture is the fault the pinning exists to remove.
+  dopplerAxis: null,
   phaseMode: 'detrended',
   ws: null,
   lastFrameAt: 0,
@@ -199,21 +221,38 @@ function renderWaterfall(f) {
 
   // The waterfall cannot show 600 lines a second at 20 frames a second; saying
   // how much it skipped is the difference between a display and a claim.
-  const shown = h.wf_rows, skipped = h.skipped;
-  const cov = shown + skipped > 0 ? (100 * shown) / (shown + skipped) : 100;
+  //
+  // Nothing arriving is its own state, and it is NOT full coverage. The
+  // fallback used to be 100%, so a stalled stream read "0 rows/frame · 100%
+  // drawn" — the healthiest possible sentence at the moment there was nothing
+  // to draw.
+  const shown = h.wf_rows, skipped = h.skipped, empty = h.empty || 0;
+  const offered = shown + skipped;
+  const cov = offered > 0 ? (100 * shown) / offered : null;
+  const coverage = cov === null
+    ? (empty > 0 ? `<span class="warn">${empty} empty</span>` : '<span class="dim">no rows</span>')
+    : `${shown} rows/frame · ${cov.toFixed(0)}% drawn`;
+
   readout('r-waterfall',
     (all ? `all classes · ${fmt(h.waterfall.span_mhz, 1)} MHz`
-         : `${n} tones · ${h.class.label}`) +
-    ` · ${shown} rows/frame · ${cov.toFixed(0)}% drawn`,
+         : `${n} tones · ${h.class.label}`) + ` · ${coverage}`,
     (all
       ? `Every record class, resampled onto one ${fmt(h.waterfall.span_mhz, 1)} MHz ` +
         `axis of ${n} bins, so a narrow legacy frame occupies its true share of ` +
         `the channel next to a wider HE one. `
       : `${n} subcarriers of the ${h.class.label} class at its native grid. `) +
-    `${shown} rows carried this frame, ${skipped} skipped ` +
-    `(${cov.toFixed(0)}% of the stream reaches the display). Raise "waterfall ` +
-    `rows/frame" or lower the frame rate to draw more. The capture is ` +
-    `unaffected — csiscope never touches it.`);
+    (offered > 0
+      ? `${shown} rows carried this frame, ${skipped} skipped ` +
+        `(${cov.toFixed(0)}% of the stream reaches the display). Raise "waterfall ` +
+        'rows/frame" or lower the frame rate to draw more. '
+      : 'No rows of this class and transmitter arrived in this frame, so nothing ' +
+        'was drawn — which is a different state from drawing everything. ') +
+    (empty > 0
+      ? `${empty} record${empty === 1 ? '' : 's'} arrived with an all-zero I/Q ` +
+        'matrix and had nothing to draw. Those are not skipped rows: the display ' +
+        'kept up, the records were empty. '
+      : '') +
+    'The capture is unaffected — csiscope never touches it.');
 }
 
 // -- spectrum + bundle --------------------------------------------------------
@@ -221,6 +260,7 @@ function renderWaterfall(f) {
 function renderSpectrum(f) {
   const { h, a } = f;
   const p = panels.spectrum;
+  if (blanked(p, 'r-spectrum', f.h, 'the spectrum')) return;
   const amp = a.amp_db;
   if (!amp || !amp.length) return;
 
@@ -243,14 +283,25 @@ function renderSpectrum(f) {
   }
   p.seriesY(amp, CATEGORICAL[0], 1.5);
   p.note('subcarrier index →', 'bl');
-  p.note('|H| dB (relative — AGC-normalised)', 'tl');
+  // AGC-RELATIVE, not AGC-normalised. The label used to claim a correction that
+  // is not applied anywhere in the pipeline: |H| carries the receiver's own gain
+  // setting, which moves several dB between packets on an unchanged channel
+  // (Xie et al. 2015 measured 7 dB between two traces of one band). An operator
+  // who reads "normalised" believes amplitude is comparable across packets.
+  p.note('|H| dB (AGC-relative — read shape, not level)', 'tl');
   p.end();
 
+  const n = h.nulls || {};
+  const dropped = n.dropped
+    ? ` ${n.dropped} of ${n.considered} records carried no channel estimate and are not in it.`
+    : '';
   readout('r-spectrum', `bundle ${fmt(h.bundle.width_db)} dB`,
     `The shaded envelope is the p05–p95 spread of |H(f)| over ${h.bundle.n} ` +
     `records. Its mean width, ${fmt(h.bundle.width_db)} dB, is the "CSI bundle ` +
     `width" used as an occupancy feature: a static channel gives a tight ` +
-    `bundle, motion widens it.`);
+    `bundle, motion widens it.${dropped} ` +
+    'The level is AGC-relative: the shape across subcarriers is the measurement, ' +
+    'the height above the axis is not.');
 }
 
 // -- phase --------------------------------------------------------------------
@@ -258,6 +309,7 @@ function renderSpectrum(f) {
 function renderPhase(f) {
   const { h, a } = f;
   const p = panels.phase;
+  if (blanked(p, 'r-phase', f.h, 'the phase')) return;
   const key = { raw: 'phase_raw', unwrapped: 'phase_unwrapped', detrended: 'phase_detrended' }[S.phaseMode];
   const y = a[key];
   if (!y || !y.length) return;
@@ -296,30 +348,68 @@ function renderCir(f) {
   const p = panels.cir;
   const y = a.cir_db;
   if (!y || !y.length) return;
+  if (blanked(p, 'r-cir', h, 'the impulse response')) return;
 
+  // The axis is centred on the strongest tap and runs negative to positive.
+  // Absolute delay is not recoverable here: the radio starts its transform at a
+  // packet boundary it detected, and that detection moves packet to packet, so
+  // the profile slid across this panel while the room did nothing. Measured
+  // 2026-08-23, the peak swept the whole 0–127 tap window on two nodes.
   const binNs = h.cir.bin_ns;
-  const spanNs = (y.length - 1) * binNs;
+  const startNs = h.cir.axis_start_ns;
+  const endNs = startNs + (y.length - 1) * binNs;
+  const resNs = h.cir.resolution_ns;
+
   p.begin({
-    x0: 0, x1: spanNs, y0: -45, y1: 2,
+    x0: startNs, x1: endNs, y0: -45, y1: 2,
     xfmt: (v) => v.toFixed(0),
     yfmt: (v) => v.toFixed(0),
   });
-  const xs = Array.from({ length: y.length }, (_, i) => i * binNs);
+
+  // The resolution cell, drawn rather than only stated. A profile plotted at
+  // `bin_ns` looks like it resolves forty times more structure than the
+  // bandwidth can distinguish; this is the interval two paths must exceed to be
+  // two paths at all (Xie et al. 2015).
+  if (resNs > 0 && resNs < (endNs - startNs)) {
+    const ctx = p.ctx;
+    ctx.save();
+    ctx.fillStyle = 'rgba(125,135,148,0.16)';
+    const x0 = p.px(-resNs / 2), x1 = p.px(resNs / 2);
+    ctx.fillRect(x0, p.pad.t, x1 - x0, p.h - p.pad.t - p.pad.b);
+    ctx.restore();
+  }
+
+  const xs = Array.from({ length: y.length }, (_, i) => startNs + i * binNs);
   p.seriesY(y, CATEGORICAL[0], 1.3, xs);
   p.rule('y', -20, THEME.AXIS, '−20 dB');
-  p.note('delay, ns →', 'bl');
+  p.note('delay from the strongest tap, ns →', 'bl');
   p.note('power, dB below the strongest tap', 'tl');
+  // Top-right, not bottom-right: the x-axis label already owns the bottom of
+  // this panel and the two collided.
+  if (resNs > 0) p.note(`shaded = 1/B = ${fmt(resNs)} ns, one resolution cell`, 'tr');
   p.end();
 
-  // Delay is what the physics gives; distance is what a person pictures.
-  const peakNs = h.cir.peak_bin * binNs;
-  const resNs = 1e3 / h.radio.bw_mhz;
-  readout('r-cir',
-    `rms spread ${fmt(h.cir.rms_delay_ns)} ns · ${fmt(binNs, 1)} ns/bin`,
-    `Strongest tap at ${fmt(peakNs)} ns. RMS delay spread ${fmt(h.cir.rms_delay_ns)} ns ` +
-    `= ${fmt(h.cir.rms_delay_ns * 0.2998)} m of excess path, over taps within ` +
-    `20 dB of the peak. Bin spacing ${fmt(binNs, 2)} ns is interpolation; the ` +
-    `true resolution is 1/BW ≈ ${fmt(resNs)} ns.`);
+  // The spread is only a measurement while it exceeds what the bandwidth can
+  // distinguish. Below that it describes the Hann window, and printing it as a
+  // channel property is how a still room reports 35 ns one second and 57 ns the
+  // next.
+  const spread = h.cir.spread_resolvable
+    ? `rms spread ${fmt(h.cir.rms_delay_ns)} ns`
+    : `<span class="dim">spread below 1/B</span>`;
+  readout('r-cir', `${spread} · 1/B ${fmt(resNs)} ns`,
+    (h.cir.spread_resolvable
+      ? `RMS delay spread ${fmt(h.cir.rms_delay_ns)} ns = ` +
+        `${fmt(h.cir.rms_delay_ns * 0.2998)} m of excess path, over taps within ` +
+        '20 dB of the peak. '
+      : `The profile is one resolution cell wide (spread ${fmt(h.cir.rms_delay_ns)} ns ` +
+        `against a resolution of ${fmt(resNs)} ns), so its width is the window ` +
+        'function rather than the channel and no number is quoted. ') +
+    `Resolution is 1/B = ${fmt(resNs)} ns ≈ ${fmt(resNs * 0.2998)} m of path: two ` +
+    'reflections closer together than that are one tap however smooth the curve ' +
+    `looks. Bin spacing ${fmt(binNs, 2)} ns is zero-padding interpolation between ` +
+    'those taps, not extra detail. ' +
+    `The peak sat at transform bin ${h.cir.peak_bin} — the packet-detection ` +
+    'delay, which is why the axis is relative rather than absolute.');
 }
 
 // -- complex plane ------------------------------------------------------------
@@ -327,6 +417,7 @@ function renderCir(f) {
 function renderConstellation(f) {
   const { a } = f;
   const p = panels.constellation;
+  if (blanked(p, 'r-constellation', f.h, 'the complex plane')) return;
   const iq = a.iq;
   if (!iq || iq.length < 4) return;
 
@@ -360,6 +451,7 @@ function renderConstellation(f) {
 function renderChains(f) {
   const { h, a } = f;
   const p = panels.chains;
+  if (blanked(p, 'r-chains', f.h, 'the per-chain view')) return;
   const n = h.geometry.ntone;
   const nc = h.geometry.nchain;
   const flat = a.chain_amp_db;
@@ -383,6 +475,7 @@ function renderChains(f) {
 function renderTones(f) {
   const { h, a } = f;
   const p = panels.tones;
+  if (blanked(p, 'r-tones', f.h, 'the time series')) return;
   const len = h.series.len;
   const tones = h.series.tones || [];
   const flat = a.tone_series;
@@ -429,7 +522,7 @@ function renderRssi(f) {
   readout('r-rssi', (h.record.rssi || []).map((v) => `${v} dBm`).join(' / ') || '—',
     'Per-chain RSSI in dBm. The driver reports a positive magnitude and csiq ' +
     'negates it at parse time, so records carry ordinary signal strength. This ' +
-    'is the only absolute amplitude reference available: |H| is AGC-normalised ' +
+    'is the only absolute amplitude reference available: |H| is AGC-relative ' +
     'and carries channel shape alone. A zero means the chain reported nothing.');
 }
 
@@ -439,8 +532,34 @@ const DOPPLER_FLOOR = -45;
 
 function renderDoppler(f) {
   const { h, a } = f;
+  const d = h.doppler;
   const y = a.doppler_db;
   if (!y || !y.length) return;
+  // The spectrogram is a heatmap, not a Panel, so it blanks by clearing its own
+  // image rather than by drawing an empty axis.
+  if (h.nulls && h.nulls.no_measurement) {
+    heat.doppler.clear();
+    S.dopplerAxis = null;
+    readout('r-doppler', '<span class="bad">no measurement</span>',
+      `Every one of the ${h.nulls.considered} records in this window arrived with ` +
+      'an all-zero I/Q matrix, so there is no series to transform. Check the ' +
+      'driver — this is not a still room.');
+    return;
+  }
+
+  // The spectrogram is a SEQUENCE of columns on ONE axis, so a column whose
+  // axis differs from the image's must not be appended to it. The server pins
+  // the rate for exactly this reason; the guard here catches the moment it
+  // moves — a genuine change of regime — and starts a fresh image rather than
+  // splicing two scales into one picture.
+  //
+  // Before this, each column was an FFT over its own window's mean packet rate.
+  // Measured 2026-08-23, that rate moved 2.3x within fifteen seconds, so bins
+  // 0.07 Hz wide sat beside bins 1.0 Hz wide under a single axis label.
+  if (S.dopplerAxis !== d.fs_hz) {
+    heat.doppler.clear();
+    S.dopplerAxis = d.fs_hz;
+  }
 
   // One column per frame, quantised over a fixed dynamic range so the colour
   // means the same thing from frame to frame.
@@ -461,7 +580,6 @@ function renderDoppler(f) {
   // perfectly regular stream has CV 0, bursty ambient traffic sits near 0.6,
   // and pure Poisson arrivals reach 1.0, where the frequency axis stops being
   // quantitative.
-  const d = h.doppler;
   const m = h.metronome;
   // A metronomic source that loses whole slots has a high CV and a perfectly
   // usable axis: every surviving arrival is on grid, so nearest-neighbour
@@ -470,20 +588,47 @@ function renderDoppler(f) {
   // metronome verdict overrides the CV whenever there is one.
   const mv = metronomeVerdict(m);
   const quantised = mv === 'on grid';
-  const trust = quantised ? 'ok'
+  const gappy = d.gap_frac > 0.5;
+  const trust = gappy ? 'bad'
+    : quantised ? 'ok'
     : mv === 'deferred' ? 'warn'
     : d.arrival_cv > 1.2 ? 'bad' : d.arrival_cv > 0.5 ? 'warn' : 'ok';
+
+  // The speed axis is a headline only while it is a measurement. On an axis the
+  // sampling cannot support it is a number people quote, so it moves into the
+  // tooltip and the panel leads with the reason instead.
+  // A speed is a frequency times a shift. When nobody agrees on the frequency
+  // there is no speed to quote, whatever the sampling did.
+  const quantitative = trust === 'ok' && h.radio.freq_trusted;
+  const speed = quantitative
+    ? `±${fmt(d.max_speed_ms, 2)} m/s`
+    : '<span class="dim">speed not quantitative</span>';
+
   const flags = [];
   if (!d.conjugate_pair) flags.push('<span class="warn">CFO</span>');
   if (h.radio.freq_assumed) flags.push('<span class="warn">f assumed</span>');
+  if (!h.radio.freq_trusted) flags.push('<span class="bad">channel disputed</span>');
+  if (d.gap_frac > 0.02) {
+    flags.push(`<span class="${gappy ? 'bad' : 'warn'}">${(100 * d.gap_frac).toFixed(0)}% fill</span>`);
+  }
+
   readout('r-doppler',
-    `±${fmt(d.max_hz, 0)} Hz · ±${fmt(d.max_speed_ms, 2)} m/s · ` +
+    `±${fmt(d.max_hz, 0)} Hz · ${speed} · ` +
     `<span class="${trust}">CV ${fmt(d.arrival_cv, 2)}</span>` +
     (flags.length ? ' · ' + flags.join(' ') : ''),
     `Unambiguous range ±${fmt(d.max_hz, 0)} Hz, i.e. radial speeds up to ` +
     `±${fmt(d.max_speed_ms, 2)} m/s at ${fmt(h.radio.freq_mhz, 0)} MHz ` +
-    `(v = λ·f_D/2). Effective sample rate ${fmt(d.fs_hz, 0)} Hz from ` +
-    `${h.doppler.nfft}-point STFT. Packet arrivals have CV ${fmt(d.arrival_cv, 2)}. ` +
+    `(v = λ·f_D/2). ` +
+    `The axis is pinned at ${fmt(d.fs_hz, 0)} Hz and held across columns, so the ` +
+    'left of the image can be compared with the right; this window actually ' +
+    `delivered ${fmt(d.fs_window_hz, 0)} Hz. Each column is a ` +
+    `${d.nfft}-point transform over ${fmt(d.span_s, 1)} s. ` +
+    (d.gap_frac > 0.02
+      ? `${(100 * d.gap_frac).toFixed(0)}% of the resample grid had no packet near ` +
+        'it and was filled with the window mean, which contributes nothing — so ' +
+        'that share of the column is fill rather than evidence. '
+      : '') +
+    `Packet arrivals have CV ${fmt(d.arrival_cv, 2)}. ` +
     (quantised
       ? `The metronome panel puts this transmitter on a ${fmt(m.slot_us / 1000, 2)} ms ` +
         'grid, so despite that CV every surviving arrival is on grid and the ' +
@@ -493,15 +638,35 @@ function renderDoppler(f) {
         `${(100 * m.off_slot).toFixed(0)}% of arrivals deferred off it. The ` +
         'dropped slots resample cleanly; the deferred ones do not, so read the ' +
         'axis as approximate rather than either exact or worthless.'
-      : 'The axis assumes uniform sampling, so above ~1.2 treat it as ' +
-        'qualitative — throttle with radio.interval_us for a regular rate.') +
+      : 'The axis assumes even sampling, so above ~1.2 read this as a picture ' +
+        'rather than a measurement — throttle with radio.interval_us for a ' +
+        'regular rate.') +
     (d.conjugate_pair ? '' :
       ' No second chain, so the series still carries CFO and the line smears.') +
     (h.radio.freq_assumed ?
-      ' Centre frequency inferred from the channel number; pin it in the rail.' : ''));
+      ' Centre frequency inferred from the channel number; pin it in the rail.' : '') +
+    (h.radio.freq_trusted ? '' :
+      ` The records carry channel ${h.radio.channel} and csid says the radio is ` +
+      `tuned to channel ${h.radio.tuned_channel}. The speed axis is a function of ` +
+      'the centre frequency, so no speed is quoted until those agree — pin the ' +
+      'centre frequency in the rail if you know which is right.'));
 }
 
 // -- inter-arrival ------------------------------------------------------------
+
+/**
+ * Format a duration given in microseconds, choosing its own unit.
+ *
+ * The axis used to be labelled `µs` while its ticks read `147.0m`, which is
+ * both a wrong unit and an ambiguous one. Every tick now carries the unit it is
+ * actually in.
+ */
+function dur(us) {
+  if (!Number.isFinite(us)) return '—';
+  if (us >= 1e6) return (us / 1e6).toFixed(us >= 1e7 ? 0 : 1) + ' s';
+  if (us >= 1e3) return (us / 1e3).toFixed(us >= 1e4 ? 0 : 1) + ' ms';
+  return us.toFixed(us >= 100 ? 0 : 1) + ' µs';
+}
 
 function renderJitter(f) {
   const { h, a } = f;
@@ -509,34 +674,67 @@ function renderJitter(f) {
   const bins = a.interarrival_hist;
   if (!bins || !bins.length) return;
 
+  // LOG axis, because these gaps span decades and a linear one hides the
+  // structure this panel exists to show. Measured 2026-08-23: p50 236 µs
+  // against a maximum of 735 ms — three and a half decades, of which a linear
+  // plot rendered one spike in the first bin and forty-seven empty columns.
+  // The two modes it was hiding, a burst spacing and a between-burst gap, are
+  // exactly what separates a metronome losing slots from a source that is not
+  // a metronome. The server bins logarithmically to match.
+  const lo = Math.max(1, h.timing.hist_min_us);
+  const hi = Math.max(lo * 10, h.timing.hist_max_us);
+  const L = Math.log10(lo), Hi = Math.log10(hi);
   const top = Math.max(1, ...bins);
+
   p.begin({
-    x0: 0, x1: h.timing.hist_max_us, y0: 0, y1: top * 1.1,
-    xfmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 'm' : v.toFixed(0)),
+    x0: L, x1: Hi, y0: 0, y1: top * 1.1,
+    xticks: Math.max(1, Math.round(Hi - L)),
+    xfmt: (v) => dur(10 ** v),
     yfmt: (v) => v.toFixed(0),
   });
-  // Bars are indexed; map them onto the microsecond axis by hand.
-  const w = h.timing.hist_max_us / bins.length;
-  const xs = Array.from({ length: bins.length }, (_, i) => (i + 0.5) * w);
+
+  // Bars are indexed over log-spaced bins; place each at its own bin centre in
+  // log space so the widths are uniform on screen.
+  const step = (Hi - L) / bins.length;
   p.ctx.fillStyle = CATEGORICAL[0];
   const base = p.py(0);
   const bw = Math.max(1, (p.w - p.pad.l - p.pad.r) / bins.length - 1);
   bins.forEach((v, i) => {
+    if (!(v > 0)) return;
     const yy = p.py(v);
-    p.ctx.fillRect(p.px(xs[i]) - bw / 2, yy, bw, base - yy);
+    p.ctx.fillRect(p.px(L + (i + 0.5) * step) - bw / 2, yy, bw, base - yy);
   });
+
   const t = h.timing.ftm;
-  p.rule('x', t.p50_us, THEME.MUTED, `p50 ${fmt(t.p50_us)} µs`);
-  p.rule('x', t.p99_us, CATEGORICAL[3], `p99 ${fmt(t.p99_us)} µs`);
-  p.note('inter-arrival, µs →', 'bl');
+  const at = (us) => Math.log10(Math.min(hi, Math.max(lo, us)));
+  p.rule('x', at(t.p50_us), THEME.MUTED, `p50 ${dur(t.p50_us)}`);
+  p.rule('x', at(t.p99_us), CATEGORICAL[3], `p99 ${dur(t.p99_us)}`);
+  p.note('inter-arrival, log scale →', 'bl');
   p.end();
 
+  // Two modes decades apart is the signature of a bursty source, and it is why
+  // an inferred slot cannot be trusted. Naming it here saves the operator from
+  // deriving it from the metronome panel's silence.
+  const occupied = bins.reduce((n, v, i) => (v > top * 0.05 ? n.concat(i) : n), []);
+  const spread = occupied.length >= 2
+    ? (occupied[occupied.length - 1] - occupied[0]) * step
+    : 0;
+  const bursty = spread >= 1.5;
+
   readout('r-jitter',
-    `p50 ${fmt(t.p50_us)} · p99.9 ${fmt(t.p999_us)} µs`,
-    `Inter-arrival on the 320 MHz baseband clock: p50 ${fmt(t.p50_us)} µs, ` +
-    `p95 ${fmt(t.p95_us)}, p99 ${fmt(t.p99_us)}, p99.9 ${fmt(t.p999_us)}, ` +
-    `max ${fmt(t.max_us)}. CV ${fmt(t.cv, 2)}. Host-side delivery for the same ` +
-    `window: p50 ${fmt(h.timing.host.p50_us)} µs, p99.9 ${fmt(h.timing.host.p999_us)}.`);
+    `p50 ${dur(t.p50_us)} · p99.9 ${dur(t.p999_us)}` +
+    (bursty ? ' · <span class="warn">bursty</span>' : ''),
+    `Inter-arrival on the 320 MHz baseband clock: p50 ${dur(t.p50_us)}, ` +
+    `p95 ${dur(t.p95_us)}, p99 ${dur(t.p99_us)}, p99.9 ${dur(t.p999_us)}, ` +
+    `max ${dur(t.max_us)}. CV ${fmt(t.cv, 2)}. Host-side delivery for the same ` +
+    `window: p50 ${dur(h.timing.host.p50_us)}, p99.9 ${dur(h.timing.host.p999_us)}. ` +
+    (bursty
+      ? `The occupied bins span about ${spread.toFixed(1)} decades, so this source ` +
+        'is bursty rather than periodic: a short spacing inside a burst and a much ' +
+        'longer gap between bursts. A slot inferred from these arrivals lands on ' +
+        'the burst spacing and describes no rate at all, which is why the ' +
+        'metronome panel withholds a deficit.'
+      : 'The gaps occupy a narrow range, so a single rate describes them.'));
 }
 
 // -- clocks -------------------------------------------------------------------
@@ -598,11 +796,20 @@ function renderCapture(f) {
     return;
   }
 
-  const pct = c.yield_ratio === null || c.yield_ratio === undefined
-    ? '—' : (100 * c.yield_ratio).toFixed(1) + '%';
+  // TWO yields, and the tile shows the second.
+  //
+  // `yield_ratio` is records over frames the radio delivered — did we get a
+  // record. `useful_yield_ratio` is the same over records that carried a
+  // channel estimate — did we measure the channel. On this fleet they differ by
+  // fifteen points, and the tile used to show only the first: 98.4% in green
+  // over a stream in which one record in six was empty.
+  const asPct = (v) => (v === null || v === undefined ? '—' : (100 * v).toFixed(1) + '%');
+  const pct = asPct(c.yield_ratio);
+  const usefulPct = asPct(c.useful_yield_ratio);
   const cls = { ok: 'ok', low: 'warn', bad: 'bad' }[c.yield_verdict] || 'warn';
+  const emptyFrac = c.records > 0 ? c.empty_records / c.records : 0;
 
-  $('t-yield').textContent = c.stale ? '—' : pct;
+  $('t-yield').textContent = c.stale ? '—' : usefulPct;
   $('tile-yield').className = 'tile' + (c.stale ? '' :
     c.yield_verdict === 'ok' ? '' : c.yield_verdict === 'bad' ? ' alert' : ' warn');
 
@@ -614,7 +821,13 @@ function renderCapture(f) {
 
   const rows = [
     ['capture yield', `<span class="${cls}">${pct} · ${c.yield_verdict}</span>`],
+    ['useful yield', `<span class="${emptyFrac > 0.05 ? 'warn' : 'ok'}">${usefulPct}</span>` +
+      ' <span class="dim">records that measured something</span>'],
     ['records / frames', `${c.records.toLocaleString()} / ${c.frames_seen.toLocaleString()}`],
+    ['empty records', c.empty_records
+      ? `<span class="${emptyFrac > 0.05 ? 'warn' : ''}">${c.empty_records.toLocaleString()}` +
+        ` · ${(100 * emptyFrac).toFixed(1)}% of records</span>`
+      : '<span class="ok">none</span>'],
     ['state', c.stale
       ? `<span class="bad">${c.state} — ${fmt(c.age_s, 0)} s stale</span>`
       : `<span class="ok">${c.state}</span>`],
@@ -644,11 +857,19 @@ function renderCapture(f) {
       'so these numbers describe a capture that may already have stopped.'
     : (c.yield_note || 'Yield is what this band gives.');
 
-  readout('r-capture', `${c.yield_verdict} · ${pct}`,
+  readout('r-capture', `${c.yield_verdict} · ${usefulPct}`,
     `Capture yield is records / frames_seen: ${c.records} of ${c.frames_seen} ` +
-    'frames became a channel estimate. The denominator comes from csid\'s ' +
-    'status file and exists nowhere in the live stream, which is why an empty ' +
-    'waterfall used to be unreadable. ' + (c.yield_note || ''));
+    `frames produced a record, which is ${pct}. The denominator comes from ` +
+    'csid\'s status file and exists nowhere in the live stream, which is why an ' +
+    'empty waterfall used to be unreadable. ' +
+    (c.empty_records
+      ? `Of those records ${c.empty_records} — ${(100 * emptyFrac).toFixed(1)}% — ` +
+        'arrived with an all-zero I/Q matrix: delivered, correctly sized, and ' +
+        `carrying no channel estimate. The useful yield is therefore ${usefulPct}, ` +
+        'and that is the number the tile shows and the one to quote for a corpus ' +
+        'size. '
+      : 'Every record carried a channel estimate. ') +
+    (c.yield_note || ''));
 }
 
 // -- the metronome ------------------------------------------------------------
@@ -668,15 +889,40 @@ function renderMetronome(f) {
   const p = panels.metronome;
   const m = h.metronome;
   const bins = a.metronome_multiples;
+  const verdict = metronomeVerdict(m);
 
-  if (!m || !bins || !bins.length || !(m.slot_us > 0)) {
+  // Nothing periodic here, so nothing in this struct describes the source —
+  // which is what `dsp::Metronome::verdict` has always said about `irregular`,
+  // and what this panel used to ignore. It printed the inferred slot, a
+  // commanded rate derived from it and a delivery deficit, in red, against a
+  // rate nobody had commanded. Measured 2026-08-23: a slot of 0.16 ms, a
+  // "commanded" 6305 Hz and a 99.4% deficit, permanently, on all four nodes,
+  // for a source configured at 25 Hz with no throttle at all.
+  //
+  // The server now withholds the deficit in exactly this case, so the absence
+  // is a fact on the wire rather than a decision taken twice.
+  if (!m || !(m.slot_us > 0) || verdict === 'irregular' || m.deficit === null) {
     p.begin({ x0: 0, x1: 1, y0: 0, y1: 1, xticks: 1, yticks: 1 });
-    p.note(m && m.n_gaps < 8 ? 'not enough arrivals yet' : 'no slot — this transmitter is not periodic', 'tl');
+    p.note(m && m.n_gaps < 8
+      ? 'not enough arrivals yet'
+      : 'not a metronome — no slot to measure against', 'tl');
     p.end();
-    readout('r-metronome', '<span class="dim">no slot</span>',
-      'No nominal slot could be established for this transmitter, so there is ' +
-      'nothing to measure a deficit against. That is the expected reading for ' +
-      'ambient traffic, which arrives when somebody transmits.');
+
+    const why = !m || !(m.slot_us > 0)
+      ? 'No nominal slot could be established for this transmitter, so there is ' +
+        'nothing to measure a deficit against. That is the expected reading for ' +
+        'ambient traffic, which arrives when somebody transmits.'
+      : `A slot of ${fmt(m.slot_us / 1000, 2)} ms was inferred from the arrivals, ` +
+        `but only ${(100 * m.exact_slot).toFixed(0)}% of gaps land on a multiple ` +
+        `of it and ${(100 * m.off_slot).toFixed(0)}% are off the grid entirely. ` +
+        'This source is not periodic, so the inferred slot describes a burst ' +
+        'spacing rather than a rate, and no deficit is reported against it. ' +
+        'Look at the inter-arrival panel: two modes decades apart is what this ' +
+        'looks like. Set radio.interval_us to have a rate declared, and the ' +
+        'deficit becomes a real measurement whatever the arrivals do.';
+    readout('r-metronome',
+      `<span class="dim">${verdict === 'irregular' ? 'irregular' : 'no slot'}</span>`,
+      why);
     $('t-deficit').textContent = '—';
     $('tile-deficit').className = 'tile';
     return;
@@ -701,6 +947,9 @@ function renderMetronome(f) {
   }
   p.note('slot multiples — 1× arrived, k× lost k−1 slots', 'bl');
   p.note(`${fmt(m.delivered_hz)} / ${fmt(m.commanded_hz)} Hz`, 'tl');
+  // The last bin is an overflow, not a multiple of sixteen. Saying so stops it
+  // being read as a population of gaps that are exactly 16 slots long.
+  if (bins[bins.length - 1] > 0.01) p.note(`${bins.length}× is ≥, not =`, 'br');
   p.end();
 
   const deficit = (100 * m.deficit).toFixed(1) + '%';
@@ -708,9 +957,8 @@ function renderMetronome(f) {
   $('tile-deficit').className = 'tile' +
     (m.deficit > 0.2 ? ' alert' : m.deficit > 0.05 ? ' warn' : '');
 
-  // Three verdicts, because the two measured arms show three mechanisms.
-  const verdict = metronomeVerdict(m);
-  const verdictCls = { 'on grid': 'ok', deferred: 'warn', irregular: 'bad' }[verdict] || 'warn';
+  // Two verdicts reach here; `irregular` returned above.
+  const verdictCls = { 'on grid': 'ok', deferred: 'warn' }[verdict] || 'warn';
   const explain = {
     'on grid':
       'Every surviving arrival sits on a multiple of the slot, so the missing ' +
@@ -723,9 +971,6 @@ function renderMetronome(f) {
       'CSMA/CA: the radio waits for a clear channel, so a frame is not merely ' +
       'dropped, it is delayed by a random backoff. Two mechanisms, not one, and ' +
       'only the dropped half resamples cleanly.',
-    irregular:
-      'The gaps do not land on a grid at all, so this source is not a metronome ' +
-      'and the Doppler axis is qualitative.',
   }[verdict] || '';
 
   readout('r-metronome',
@@ -895,6 +1140,7 @@ function renderRatio(f) {
 function renderToneStats(f) {
   const { h, a } = f;
   const p = panels.tonestats;
+  if (blanked(p, 'r-tonestats', f.h, 'the per-tone statistics')) return;
   const spread = a.tone_spread_db;
   const nulls = a.tone_null_frac;
   if (!spread || !spread.length) return;
@@ -905,12 +1151,16 @@ function renderToneStats(f) {
 
   // Nulled tones first, as background: they are an absence of measurement, not
   // a very steady one, and drawing them as zero spread would say the opposite.
+  // Shaded in proportion, not past a threshold. The old form drew a tone only
+  // when it was null in MORE THAN HALF the window, so a band-wide null rate of
+  // 11–23% — which is what the fleet actually delivers — drew nothing at all
+  // and the readout said "0 nulled". A threshold answers "is this tone always
+  // dead"; the question the operator has is "how much of this tone is missing".
   if (nulls && nulls.length === spread.length) {
-    p.ctx.fillStyle = 'rgba(125,135,148,0.22)';
     for (let i = 0; i < nulls.length; i++) {
-      if (nulls[i] > 0.5) {
-        p.ctx.fillRect(p.px(i) - 1.5, p.pad.t, 3, p.h - p.pad.t - p.pad.b);
-      }
+      if (!(nulls[i] > 0.01)) continue;
+      p.ctx.fillStyle = `rgba(125,135,148,${(0.12 + 0.6 * nulls[i]).toFixed(3)})`;
+      p.ctx.fillRect(p.px(i) - 1.5, p.pad.t, 3, p.h - p.pad.t - p.pad.b);
     }
   }
   p.seriesY(spread, CATEGORICAL[0], 1.3);
@@ -923,16 +1173,26 @@ function renderToneStats(f) {
   p.note('temporal spread, dB (1σ over the window)', 'tl');
   p.end();
 
+  // The band-wide mean, as a number. A shading intensity is a hint; this is the
+  // fact, and it is the one that was invisible.
+  const meanNull = nulls && nulls.length
+    ? nulls.reduce((x, y) => x + y, 0) / nulls.length
+    : 0;
+  const nullTxt = meanNull > 0.005
+    ? ` · <span class="${meanNull > 0.1 ? 'warn' : ''}">${(100 * meanNull).toFixed(0)}% null</span>`
+    : '';
   readout('r-tonestats',
-    `max ${fmt(st.max_spread_db)} dB @ #${st.max_spread_tone} · ` +
-    `${st.null_tones} nulled · ${st.n} cols`,
+    `max ${fmt(st.max_spread_db)} dB @ #${st.max_spread_tone}${nullTxt} · ${st.n} cols`,
     `Per-tone standard deviation of |H| in dB over ${st.n} decimated columns. ` +
     'Reported in dB rather than as a coefficient of variation, because a CV of ' +
     'a logarithmic quantity is not a CV of the amplitude underneath it — for ' +
     `small excursions CV ≈ spread/8.686, so ${fmt(st.max_spread_db)} dB is about ` +
-    `${fmt(st.max_spread_db / 8.686, 3)}. Grey bars are nulled tones: an absence ` +
-    'of measurement, excluded from every statistic here. Watch the outer three ' +
-    'tones — the ABBA probe put 55% of its spurious events there.');
+    `${fmt(st.max_spread_db / 8.686, 3)}. ` +
+    `Grey shading is each tone's null share, ${(100 * meanNull).toFixed(1)}% across ` +
+    `the band and total on ${st.null_tones} tone${st.null_tones === 1 ? '' : 's'}. ` +
+    'A null is an absence of measurement, not a very steady one, and every ' +
+    'statistic here excludes it. Watch the outer three tones — the ABBA probe ' +
+    'put 55% of its spurious events there.');
 }
 
 // -- tables -------------------------------------------------------------------
@@ -1007,10 +1267,19 @@ function renderTables(f) {
     mixRows(h.mix.width, 'width');
 
   const v = h.validation;
+  const nulls = h.nulls || { dropped: 0, considered: 0, frac: 0 };
   const verdict = (ok, text) => `<span class="${ok ? 'ok' : 'warn'}">${text}</span>`;
+  const na = (why) => `<span class="dim">n/a — ${why}</span>`;
   kv($('tbl-validation'), [
     ['payload matches header', verdict(v.dimensions_ok, v.dimensions_ok ? 'yes' : 'NO — ABI drift?')],
-    ['DC suppression', verdict(v.dc_notch_db < -3, fmt(v.dc_notch_db) + ' dB')],
+    // Null means the delivered tone set has no DC bin, which is every 802.11
+    // used-tone set. The check used to run anyway, on the two data tones either
+    // side of centre, and therefore failed on every node of this fleet forever:
+    // measured 2026-08-23 it read between −1.3 and +7.9 dB against a threshold
+    // of −3. A check that cannot pass is not a check.
+    ['DC suppression', v.dc_notch_db === null || v.dc_notch_db === undefined
+      ? na('this tone grid has no DC bin')
+      : verdict(v.dc_notch_db < -3, fmt(v.dc_notch_db) + ' dB')],
     ['band-edge roll-off', verdict(v.edge_rolloff_db < -1, fmt(v.edge_rolloff_db) + ' dB')],
     ['chain amplitude spread', `<span class="dim">${fmt(v.chain_spread_db)} dB</span>`],
     ['chains are distinct', v.chain_identical === null || v.chain_identical === undefined
@@ -1019,8 +1288,17 @@ function renderTables(f) {
           v.chain_identical > 0.99
             ? 'NO — chains are copies'
             : `yes (${(100 * v.chain_identical).toFixed(1)}% identical)`)],
-    ['exactly-zero coefficients', verdict(v.zero_fraction < 0.2,
+    // TWO scopes, because they answer different questions and the panel used to
+    // answer only the narrow one. `zero_fraction` is this record; the window
+    // share is the stream. Reading 0.0% in green while one record in six was
+    // entirely zero is what a single-record check looks like when it is
+    // presented as a property of the capture.
+    ['zero coefficients, this record', verdict(v.zero_fraction < 0.2,
       (100 * v.zero_fraction).toFixed(1) + '%')],
+    ['empty records, this window', nulls.considered
+      ? verdict(nulls.frac < 0.02,
+          `${nulls.dropped} of ${nulls.considered} · ${(100 * nulls.frac).toFixed(1)}%`)
+      : '<span class="dim">—</span>'],
   ]);
 
   const s = h.stream;
@@ -1045,6 +1323,17 @@ function renderStrip(f) {
   // Rate is for the selected class, which is the rate of the thing on screen —
   // not the channel's total, which is in the CSI-mix panel.
   $('t-rate').textContent = fmt(t.rate_hz, 0) + ' Hz';
+
+  // The window's own empty share, beside the yield. The yield is what csid saw
+  // over the whole session; this is what the analysis on screen right now had
+  // to throw away.
+  const nulls = h.nulls || { dropped: 0, considered: 0, frac: 0 };
+  $('t-empty').textContent = nulls.considered
+    ? `${(100 * nulls.frac).toFixed(0)}%`
+    : '—';
+  $('tile-empty').className = 'tile' +
+    (nulls.no_measurement ? ' alert' : nulls.frac > 0.05 ? ' warn' : '');
+
   $('t-class').textContent =
     `${h.class.label} ${(100 * h.class.share).toFixed(0)}%`;
   $('t-mimo').textContent = `${h.geometry.nrx}×${h.geometry.ntx}`;
@@ -1060,13 +1349,21 @@ function renderStrip(f) {
   $('t-bundle').textContent = fmt(h.bundle.width_db) + ' dB';
   $('t-records').textContent = h.stream.received.toLocaleString();
 
-  $('t-class').parentElement.classList.toggle('alert', !h.geometry.dimensions_ok);
+  $('t-class').parentElement.classList.toggle('alert',
+    !h.geometry.dimensions_ok || h.radio.channel_mismatch);
   $('t-class').parentElement.classList.toggle('warn', h.class.pinned);
 
+  // The channel, and the disagreement about it when there is one. This is the
+  // one line always on screen, so it is where a capture on a channel nobody
+  // agrees on has to be visible.
+  const ch = h.radio.channel_mismatch
+    ? `ch ${h.radio.channel} (csid says ${h.radio.tuned_channel}) `
+    : `ch ${h.radio.channel} `;
   $('s-session').textContent =
-    `session ${h.record.session_uid} · ch ${h.radio.channel} ` +
+    `session ${h.record.session_uid} · ${ch}` +
     `${h.radio.width} · ${h.geometry.ntone} tones over ${fmt(h.radio.bw_mhz, 1)} MHz ` +
     `· ${(h.radio.spacing_hz / 1000).toFixed(3)} kHz spacing`;
+  $('s-session').className = h.radio.channel_mismatch ? 'bad' : '';
   // Two scopes sit between the requested window and the one under the plots,
   // and both shrink it. A Doppler spectrogram computed over 139 records when
   // 256 were asked for is a different measurement, so the narrowing is stated
@@ -1151,8 +1448,9 @@ function connect() {
         S.settings = m.settings;
         $('s-source').textContent = m.source;
         $('s-version').textContent = `csiscope ${m.csiscope_version} · csid ${m.csid_version}`;
-        $('s-mode').textContent = m.read_only ? 'READ-ONLY' : '';
-        document.body.classList.toggle('read-only', m.read_only);
+        // Stated once, and always true: the console serves no route that
+        // mutates anything. See `server.rs`.
+        $('s-mode').textContent = 'READ-ONLY';
         syncControls();
       } else if (m.t === 'settings') {
         S.settings = m.settings;
@@ -1177,7 +1475,7 @@ function connect() {
  * Scale the waterfall to the signal the first time a given geometry/chain is
  * seen.
  *
- * |H| is AGC-normalised, so its absolute level depends on the radio's gain
+ * |H| is AGC-relative, so its absolute level depends on the radio's gain
  * state, not on a number anyone can predict. A fixed default colour window
  * therefore saturates or blacks out on first contact, which looks like a bug.
  * The operator's own choice always wins: touching a dB slider disables this.
@@ -1392,319 +1690,41 @@ function wireTabs() {
       document.querySelectorAll('.tab').forEach((t) =>
         t.classList.toggle('on', t.id === `tab-${b.dataset.tab}`));
       document.body.classList.toggle('no-rail', b.dataset.tab !== 'scope');
-      if (b.dataset.tab === 'config') loadConfig();
-      if (b.dataset.tab === 'sessions') loadSessions();
       if (b.dataset.tab === 'node') loadNode();
       if (b.dataset.tab === 'scope') scheduleRender();
     };
   });
 }
 
-// ------------------------------------------------------------------- config
+// --------------------------------------------------------------------- node
+//
+// Read-only, and there is nothing here that could be otherwise: the console
+// serves no route that mutates anything. What this tab does is describe the
+// host — versions, kernel, capability envelope, the experiment profiles
+// deployed to it and the state of their units — plus two diagnostics that read
+// and change nothing, the journal and `csid doctor`.
 
-const NEW_EXPERIMENT = `# A new capture experiment. Validated against the same rules
-# \`csid validate\` applies, before it is written.
-tag = "describe what this run is for"
-
-[radio]
-interface   = "wlp1s0"
-monitor     = "wlp1s0mon0"
-channel     = 36
-width       = "80MHz"
-interval_us = 0          # 0 = unthrottled; 10000 caps at ~88 Hz
-mac_filter  = []
-
-[capture]
-mode     = "passive"
-duration = "60s"
-
-[stream]
-enabled     = true
-transport   = "unix"
-unix_socket = "/run/csid/live.sock"
-max_queue   = 4096
-
-[export]
-on_close = true
-`;
-
-async function loadConfig() {
-  try {
-    S.overview = await api('/api/overview');
-  } catch (e) {
-    toast(e.message, true);
-    return;
-  }
-  S.experiments = S.overview.experiments;
-  const units = Object.fromEntries(S.overview.units.map((u) => [u.unit, u]));
-
-  table($('tbl-experiments'),
-    [
-      { label: 'experiment', get: (r) => r.name, mono: true },
-      {
-        label: 'radio',
-        mono: true,
-        get: (r) => r.tuning
-          ? `ch${r.config.radio.channel} ${r.tuning.width}`
-          : '<span class="bad pill">invalid</span>',
-      },
-      { label: 'state', get: (r) => unitCell(units[`csid@${r.name}.service`]) },
-    ],
-    S.experiments,
-    { click: (r) => openExperiment(r.name) });
-
-  renderUnits(S.overview.units);
-
-  const g = S.overview.global;
-  kv($('tbl-node-config'), [
-    ['path', S.overview.config_path],
-    ['spool', g.node.spool],
-    ['hostname', g.node.hostname || S.overview.hostname || '—'],
-    ['sync', g.sync.enabled ? `${g.sync.remote}:${g.sync.bucket}/${g.sync.prefix}` : 'disabled'],
-    // `sync.prune_after_days` is deliberately NOT shown. It is parsed and
-    // ignored (see SyncConfig), while the retention that actually runs lives in
-    // csid-prune's systemd environment. Showing it meant the only retention
-    // number an operator could read was the one with no effect — which is how a
-    // spool that kept every capture.csiq forever looked correctly configured.
-    ['otel', g.otel.enabled ? g.otel.endpoint : 'disabled'],
-    ['driver oui', '0x' + g.driver.vendor_oui.toString(16).padStart(6, '0')],
-    ['csi subcmd', '0x' + g.driver.csi_event_subcmd.toString(16)],
-    ['hdr / data attr',
-      '0x' + g.driver.attr_csi_hdr.toString(16) + ' / 0x' + g.driver.attr_csi_data.toString(16)],
-  ]);
-
-  // Pin the Doppler axis to whatever is actually running, so the speed scale
-  // is exact rather than inferred.
-  const running = S.experiments.find(
-    (r) => units[`csid@${r.name}.service`]?.active_state === 'active');
-  if (running?.tuning && S.settings && S.settings.freq_mhz === null) {
-    push({ freq_mhz: running.tuning.control_freq_mhz });
-  }
-
-  const sel = $('c-journal-unit');
-  sel.innerHTML = S.overview.units.map((u) => `<option>${u.unit}</option>`).join('');
-}
+const UNIT_STATE = {
+  active: 'ok',
+  activating: 'warn',
+  deactivating: 'warn',
+  failed: 'bad',
+  inactive: 'dim',
+};
 
 function unitCell(u) {
   if (!u) return '<span class="dim">—</span>';
-  if (!u.available || u.load_state === 'not-found') return '<span class="dim">no unit</span>';
-  const cls = u.active_state === 'active' ? 'ok'
-    : u.active_state === 'failed' ? 'bad' : 'dim';
-  return `<span class="${cls}">${u.active_state}/${u.sub_state}</span>`;
+  if (!u.available) return '<span class="dim">no systemd</span>';
+  const cls = UNIT_STATE[u.active_state] || 'dim';
+  const sub = u.sub_state && u.sub_state !== u.active_state ? ` (${u.sub_state})` : '';
+  return `<span class="${cls}">${u.active_state}${sub}</span>`;
 }
-
-function renderUnits(units) {
-  table($('tbl-units'),
-    [
-      { label: 'unit', get: (u) => u.unit, mono: true },
-      { label: 'state', get: (u) => unitCell(u) },
-      { label: 'result', get: (u) => u.result || '—' },
-      { label: 'pid', num: true, get: (u) => (u.main_pid && u.main_pid !== '0' ? u.main_pid : '—') },
-      {
-        label: '',
-        get: (u) => ['start', 'stop', 'restart']
-          .map((a) => `<button data-u="${u.unit}" data-a="${a}">${a}</button>`).join(' '),
-      },
-    ],
-    units);
-  $('tbl-units').querySelectorAll('button[data-u]').forEach((b) => {
-    b.onclick = async () => {
-      try {
-        const r = await post(`/api/units/${encodeURIComponent(b.dataset.u)}/${b.dataset.a}`);
-        toast(`${b.dataset.a} ${b.dataset.u}: ${r.status.active_state}/${r.status.sub_state}` +
-          (r.run.ok ? '' : `\n${r.run.stderr.trim()}`), !r.run.ok);
-        setTimeout(loadConfig, 700);
-      } catch (e) { toast(e.message, true); }
-    };
-  });
-}
-
-async function openExperiment(name) {
-  try {
-    const e = await api(`/api/experiments/${encodeURIComponent(name)}`);
-    S.editing = { kind: 'experiment', name };
-    $('editor-title').textContent = `Experiment · ${name}`;
-    $('editor-path').textContent = e.path;
-    $('editor').value = e.toml;
-    $('btn-delete').disabled = false;
-    showCheck(e);
-  } catch (err) { toast(err.message, true); }
-}
-
-async function openGlobal() {
-  try {
-    const c = await api('/api/config');
-    S.editing = { kind: 'global' };
-    $('editor-title').textContent = 'Node configuration';
-    $('editor-path').textContent = c.path;
-    $('editor').value = c.toml;
-    $('btn-delete').disabled = true;
-    showCheck(c.check);
-  } catch (err) { toast(err.message, true); }
-}
-
-function showCheck(c) {
-  const v = $('editor-verdict');
-  if (c.valid) {
-    v.className = 'verdict ok';
-    v.textContent = 'valid — csid would accept this configuration';
-  } else {
-    v.className = 'verdict bad';
-    v.textContent = c.error || 'invalid';
-  }
-  const t = c.tuning;
-  kv($('tbl-tuning'), t ? [
-    ['band', t.band],
-    ['control frequency', `${t.control_freq_mhz} MHz`],
-    ['centre frequency', t.center_freq_mhz ? `${t.center_freq_mhz} MHz`
-      : 'not required at this width'],
-    ['width', t.width],
-    ['rate cap', t.interval_us ? `${t.interval_us} µs → ~${fmt(t.interval_rate_hz)} Hz`
-      : 'unthrottled'],
-    ['duration', t.duration_s ? `${t.duration_s} s` : 'until stopped'],
-    ['live stream', t.stream || 'disabled'],
-    ['csiq on close', t.export_on_close ? 'yes' : 'no'],
-  ] : [['—', 'no tuning resolved']]);
-}
-
-function wireConfig() {
-  $('btn-edit-global').onclick = openGlobal;
-
-  $('btn-new-exp').onclick = () => {
-    const name = $('new-exp-name').value.trim();
-    if (!name) return;
-    S.editing = { kind: 'experiment', name };
-    $('editor-title').textContent = `Experiment · ${name} (new)`;
-    $('editor-path').textContent = `${S.overview?.experiment_dir || ''}/${name}.toml`;
-    $('editor').value = NEW_EXPERIMENT;
-    $('btn-delete').disabled = true;
-    validateEditor();
-  };
-
-  $('btn-validate').onclick = validateEditor;
-
-  $('btn-save').onclick = async () => {
-    if (!S.editing) return toast('nothing open in the editor', true);
-    const toml = $('editor').value;
-    try {
-      const r = S.editing.kind === 'global'
-        ? await api('/api/config', {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ toml }),
-          })
-        : await api(`/api/experiments/${encodeURIComponent(S.editing.name)}`, {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ toml }),
-          });
-      showCheck(r.check);
-      toast('written');
-      loadConfig();
-    } catch (e) { toast(e.message, true); }
-  };
-
-  $('btn-delete').onclick = async () => {
-    if (!S.editing || S.editing.kind !== 'experiment') return;
-    if (!confirm(`Delete experiment ${S.editing.name}?`)) return;
-    try {
-      await api(`/api/experiments/${encodeURIComponent(S.editing.name)}`, { method: 'DELETE' });
-      toast('deleted');
-      $('editor').value = '';
-      S.editing = null;
-      loadConfig();
-    } catch (e) { toast(e.message, true); }
-  };
-
-  // Validate as you type, debounced — the same check the save path runs.
-  let timer = null;
-  $('editor').addEventListener('input', () => {
-    clearTimeout(timer);
-    timer = setTimeout(validateEditor, 350);
-  });
-
-  $('btn-journal').onclick = async () => {
-    try {
-      const r = await api(`/api/journal?unit=${encodeURIComponent($('c-journal-unit').value)}&lines=300`);
-      $('journal-out').textContent = r.text || '(nothing)';
-    } catch (e) { toast(e.message, true); }
-  };
-}
-
-async function validateEditor() {
-  if (!S.editing) return;
-  const toml = $('editor').value;
-  try {
-    if (S.editing.kind === 'global') {
-      // The node config has no radio to resolve, so its check is a parse.
-      const r = await api('/api/config');
-      showCheck(r.check);
-      return;
-    }
-    showCheck(await post(`/api/experiments/${encodeURIComponent(S.editing.name)}/validate`, { toml }));
-  } catch (e) { toast(e.message, true); }
-}
-
-/** Add a MAC seen in the talker table to the open experiment's filter. */
-function pinMacFilter(mac) {
-  if (!S.editing || S.editing.kind !== 'experiment') {
-    toast('open an experiment in the Config tab first, then pin a MAC', true);
-    return;
-  }
-  const text = $('editor').value;
-  const m = text.match(/^\s*mac_filter\s*=\s*\[(.*)\]\s*$/m);
-  if (!m) { toast('no mac_filter line to update', true); return; }
-  if (m[1].includes(mac)) { toast(`${mac} is already filtered`); return; }
-  const existing = m[1].trim() ? m[1].trim() + ', ' : '';
-  $('editor').value = text.replace(m[0], `mac_filter  = [${existing}"${mac}"]`);
-  validateEditor();
-  toast(`${mac} added to mac_filter — save, then restart the unit`);
-}
-
-// ----------------------------------------------------------------- sessions
-
-async function loadSessions() {
-  try {
-    const r = await api('/api/sessions');
-    S.sessions = r.sessions;
-    $('spool-path').textContent = r.spool;
-    table($('tbl-sessions'),
-      [
-        { label: 'session', get: (s) => s.id, mono: true },
-        { label: 'status', get: (s) => statusCell(s.sidecar?.status) },
-        { label: 'records', num: true, get: (s) => s.sidecar?.summary?.records?.toLocaleString() },
-        { label: 'rate', num: true, get: (s) => fmt(s.sidecar?.summary?.mean_rate_hz) + ' Hz' },
-        { label: 'tones', get: (s) => (s.sidecar?.summary?.tone_counts || []).join(', ') },
-        { label: 'raw', num: true, get: (s) => bytes(s.raw_bytes) },
-        { label: 'csiq', num: true, get: (s) => (s.csiq_bytes ? bytes(s.csiq_bytes) : '—') },
-        { label: '', get: (s) => `<button data-x="${s.id}">export</button>` },
-      ],
-      S.sessions,
-      { click: (s) => { $('sidecar-out').textContent = JSON.stringify(s.sidecar, null, 2); } });
-    $('tbl-sessions').querySelectorAll('button[data-x]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        try {
-          const r = await post(`/api/sessions/${encodeURIComponent(b.dataset.x)}/export`);
-          toast(r.ok ? r.stdout.trim() : r.stderr.trim(), !r.ok);
-          loadSessions();
-        } catch (e) { toast(e.message, true); } finally { b.disabled = false; }
-      };
-    });
-  } catch (e) { toast(e.message, true); }
-}
-
-function statusCell(s) {
-  const cls = { complete: 'ok', capturing: 'ok', stopped: 'warn', failed: 'bad' }[s] || 'dim';
-  return `<span class="${cls}">${s || 'unknown'}</span>`;
-}
-
-// --------------------------------------------------------------------- node
 
 async function loadNode() {
   try {
     const [o, caps] = await Promise.all([api('/api/overview'), api('/api/caps')]);
     S.overview = o;
+
     kv($('tbl-node'), [
       ['hostname', o.hostname || '—'],
       ['kernel', o.kernel || '—'],
@@ -1713,10 +1733,13 @@ async function loadNode() {
       ['live source', o.source],
       ['config', o.config_path],
       ['experiments', o.experiment_dir],
-      ['mode', o.read_only ? '<span class="warn">read-only</span>' : 'read-write'],
+      ['default interface', o.interface],
+      ['console', '<span class="ok">read-only</span>'],
       ['csid on PATH', o.helpers.csid ? '<span class="ok">yes</span>' : '<span class="bad">no</span>'],
       ['systemd', o.helpers.systemctl ? '<span class="ok">yes</span>' : '<span class="warn">absent</span>'],
+      ['journal', o.helpers.journalctl ? '<span class="ok">yes</span>' : '<span class="warn">absent</span>'],
     ]);
+
     kv($('tbl-caps'), [
       ['tone counts', caps.tone_counts.join(', ')],
       ['max MIMO', caps.max_mimo],
@@ -1726,11 +1749,60 @@ async function loadNode() {
       ['ftm wrap', `${caps.ftm_wrap_seconds.toFixed(2)} s`],
     ]);
     $('caps-notes').innerHTML = caps.notes.map((n) => `<li>${n}</li>`).join('');
+
+    // Experiments and their units, joined by name. The overview returns them in
+    // the same order, but joining on the unit name rather than the index means a
+    // future divergence shows as a blank cell instead of a wrong one.
+    const units = new Map((o.units || []).map((u) => [u.unit, u]));
+    table($('tbl-experiments'), [
+      { label: 'experiment', get: (e) => e.name, mono: true },
+      { label: 'tag', get: (e) => e.config?.tag || '<span class="dim">—</span>' },
+      {
+        label: 'tuning',
+        get: (e) => (e.tuning
+          ? `ch ${e.config?.radio?.channel ?? '?'} · ${e.tuning.width} · ${e.tuning.band} GHz`
+          : `<span class="bad">${e.error || 'invalid'}</span>`),
+        mono: true,
+      },
+      {
+        label: 'rate',
+        num: true,
+        mono: true,
+        get: (e) => (e.tuning?.interval_rate_hz
+          ? `${e.tuning.interval_rate_hz.toFixed(0)} Hz`
+          : '<span class="dim">unthrottled</span>'),
+      },
+      {
+        label: 'duration',
+        num: true,
+        mono: true,
+        get: (e) => (e.tuning?.duration_s ? `${e.tuning.duration_s} s` : '<span class="dim">open</span>'),
+      },
+      { label: 'unit', get: (e) => unitCell(units.get(`csid@${e.name}.service`)) },
+    ], o.experiments || []);
+
+    const sel = $('c-journal-unit');
+    const names = (o.experiments || []).map((e) => `csid@${e.name}.service`);
+    for (const extra of ['csid-sync.timer', 'csid-prune.timer']) names.push(extra);
+    const keep = sel.value;
+    sel.innerHTML = names.map((n) => `<option value="${n}">${n}</option>`).join('');
+    if (names.includes(keep)) sel.value = keep;
+
     if (!$('c-doctor-iface').value) $('c-doctor-iface').value = o.interface;
   } catch (e) { toast(e.message, true); }
 }
 
 function wireNode() {
+  $('btn-journal').onclick = async () => {
+    const unit = $('c-journal-unit').value;
+    if (!unit) return;
+    $('journal-out').textContent = 'reading…';
+    try {
+      const r = await api(`/api/journal?unit=${encodeURIComponent(unit)}&lines=300`);
+      $('journal-out').textContent = r.text || '(nothing in the journal for this unit)';
+    } catch (e) { $('journal-out').textContent = e.message; }
+  };
+
   $('btn-doctor').onclick = async () => {
     $('doctor-out').textContent = 'running…';
     try {
@@ -1746,8 +1818,6 @@ function wireNode() {
 setupPanels();
 wireRail();
 wireTabs();
-wireConfig();
 wireNode();
 connect();
 new ResizeObserver(() => scheduleRender()).observe(document.body);
-loadConfig().catch(() => {});

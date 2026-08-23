@@ -3,7 +3,7 @@
 //! Each function here corresponds to a representation the Wi-Fi sensing
 //! literature actually uses, and the comments name which one, because "plot the
 //! CSI" is under-specified: raw phase is meaningless without sanitisation, raw
-//! amplitude is AGC-normalised, and a Doppler axis is a lie unless you say what
+//! amplitude is AGC-relative, and a Doppler axis is a lie unless you say what
 //! sample rate produced it.
 //!
 //! | Function | Representation | Grounding |
@@ -15,9 +15,14 @@
 //! | [`doppler`] | Doppler spectrogram column | Li et al. 2022 (STFT); Zheng et al. 2019 (conjugate multiplication) |
 //! | [`Validation`] | sanity checks on the extraction itself | Gringoli et al. 2019 §"Crime Scene Investigation" |
 //!
-//! **Amplitude is AGC-normalised** (see `csid caps`): `|H|` carries channel
-//! *shape*, not absolute scale. Every amplitude view is therefore relative, and
-//! the absolute anchor is the per-chain RSSI reported alongside it.
+//! **Amplitude is AGC-RELATIVE, not AGC-normalised** (see `csid caps`). Nothing
+//! in this pipeline divides the gain out: `|H|` carries the receiver's own gain
+//! setting alongside the channel, and two frames of an unchanged channel can
+//! differ by several dB because the radio re-ranged (Xie et al. 2015 measured
+//! 7 dB between two traces of one band). So every amplitude view reports
+//! *shape*, the absolute anchor is the per-chain RSSI reported beside it, and
+//! the panels say "AGC-relative" — the older wording claimed a correction that
+//! was never applied.
 //!
 //! ## Two forms of every kernel
 //!
@@ -185,6 +190,46 @@ impl Geometry {
         let tx = chain % self.ntx.max(1);
         format!("rx{rx}·tx{tx}")
     }
+}
+
+/// Does this record carry a channel estimate at all?
+///
+/// ## The one policy, in one place
+///
+/// A record can arrive with an intact header, a payload of exactly the declared
+/// length, a plausible RSSI and a PHY label — and every coefficient in it equal
+/// to `(0, 0)`. [`Geometry::matches`] passes it, because length is not content.
+/// It is not a measurement of a very weak channel; it is the absence of a
+/// measurement, and the two must not be averaged together.
+///
+/// Measured 2026-08-23 across monad01/02/09/10 simultaneously: 15.2–16.0% of
+/// records in the analysis window were in this state, interleaved as isolated
+/// singletons (mean run length 1.01) among good ones, each carrying the node's
+/// *strongest* RSSI. The console drew all of them.
+///
+/// What that cost, before this predicate existed:
+///
+/// - the p05 of the amplitude bundle landed on a null for **every tone, every
+///   frame, every node**, so the shaded envelope was drawn from the bottom of
+///   the plot and its width was pinned at ~44 dB — the distance from a null to
+///   the p95, not a property of the channel;
+/// - the subcarrier time series plunged to the axis floor every fourth record,
+///   which reads as violent motion in a still room;
+/// - the Doppler series took a `0 + 0i` sample one time in six, and after mean
+///   removal each one is a broadband impulse across the whole spectrum;
+/// - the waterfall drew them as rows at the colour floor.
+///
+/// Five views, five independent decisions, all of them wrong in the same way.
+/// This function is the decision; [`crate::analyze`] applies it once, where the
+/// window is built, and reports how many it removed.
+///
+/// **This is not the same question as [`NULL_TONE_DB`]**, which asks whether one
+/// *subcarrier* is at the quantisation floor. 802.11 genuinely nulls tones, and
+/// a per-tone null in an otherwise good record is a fact about the tone plan.
+/// A record in which *every* tone is null is a fact about the driver.
+#[inline]
+pub fn is_measurement(rec: &CsiRecord) -> bool {
+    !rec.iq.is_empty() && rec.iq.iter().any(|&v| v != 0)
 }
 
 /// The `i16` slice holding one chain's interleaved coefficients, or `None` when
@@ -626,19 +671,77 @@ pub fn detrend_into(unwrapped: &[f32], spacing_hz: f64, out: &mut Vec<f32>) -> D
 // -- channel impulse response -------------------------------------------------
 
 /// Power–delay profile from the channel frequency response.
+///
+/// ## The axis is relative to the strongest tap, and it has to be
+///
+/// A commodity NIC starts its FFT at a packet boundary it detected, and the
+/// detection delay differs from packet to packet. That appears in the CFR as a
+/// linear phase term and in the transform as a *translation* of the whole
+/// profile. Measured 2026-08-23 over fifteen seconds on a still room,
+/// [`Cir::peak_bin`] swept the entire 0–127 range on two nodes: the profile was
+/// sliding across the panel while nothing moved.
+///
+/// Absolute delay is not recoverable from this instrument — the linear term the
+/// phase fit removes is partly time-of-flight, and nothing calibrates it (see
+/// `crate::tones` and Ma et al. 2020 §Phase Offsets Removal). So the profile is
+/// returned **peak-aligned**: the strongest tap sits at [`Cir::peak_index`] and
+/// the axis runs from [`Cir::axis_start_ns`], which is negative. Reading a
+/// negative delay is correct and expected; reading an absolute one is not.
+///
+/// Alignment also fixes a second, quieter fault. The window is truncated to
+/// `taps`, and a peak that wandered towards the truncation boundary took half
+/// its own profile out of the returned slice — which is why `rms_delay_ns`
+/// moved by 3.6× on a single node while the room did nothing.
 #[derive(Debug, Clone, Default)]
 pub struct Cir {
-    /// Magnitude in dB, normalised so the strongest tap is 0 dB. Tap `i` sits
-    /// at delay `i * bin_ns`; the axis is not materialised because it is
-    /// uniform and the consumer can build it from one scalar.
+    /// Magnitude in dB, normalised so the strongest tap is 0 dB.
+    ///
+    /// Tap `i` sits at delay `axis_start_ns + i * bin_ns`.
     pub mag_db: Vec<f32>,
-    /// Delay resolution (bin spacing) in nanoseconds.
+    /// Spacing between returned taps, in nanoseconds.
+    ///
+    /// **This is not the resolution.** Zero-padding interpolates between the
+    /// taps the bandwidth can actually distinguish; it does not create new
+    /// ones. See [`Cir::resolution_ns`].
     pub bin_ns: f32,
-    /// Index of the strongest tap.
+    /// True delay resolution, `1/B`, in nanoseconds.
+    ///
+    /// `B` is the occupied bandwidth — the delivered tone count times the
+    /// subcarrier spacing. Two paths closer together than this are one tap,
+    /// whatever the plot's smoothness suggests (Xie et al. 2015: at 20 MHz the
+    /// path-length ambiguity is 15 m). On the fleet's 52-tone legacy grid this
+    /// is 61.5 ns against a `bin_ns` of 1.6, so a 198 ns window holds barely
+    /// three resolvable taps.
+    pub resolution_ns: f32,
+    /// Delay of the first returned tap, in nanoseconds. Negative by
+    /// construction — see the type's own documentation.
+    pub axis_start_ns: f32,
+    /// Index *within `mag_db`* of the strongest tap. The alignment target.
+    pub peak_index: usize,
+    /// Index within the un-aligned transform of the strongest tap.
+    ///
+    /// Kept because it is a genuine diagnostic — it is the packet-detection
+    /// delay, in bins — and because a value pinned at 0 or at `nfft-1` across
+    /// many frames means the rotation is wrong rather than the channel odd.
     pub peak_bin: usize,
     /// RMS delay spread over the returned taps, in nanoseconds — a one-number
     /// summary of how multipath-rich the link is.
+    ///
+    /// Meaningless below [`Cir::resolution_ns`]: a spread smaller than the
+    /// smallest interval the bandwidth can distinguish is describing the
+    /// window function, not the channel. [`Cir::spread_is_resolvable`] is the
+    /// test, and the panel prints the verdict rather than the bare number.
     pub rms_delay_ns: f32,
+}
+
+impl Cir {
+    /// Is the reported spread larger than the bandwidth can resolve?
+    ///
+    /// `false` means the profile is one resolution cell wide and
+    /// [`Cir::rms_delay_ns`] is a property of the Hann window.
+    pub fn spread_is_resolvable(&self) -> bool {
+        self.resolution_ns > 0.0 && self.rms_delay_ns >= self.resolution_ns
+    }
 }
 
 /// Inverse-FFT the CFR into a power–delay profile (Bocus et al. 2022).
@@ -688,11 +791,14 @@ pub fn cir_into(
 ) {
     out.mag_db.clear();
     out.bin_ns = 0.0;
+    out.resolution_ns = 0.0;
+    out.axis_start_ns = 0.0;
+    out.peak_index = 0;
     out.peak_bin = 0;
     out.rms_delay_ns = 0.0;
 
     let n = h.len();
-    if n < 4 || nfft < n {
+    if n < 4 || nfft < n || spacing_hz <= 0.0 {
         return;
     }
 
@@ -709,26 +815,44 @@ pub fn cir_into(
 
     tf.run(buf, true);
 
-    let taps = taps.min(nfft);
-    // Work in power throughout: the peak search, the threshold and the second
-    // moment are all monotone in it, and dB comes out of the same logarithm
-    // the amplitude path uses.
-    let mut peak = 0usize;
+    // Peak over the WHOLE transform, not over the first `taps` of it.
+    //
+    // The old form searched only the slice it was about to return, so a
+    // profile whose true peak sat outside that slice reported the strongest
+    // thing inside it — a different tap, normalised to the wrong power. Since
+    // the peak is what the axis is now anchored to, it has to be the real one.
+    let mut peak_bin = 0usize;
     let mut peak_power = 0.0f32;
-    out.mag_db.resize(taps, 0.0);
-    for (i, c) in buf[..taps].iter().enumerate() {
+    for (i, c) in buf.iter().enumerate() {
         let p = c.re * c.re + c.im * c.im;
-        out.mag_db[i] = p;
         if p > peak_power {
             peak_power = p;
-            peak = i;
+            peak_bin = i;
         }
     }
     let peak_power = peak_power.max(POWER_FLOOR);
 
+    // Peak-align: return a window centred on the strongest tap, read circularly
+    // out of the transform. `taps` is forced even so the peak lands exactly at
+    // `taps/2` and the axis is symmetric.
+    let taps = taps.min(nfft).max(4) & !1;
+    let lead = taps / 2;
+    out.mag_db.resize(taps, 0.0);
+    for (i, slot) in out.mag_db.iter_mut().enumerate() {
+        let k = (peak_bin + nfft + i - lead) % nfft;
+        let c = buf[k];
+        *slot = c.re * c.re + c.im * c.im;
+    }
+
     let bin_s = 1.0 / (nfft as f64 * spacing_hz);
     out.bin_ns = (bin_s * 1e9) as f32;
-    out.peak_bin = peak;
+    // Resolution is set by the OCCUPIED BANDWIDTH, which is what the delivered
+    // tones span — never by `nfft`, which only decides how finely the same
+    // information is interpolated.
+    out.resolution_ns = (1e9 / (n as f64 * spacing_hz)) as f32;
+    out.axis_start_ns = -(lead as f64 * bin_s * 1e9) as f32;
+    out.peak_index = lead;
+    out.peak_bin = peak_bin;
 
     // RMS delay spread: the power-weighted standard deviation of tap delay,
     // measured from the power-weighted mean (not from the peak).
@@ -766,26 +890,65 @@ pub fn cir_into(
     };
 
     // Normalise to the strongest tap and convert in place.
+    let peak_db = db_from_power(peak_power);
     for v in out.mag_db.iter_mut() {
-        *v = db_from_power(*v) - db_from_power(peak_power);
+        *v = db_from_power(*v) - peak_db;
     }
 }
 
 // -- Doppler ------------------------------------------------------------------
 
 /// One column of a Doppler spectrogram, plus the axis it is honest about.
+///
+/// ## Why the axis is pinned rather than measured
+///
+/// A spectrogram is a sequence of columns drawn on **one** frequency axis. The
+/// console used to derive each column's `fs` from the mean packet rate of that
+/// column's own window, so consecutive columns were FFTs over different sample
+/// rates, stacked into one image and labelled with the newest column's range.
+///
+/// Measured 2026-08-23 over fifteen seconds: `max_hz` moved by 2.3–2.4× on
+/// every node of the fleet, and across a longer sample from ±18 Hz to ±132 Hz.
+/// Columns whose bins were 0.07 Hz wide sat beside columns whose bins were
+/// 1.0 Hz wide. Nothing in the image could be compared with anything else in it.
+///
+/// So the caller pins a rate and every column is resampled onto **that** grid.
+/// The rate is chosen from a coarse 1-2-5 ladder at or above the delivered
+/// rate ([`snap_rate_hz`]), which keeps it stable across frames and never
+/// narrower than the achieved Nyquist. What the window actually delivered is
+/// reported separately as [`Doppler::fs_window_hz`], and the share of grid
+/// slots that had no sample near them as [`Doppler::gap_frac`] — the two
+/// numbers that say how much of the column is information and how much is fill
+/// (MUSE-Fi, Hu et al. 2023: resample to a declared rate, tag the empty
+/// instants, then transform — never transform the raw arrivals).
 #[derive(Debug, Clone, Default)]
 pub struct Doppler {
     /// Power in dB relative to the column peak, FFT-shifted so the centre bin
     /// is 0 Hz and the axis runs `[−fs/2, +fs/2)`.
     pub power_db: Vec<f32>,
-    /// Effective sample rate used for the frequency axis, in Hz.
+    /// The **pinned** sample rate the frequency axis is built from, in Hz.
+    /// Stable across columns; see the type's own documentation.
     pub fs_hz: f32,
+    /// What this window actually delivered, in Hz. Diagnostic only — it never
+    /// touches the axis.
+    pub fs_window_hz: f32,
+    /// Where [`Doppler::fs_hz`] came from: `"tracked"` (snapped from the
+    /// delivered rate) or `"none"` (nothing to compute).
+    pub fs_source: &'static str,
     /// Maximum unambiguous Doppler shift (`fs/2`), in Hz.
     pub max_hz: f32,
     /// Corresponding maximum unambiguous radial speed, in m/s
     /// (`v = λ·f_D/2`, so `v_max = λ·fs/4`).
     pub max_speed_ms: f32,
+    /// Share of resample slots with no sample within half a grid step.
+    ///
+    /// These are filled with the series mean, so they contribute nothing to the
+    /// spectrum — but they contribute nothing to the *evidence* either, and a
+    /// column that is mostly fill is a picture of the fill. Reported so the
+    /// panel can say so.
+    pub gap_frac: f32,
+    /// Seconds of history the column covers.
+    pub span_s: f32,
     /// Coefficient of variation of the packet inter-arrival time. The Doppler
     /// axis assumes uniform sampling; ambient traffic is not uniform, so this
     /// is how much to distrust the axis. Below ~0.3 the resampling is benign.
@@ -793,6 +956,29 @@ pub struct Doppler {
     /// Whether a second chain was available for the conjugate-multiplication
     /// step. Without it the series still carries CFO and the spectrum smears.
     pub conjugate_pair: bool,
+}
+
+/// Round a rate up onto a 1-2-5 ladder, so a wobbling measurement maps to a
+/// stable axis.
+///
+/// At or above, never below: the axis must always cover the delivered Nyquist,
+/// or the resampling would decimate and alias. A rate of 21 Hz and a rate of
+/// 49 Hz both land on 50, so the spectrogram's axis holds still while the
+/// channel breathes, and only a genuine change of regime moves it.
+pub fn snap_rate_hz(fs: f64) -> f64 {
+    if !(fs > 0.0) {
+        return 0.0;
+    }
+    let decade = 10f64.powf(fs.log10().floor());
+    for m in [1.0, 2.0, 5.0, 10.0] {
+        let step = m * decade;
+        // A hair of tolerance so a rate that is already exactly on the ladder
+        // is not pushed to the next rung by floating-point noise.
+        if fs <= step * (1.0 + 1e-9) {
+            return step;
+        }
+    }
+    decade * 10.0
 }
 
 /// A time series ready for the STFT, with the timing metadata behind it.
@@ -890,7 +1076,7 @@ pub fn doppler_series_into(
 ///
 /// `wavelength_m` comes from the tuned centre frequency and converts the
 /// Doppler axis into a speed axis.
-pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32) -> Doppler {
+pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32, fs_pinned: f64) -> Doppler {
     let mut out = Doppler::default();
     LOCAL_TRANSFORMS.with(|t| {
         doppler_into(
@@ -898,6 +1084,7 @@ pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32) -> Doppler {
             series,
             nfft,
             wavelength_m,
+            fs_pinned,
             &mut Vec::new(),
             &mut out,
         )
@@ -906,18 +1093,28 @@ pub fn doppler(series: &Series, nfft: usize, wavelength_m: f32) -> Doppler {
 }
 
 /// [`doppler`], with cached plans and caller-owned buffers.
+///
+/// `fs_pinned` is the sample rate the frequency axis is built from. Pass 0 to
+/// let this column snap its own from the delivered rate — correct for a
+/// one-shot call, wrong for a spectrogram, where the caller must hold one rate
+/// across columns. See [`Doppler`].
 pub fn doppler_into(
     tf: &mut Transforms,
     series: &Series,
     nfft: usize,
     wavelength_m: f32,
+    fs_pinned: f64,
     buf: &mut Vec<Complex32>,
     out: &mut Doppler,
 ) {
     out.power_db.clear();
     out.fs_hz = 0.0;
+    out.fs_window_hz = 0.0;
+    out.fs_source = "none";
     out.max_hz = 0.0;
     out.max_speed_ms = 0.0;
+    out.gap_frac = 0.0;
+    out.span_s = 0.0;
     out.arrival_cv = 0.0;
     out.conjugate_pair = series.conjugate_pair;
 
@@ -928,11 +1125,11 @@ pub fn doppler_into(
 
     let t0 = series.ticks[0];
     let t1 = *series.ticks.last().unwrap();
-    let span_s = csiq::ftm_to_seconds(t1.saturating_sub(t0));
-    if span_s <= 0.0 {
+    let window_span_s = csiq::ftm_to_seconds(t1.saturating_sub(t0));
+    if window_span_s <= 0.0 {
         return;
     }
-    let fs = (n - 1) as f64 / span_s;
+    let fs_window = (n - 1) as f64 / window_span_s;
 
     // Inter-arrival dispersion: how far from uniform the sampling really was.
     // Accumulated in one pass rather than through an intermediate vector.
@@ -951,21 +1148,78 @@ pub fn doppler_into(
         0.0
     };
 
-    // Nearest-neighbour resample onto a uniform grid of `nfft` points.
+    // The axis. A caller drawing a spectrogram supplies it and holds it still;
+    // a one-shot caller gets the same ladder applied to this window alone.
+    let fs = if fs_pinned > 0.0 {
+        fs_pinned
+    } else {
+        snap_rate_hz(fs_window)
+    };
+    if !(fs > 0.0) {
+        return;
+    }
+
+    // Resample onto the pinned grid, ending at the newest sample and reaching
+    // back `nfft / fs` seconds. A grid slot takes the nearest sample within
+    // half a step; anything further away is a GAP, not a held value.
+    //
+    // Holding the previous sample across a long silence — which is what this
+    // did before — manufactures a flat stretch of signal out of an absence of
+    // one, and a flat stretch is energy at 0 Hz. The gaps are filled with the
+    // series mean instead, so they land exactly on the DC term that is removed
+    // two steps below and contribute nothing at all.
+    let step_ns = 1e9 / fs;
+    let grid_span_ns = step_ns * (nfft - 1) as f64;
+    let last_ns = ticks_to_ns(t1);
+    let first_ns = last_ns - grid_span_ns;
+    out.span_s = (grid_span_ns / 1e9) as f32;
+
     buf.clear();
     buf.resize(nfft, Complex32::new(0.0, 0.0));
+    let tolerance_ns = step_ns / 2.0;
     let mut cursor = 0usize;
-    for (i, slot) in buf.iter_mut().enumerate() {
-        let want = t0 as f64 + (t1 - t0) as f64 * (i as f64 / (nfft - 1) as f64);
-        while cursor + 1 < n && (series.ticks[cursor + 1] as f64) < want {
-            cursor += 1;
+    let mut gaps = 0usize;
+    let mut filled: Complex32 = Complex32::new(0.0, 0.0);
+    let mut filled_n = 0usize;
+    // `hit[i]` is false where the grid found nothing; a second pass fills those
+    // with the mean of the ones that did.
+    let mut hit = vec![false; nfft];
+    for i in 0..nfft {
+        let want = first_ns + step_ns * i as f64;
+        // Advance while the NEXT sample is at least as close as the current one.
+        while cursor + 1 < n {
+            let here = (ticks_to_ns(series.ticks[cursor]) - want).abs();
+            let next = (ticks_to_ns(series.ticks[cursor + 1]) - want).abs();
+            if next <= here {
+                cursor += 1;
+            } else {
+                break;
+            }
         }
-        *slot = series.values[cursor];
+        if (ticks_to_ns(series.ticks[cursor]) - want).abs() <= tolerance_ns {
+            buf[i] = series.values[cursor];
+            hit[i] = true;
+            filled += series.values[cursor];
+            filled_n += 1;
+        } else {
+            gaps += 1;
+        }
+    }
+    out.gap_frac = gaps as f32 / nfft as f32;
+    if filled_n == 0 {
+        return;
+    }
+    let mean = filled / filled_n as f32;
+    for (i, v) in buf.iter_mut().enumerate() {
+        if !hit[i] {
+            *v = mean;
+        }
     }
 
     // Remove the static component: the LoS and every unmoving reflector sit at
-    // 0 Hz and would otherwise dominate by tens of dB.
-    let mean: Complex32 = buf.iter().sum::<Complex32>() / nfft as f32;
+    // 0 Hz and would otherwise dominate by tens of dB. The mean is taken over
+    // the slots that carry a sample, so the fill cancels exactly.
+    //
     // Hann window suppresses the leakage skirts that a rectangular window would
     // spread from that (never perfectly cancelled) DC term.
     let window = tf.hann(nfft);
@@ -997,9 +1251,20 @@ pub fn doppler_into(
 
     let max_hz = (fs / 2.0) as f32;
     out.fs_hz = fs as f32;
+    out.fs_window_hz = fs_window as f32;
+    out.fs_source = if fs_pinned > 0.0 { "tracked" } else { "column" };
     out.max_hz = max_hz;
     // v = λ·f_D/2 for a reflected (two-way) path.
     out.max_speed_ms = wavelength_m * max_hz / 2.0;
+}
+
+/// 320 MHz baseband ticks as nanoseconds, in `f64`.
+///
+/// The window spans seconds, so `f64` nanoseconds keep every difference exact
+/// well past any window the console can hold.
+#[inline]
+fn ticks_to_ns(ticks: u64) -> f64 {
+    ticks as f64 * 1e9 / csiq::FTM_HZ as f64
 }
 
 /// Free-space wavelength for a centre frequency in MHz.
@@ -1029,7 +1294,19 @@ pub struct Validation {
     /// centre subcarriers — averaging a 3-tone null across a 12-tone window
     /// would hide it. A correct capture is clearly negative here; ≈0 means the
     /// tone grid is not centred where the parser assumes.
-    pub dc_notch_db: f32,
+    ///
+    /// **`None` on a tone grid that has no DC tone**, which is every 802.11
+    /// used-tone set this fleet captures. The check took the minimum of the
+    /// middle ±2.5% of the delivered array; on a 52-tone legacy grid that is
+    /// two tones, `k = −1` and `k = +1`, both of them data. It was structurally
+    /// incapable of finding a notch that is not in the array, and it therefore
+    /// failed permanently — measured 2026-08-23 across four nodes, it never once
+    /// reached the −3 dB the panel wanted, reading between −1.3 and +7.9 dB.
+    ///
+    /// A check that cannot pass is not a check. See [`crate::tones::grid`]: a
+    /// `Uniform` grid (the ray-traced simulator) does deliver DC, and there the
+    /// test is both applicable and meaningful.
+    pub dc_notch_db: Option<f32>,
     /// Mean of the outer 10% of tones minus the mean of the inner 20%, in dB.
     /// Analogue filtering makes this negative; ≈0 means no roll-off, which on
     /// real hardware means the frequency axis is not what we assume.
@@ -1121,10 +1398,18 @@ pub fn validate_into(rec: &CsiRecord, amp: &mut Vec<f32>, v: &mut Validation) {
     }
     let whole = a.iter().sum::<f32>() / n as f32;
 
-    let centre_half = (n / 40).max(1); // ±2.5% of the band
-    let mid = n / 2;
-    let centre = &a[mid.saturating_sub(centre_half)..(mid + centre_half).min(n)];
-    v.dc_notch_db = centre.iter().cloned().fold(f32::INFINITY, f32::min) - whole;
+    // Only ask the question where the answer can exist. On an 802.11 used-tone
+    // set the driver never delivers DC, so there is no notch in this array to
+    // find and the middle of it is ordinary data.
+    v.dc_notch_db = match crate::tones::grid(n) {
+        crate::tones::Grid::Dot11 => None,
+        crate::tones::Grid::Uniform => {
+            let centre_half = (n / 40).max(1); // ±2.5% of the band
+            let mid = n / 2;
+            let centre = &a[mid.saturating_sub(centre_half)..(mid + centre_half).min(n)];
+            Some(centre.iter().cloned().fold(f32::INFINITY, f32::min) - whole)
+        }
+    };
 
     let edge = (n / 10).max(1);
     let edges =
@@ -1262,6 +1547,19 @@ const EXACT_SLOT_TOLERANCE: f64 = 0.05;
 /// Above this on-slot fraction the source is simply on the grid.
 const ON_GRID_AT: f32 = 0.90;
 
+/// The largest deficit an *inferred* slot is allowed to imply.
+///
+/// A backstop, independent of the grid statistics below it. A metronome that
+/// loses slots loses some of them: the measured 2.4 GHz arm lost 38.7% and the
+/// 5 GHz arm 0.6%. A slot recovered from the arrivals that implies the source
+/// delivered under 5% of what it "commanded" has not found a rate — it has
+/// found the spacing inside a burst, and dividing the two produces a number
+/// with no referent.
+///
+/// A declared slot is exempt: the operator stated the rate, and a source that
+/// delivers 0.3% of a commanded rate is a real and important measurement.
+const INFERRED_DEFICIT_CEILING: f32 = 0.95;
+
 /// Above this *exact* fraction there is a real slot underneath, even when a
 /// substantial population has been pushed off it.
 const DEFERRED_AT: f32 = 0.40;
@@ -1301,11 +1599,39 @@ pub struct Metronome {
     /// when it was recovered from the arrivals, `"none"` when neither worked.
     pub slot_source: &'static str,
     /// `1e6 / slot_us` — the rate the source is trying to achieve.
-    pub commanded_hz: f32,
+    ///
+    /// **`None` when no rate can honestly be claimed**, which is whenever the
+    /// slot was *inferred* and the arrivals turned out not to be metronomic.
+    /// See [`Metronome::deficit`].
+    pub commanded_hz: Option<f32>,
     /// Arrivals per second actually delivered over the window.
     pub delivered_hz: f32,
     /// `1 − delivered/commanded`, clamped to `[0, 1]`.
-    pub deficit: f32,
+    ///
+    /// ## Why this is an `Option`, and what it cost when it was not
+    ///
+    /// A deficit is a comparison against a commanded rate. When the capture
+    /// declares `radio.interval_us` there is one, and the comparison is exact —
+    /// that is EXP-010's primary occupancy channel. When it does not,
+    /// [`infer_slot_us`] recovers a slot from the arrivals themselves, and it
+    /// seeds on their p25.
+    ///
+    /// On a *bursty* source the p25 is the spacing INSIDE a burst. Measured
+    /// 2026-08-23 on all four nodes: the injector's gaps had a p50 of 236 µs and
+    /// a p95 of 191 ms, the inference returned a 158.6 µs slot, and the console
+    /// reported a commanded rate of **6305 Hz** and a delivery deficit of
+    /// **99.4%** — in red, permanently, on every node. The configured injector
+    /// rate was 25 Hz and `interval_us` was 0. Nothing had commanded 6305 Hz.
+    ///
+    /// The console already knew. [`Metronome::verdict`] returned `irregular`,
+    /// whose own documentation says "no mode at all … nothing else in this
+    /// struct describes it" — and the deficit was published anyway, because it
+    /// was a bare `f32` with no way to say "not applicable".
+    ///
+    /// So: an inferred slot yields a deficit only if the arrivals then turn out
+    /// to be on a grid. A declared slot always yields one, because the operator
+    /// stated the rate and losing every frame of it is exactly the measurement.
+    pub deficit: Option<f32>,
     /// Share of gaps at each multiple `k = 1..=MAX_MULTIPLE`, indexed from 0.
     /// Sums to `1 − off_slot` less whatever fell beyond the last bin.
     pub multiples: Vec<f32>,
@@ -1411,9 +1737,9 @@ pub fn metronome_into(
     out.n_gaps = times_ns.len().saturating_sub(1);
     out.slot_us = 0.0;
     out.slot_source = "none";
-    out.commanded_hz = 0.0;
+    out.commanded_hz = None;
     out.delivered_hz = 0.0;
-    out.deficit = 0.0;
+    out.deficit = None;
     out.off_slot = 0.0;
     out.exact_slot = 0.0;
     out.longest_run = 0;
@@ -1453,8 +1779,6 @@ pub fn metronome_into(
         }
     };
     out.slot_us = slot_us as f32;
-    out.commanded_hz = (1e6 / slot_us) as f32;
-    out.deficit = (1.0 - out.delivered_hz as f64 / (1e6 / slot_us)).clamp(0.0, 1.0) as f32;
 
     // The sort above (inference path only) reorders `scratch`, which is fine:
     // every quantity below is a property of the multiset of gaps, not of their
@@ -1467,7 +1791,23 @@ pub fn metronome_into(
         let ratio = g as f64 / slot_us;
         let k = ratio.round();
         let resid = (ratio - k).abs();
-        if k >= 1.0 && resid <= ON_SLOT_TOLERANCE {
+        // `k` is bounded by the same MAX_MULTIPLE the histogram uses, and the
+        // bound is load-bearing rather than cosmetic. The residual test is a
+        // FRACTION of the slot, so as `k` grows the multiples become dense
+        // relative to the gaps and almost any interval lands near one of them.
+        //
+        // Measured on the archived segment
+        // `monad01_illum-coex-03_20260823-102958-seg0003`: the inferred slot was
+        // 158 µs and the largest gap was 10,246 of them. Counting those as "on
+        // the grid" put 65% of gaps on-slot and 36% dead on it, which reads as a
+        // metronome — for a source whose gaps run from 158 µs to 1.6 seconds.
+        // With the bound applied the same capture reads 51% on-slot and 33%
+        // exact, i.e. `irregular`, which is what it is.
+        //
+        // A gap of ten thousand slots is not a metronome that missed 10,249
+        // transmissions. It is a different process, and the histogram has always
+        // said so by refusing to bin it.
+        if k >= 1.0 && k <= MAX_MULTIPLE as f64 && resid <= ON_SLOT_TOLERANCE {
             on_slot += 1;
             if resid <= EXACT_SLOT_TOLERANCE {
                 exact += 1;
@@ -1487,6 +1827,20 @@ pub fn metronome_into(
     out.exact_slot = exact as f32 / n;
     out.longest_run = max_k.saturating_sub(1);
     out.quantised = (on_slot as f32 / n) >= ON_GRID_AT;
+
+    // The deficit, last, because whether it may be published depends on the
+    // grid statistics computed just above. A declared slot is always a fair
+    // comparison; an inferred one is a fair comparison only if the arrivals it
+    // was inferred from turned out to be on a grid at all.
+    let commanded = 1e6 / slot_us;
+    let deficit = (1.0 - out.delivered_hz as f64 / commanded).clamp(0.0, 1.0) as f32;
+    let declared = out.slot_source == "declared";
+    let credible = declared
+        || (out.verdict() != "irregular" && deficit <= INFERRED_DEFICIT_CEILING);
+    if credible {
+        out.commanded_hz = Some(commanded as f32);
+        out.deficit = Some(deficit);
+    }
 }
 
 // -- the CSI ratio ------------------------------------------------------------
@@ -1803,13 +2157,164 @@ mod tests {
             })
             .collect();
         let c = cir(&h, spacing, 512, 128);
+        // `peak_bin` is the tap's index in the UN-aligned transform, which is
+        // where the planted delay actually lands.
         let expect = (tau / (1.0 / (512.0 * spacing))).round() as usize;
         assert!(
             c.peak_bin.abs_diff(expect) <= 1,
             "peak at bin {} expected ~{expect}",
             c.peak_bin
         );
-        assert!(c.mag_db[c.peak_bin] == 0.0, "peak must normalise to 0 dB");
+        // The returned profile is peak-aligned, so within it the peak sits at
+        // `peak_index` — the centre — whatever the packet-detection delay was.
+        assert_eq!(c.peak_index, c.mag_db.len() / 2);
+        assert!(c.mag_db[c.peak_index] == 0.0, "peak must normalise to 0 dB");
+        assert!(
+            c.axis_start_ns < 0.0,
+            "a peak-aligned axis starts before the peak"
+        );
+        // Resolution is 1/B and has nothing to do with `nfft`.
+        let expected_res = 1e9 / (h.len() as f64 * spacing);
+        assert!((c.resolution_ns as f64 - expected_res).abs() < 1e-6);
+        assert!(
+            c.resolution_ns > c.bin_ns * 8.0,
+            "zero-padding interpolates; it must not be reported as resolution"
+        );
+    }
+
+    #[test]
+    fn the_rate_ladder_is_stable_and_never_narrows() {
+        // Every rung maps to itself: a rate already on the ladder must not be
+        // pushed to the next one by floating-point noise.
+        for rung in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0] {
+            assert_eq!(snap_rate_hz(rung), rung, "rung {rung}");
+        }
+        // At or above, never below — an axis under the delivered Nyquist aliases.
+        for fs in [0.4, 1.7, 9.3, 21.3, 33.0, 37.4, 264.0, 608.0, 1883.0] {
+            let snapped = snap_rate_hz(fs);
+            assert!(snapped >= fs, "{fs} snapped down to {snapped}");
+            // And never wastefully far above: at most one rung, i.e. 2.5x.
+            assert!(snapped <= fs * 2.5, "{fs} snapped all the way to {snapped}");
+        }
+        // The measured wobble, 9.3 to 21.3 Hz, has to land somewhere stable.
+        assert_eq!(snap_rate_hz(21.3), 50.0);
+        assert_eq!(snap_rate_hz(0.0), 0.0);
+        assert_eq!(snap_rate_hz(-1.0), 0.0);
+    }
+
+    #[test]
+    fn a_record_of_zeros_is_not_a_measurement() {
+        let good = rec(52, 2, 1, |t, c| (10 + t as i16, c as i16));
+        assert!(is_measurement(&good));
+
+        let mut empty = good.clone();
+        empty.iq.iter_mut().for_each(|v| *v = 0);
+        assert!(!is_measurement(&empty));
+        // It still passes every structural check, which is the whole problem.
+        assert!(Geometry::of(&empty).matches(&empty));
+        assert_eq!(validate(&empty).zero_fraction, 1.0);
+
+        // A single least-significant bit anywhere is a reading.
+        let mut one = empty.clone();
+        one.iq[7] = 1;
+        assert!(is_measurement(&one));
+    }
+
+    /// A hole in the arrivals is reported, not papered over.
+    ///
+    /// Holding the previous sample across a silence manufactures a flat stretch
+    /// of signal, and a flat stretch is energy at 0 Hz. The gaps go to the mean
+    /// instead, which the DC removal then cancels exactly.
+    #[test]
+    fn doppler_reports_the_share_of_the_grid_it_had_to_fill() {
+        let fs = 400.0f64;
+        let n = 512usize;
+        // Half the window is delivered; then the source stops for as long again.
+        let ticks: Vec<u64> = (0..n)
+            .map(|i| {
+                let t = if i < n / 2 {
+                    i as f64 / fs
+                } else {
+                    (n / 2) as f64 / fs + (i - n / 2) as f64 / fs * 8.0
+                };
+                (t * csiq::FTM_HZ as f64) as u64
+            })
+            .collect();
+        let values: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * 50.0 * i as f64 / fs;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let s = Series {
+            values,
+            ticks,
+            conjugate_pair: true,
+        };
+        let d = doppler(&s, 512, wavelength_m(5180.0), fs);
+        assert_eq!(d.fs_hz, fs as f32, "the pinned axis is used verbatim");
+        assert_eq!(d.fs_source, "tracked");
+        assert!(
+            d.gap_frac > 0.05,
+            "a stalled source must show as fill, not as signal: {}",
+            d.gap_frac
+        );
+        assert!(d.span_s > 0.0);
+
+        // A fully delivered window has nothing to fill.
+        let ticks: Vec<u64> = (0..n)
+            .map(|i| (i as f64 / fs * csiq::FTM_HZ as f64) as u64)
+            .collect();
+        let values: Vec<Complex32> = (0..n).map(|_| Complex32::new(1.0, 0.0)).collect();
+        let dense = doppler(
+            &Series {
+                values,
+                ticks,
+                conjugate_pair: true,
+            },
+            512,
+            wavelength_m(5180.0),
+            fs,
+        );
+        assert!(dense.gap_frac < 0.02, "gap_frac {}", dense.gap_frac);
+    }
+
+    /// The same planted tone, on an axis nobody pinned: the ladder widens the
+    /// range but must not move the physics.
+    #[test]
+    fn doppler_recovers_a_tone_on_a_snapped_axis() {
+        let fs = 400.0f64;
+        let n = 1024usize;
+        let ticks: Vec<u64> = (0..n)
+            .map(|i| (i as f64 / fs * csiq::FTM_HZ as f64) as u64)
+            .collect();
+        let values: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * 50.0 * i as f64 / fs;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let d = doppler(
+            &Series {
+                values,
+                ticks,
+                conjugate_pair: true,
+            },
+            512,
+            wavelength_m(5180.0),
+            0.0,
+        );
+        assert_eq!(d.fs_hz, 500.0, "400 Hz snaps up to the 500 Hz rung");
+        assert_eq!(d.fs_source, "column");
+        let peak = d
+            .power_db
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        let hz = (peak as f32 - 256.0) * d.fs_hz / 512.0;
+        assert!((hz - 50.0).abs() < 3.0, "peak at {hz} Hz, expected 50");
     }
 
     #[test]
@@ -1831,7 +2336,7 @@ mod tests {
             ticks,
             conjugate_pair: true,
         };
-        let d = doppler(&s, 512, wavelength_m(5180.0));
+        let d = doppler(&s, 512, wavelength_m(5180.0), fs);
         let peak = d
             .power_db
             .iter()
@@ -1913,6 +2418,24 @@ mod tests {
         }
     }
 
+    /// The check that could never pass. A used-tone set has no DC tone, so the
+    /// middle of the delivered array is data and testing it for a notch reports
+    /// a failure about the channel's shape rather than about the extraction.
+    #[test]
+    fn the_dc_check_is_not_applicable_to_an_802_11_used_tone_set() {
+        for ntone in [52u16, 56, 114, 242, 484, 996] {
+            let r = rec(ntone, 2, 1, |t, _| (100 + (t % 17) as i16, 3));
+            assert_eq!(
+                validate(&r).dc_notch_db,
+                None,
+                "{ntone}-tone is a used-tone set and has no DC bin"
+            );
+        }
+        // A contiguous grid — what the ray-traced simulator delivers — does.
+        let uniform = rec(64, 2, 1, |t, _| (100 + (t % 17) as i16, 3));
+        assert!(validate(&uniform).dc_notch_db.is_some());
+    }
+
     #[test]
     fn validation_sees_a_suppressed_dc_and_a_rolled_off_edge() {
         let n = 100usize;
@@ -1930,7 +2453,10 @@ mod tests {
         });
         let v = validate(&r);
         assert!(v.dimensions_ok);
-        assert!(v.dc_notch_db < -5.0, "dc notch was {}", v.dc_notch_db);
+        // 100 tones is not an 802.11 used-tone set, so this grid does carry DC
+        // and the check is applicable.
+        let notch = v.dc_notch_db.expect("a uniform grid has a DC bin to test");
+        assert!(notch < -5.0, "dc notch was {notch}");
         assert!(
             v.edge_rolloff_db < -5.0,
             "rolloff was {}",
@@ -1987,8 +2513,10 @@ mod tests {
 
         assert_eq!(m.slot_source, "inferred");
         assert!((m.slot_us - 10_000.0).abs() < 1.0, "slot {}", m.slot_us);
-        assert!((m.commanded_hz - 100.0).abs() < 0.1);
-        assert!(m.deficit < 0.01, "deficit {}", m.deficit);
+        let commanded = m.commanded_hz.expect("an on-grid source has a rate");
+        assert!((commanded - 100.0).abs() < 0.1);
+        let deficit = m.deficit.expect("an on-grid source has a deficit");
+        assert!(deficit < 0.01, "deficit {deficit}");
         assert!(m.quantised);
         assert_eq!(m.verdict(), "on grid");
         assert!(m.multiples[0] > 0.99, "all mass at 1x: {:?}", &m.multiples[..4]);
@@ -2007,10 +2535,10 @@ mod tests {
 
         assert_eq!(m.slot_source, "declared");
         assert!((m.slot_us - 10_000.0).abs() < 1.0);
+        let deficit = m.deficit.expect("a declared slot always yields a deficit");
         assert!(
-            (m.deficit - 0.385).abs() < 0.02,
-            "deficit {} should be ~5/13",
-            m.deficit
+            (deficit - 0.385).abs() < 0.02,
+            "deficit {deficit} should be ~5/13"
         );
         // Every gap is still an exact multiple: the source never jittered.
         assert!(m.quantised, "off-slot {}", m.off_slot);
@@ -2019,6 +2547,116 @@ mod tests {
         assert!(m.multiples[3] > 0.1, "4x share {}", m.multiples[3]);
         assert_eq!(m.longest_run, 3);
         assert_eq!(m.verdict(), "on grid");
+    }
+
+    /// The arrivals that broke this panel, replayed from the capture itself.
+    ///
+    /// Not a fixture written to look like the fleet — the fleet's own arrival
+    /// times, lifted out of
+    /// `monad01_illum-coex-03_20260823-102958-seg0003/capture.raw` and kept
+    /// verbatim beside this test. Every hand-written approximation of this
+    /// process came out more regular than the real one, and regularity is
+    /// exactly what is under test.
+    ///
+    /// What the console did with it: inferred a 158 µs slot, called that a
+    /// commanded 6317 Hz, and reported a 99.7% delivery deficit in red — for a
+    /// transmitter configured at 250 Hz with no throttle at all, delivering
+    /// 29 Hz. The largest gap was 10,246 of those "slots".
+    #[test]
+    fn the_real_injector_gets_no_fabricated_deficit() {
+        let text = include_str!("../tests/fixtures/injector-arrivals-ch3.txt");
+        let ticks: Vec<u64> = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| l.trim().parse::<u64>().expect("a tick count per line"))
+            .collect();
+        assert_eq!(ticks.len(), 1743, "the fixture is the whole transmitter");
+
+        // The DSP works in nanoseconds; the fixture is in 320 MHz ticks, as the
+        // hardware counts.
+        let times_ns: Vec<u64> = ticks
+            .iter()
+            .map(|&t| (t as f64 * 1e9 / csiq::FTM_HZ as f64) as u64)
+            .collect();
+
+        let mut m = Metronome::default();
+        metronome_into(&times_ns, None, &mut Vec::new(), &mut m);
+
+        // The delivered rate is measured, so it is always reported.
+        assert!(
+            (m.delivered_hz - 29.2).abs() < 1.0,
+            "delivered {} Hz, the segment's own rate is 29.2",
+            m.delivered_hz
+        );
+        // The slot is still inferred and still shown — it is a real feature of
+        // the arrivals, it is just not a rate.
+        assert_eq!(m.slot_source, "inferred");
+        assert!(
+            (m.slot_us - 158.0).abs() < 5.0,
+            "slot {} µs, the burst spacing is ~158",
+            m.slot_us
+        );
+
+        // And nothing is divided by it.
+        assert_eq!(
+            m.verdict(),
+            "irregular",
+            "on-slot statistics: exact {} off {}",
+            m.exact_slot,
+            m.off_slot
+        );
+        assert_eq!(m.deficit, None, "no rate was commanded to be short of");
+        assert_eq!(m.commanded_hz, None);
+    }
+
+    /// The bound that does the work above, stated on its own.
+    ///
+    /// The residual test is a fraction of the slot, so as the multiple grows the
+    /// grid becomes dense relative to the gaps and almost anything lands near
+    /// it. Measured on the same capture: unbounded, 65.2% of gaps read as
+    /// on-slot and 35.6% as dead on it; bounded at MAX_MULTIPLE, 51.1% and
+    /// 32.9%. The second pair is the honest reading of a source whose gaps span
+    /// four decades.
+    #[test]
+    fn a_gap_of_ten_thousand_slots_is_not_on_the_grid() {
+        // A clean 10 ms metronome, with one arrival an hour late.
+        let mut t: Vec<u64> = (0..200u64).map(|i| i * 10_000_000).collect();
+        let last = *t.last().unwrap();
+        t.push(last + 10_000_000 * 10_000);
+        let mut m = Metronome::default();
+        metronome_into(&t, Some(10_000.0), &mut Vec::new(), &mut m);
+
+        // 199 gaps at 1x and one at 10,000x. The long one is off-slot, not a
+        // 10,000-slot loss, so `longest_run` describes the bins that exist.
+        assert!(m.off_slot > 0.0 && m.off_slot < 0.02, "off {}", m.off_slot);
+        assert!(
+            m.longest_run < MAX_MULTIPLE as u32,
+            "longest_run {} exceeds what the histogram can hold",
+            m.longest_run
+        );
+        // The source is still on the grid: one outlier does not unmake it.
+        assert_eq!(m.verdict(), "on grid");
+    }
+
+    /// The operator's own number always survives. A declared slot means the
+    /// rate was commanded, and losing every frame of it is the measurement —
+    /// not a reason to withhold it.
+    #[test]
+    fn a_declared_slot_still_reports_a_deficit_on_an_irregular_source() {
+        let mut t: Vec<u64> = Vec::new();
+        let mut now = 0u64;
+        for _ in 0..20 {
+            for _ in 0..30 {
+                t.push(now);
+                now += 160_000;
+            }
+            now += 200_000_000;
+        }
+        let mut m = Metronome::default();
+        metronome_into(&t, Some(10_000.0), &mut Vec::new(), &mut m);
+        assert_eq!(m.slot_source, "declared");
+        assert!(m.deficit.is_some(), "a commanded rate is always comparable");
+        assert!((m.commanded_hz.unwrap() - 100.0).abs() < 0.1);
     }
 
     /// Inference survives half the slots going missing — which is more loss
@@ -2041,15 +2679,15 @@ mod tests {
         let mut inferred = Metronome::default();
         metronome_into(&t, None, &mut Vec::new(), &mut inferred);
         assert!((inferred.slot_us - 20_000.0).abs() < 100.0);
-        assert!(inferred.deficit < 0.01, "inference sees a healthy 50 Hz source");
+        assert!(
+            inferred.deficit.unwrap() < 0.01,
+            "inference sees a healthy 50 Hz source"
+        );
 
         let mut declared = Metronome::default();
         metronome_into(&t, Some(10_000.0), &mut Vec::new(), &mut declared);
-        assert!(
-            (declared.deficit - 0.5).abs() < 0.01,
-            "deficit {}",
-            declared.deficit
-        );
+        let deficit = declared.deficit.unwrap();
+        assert!((deficit - 0.5).abs() < 0.01, "deficit {deficit}");
     }
 
     /// The measured 2.4 GHz arm, whose gaps are a *mixture* — and which is why

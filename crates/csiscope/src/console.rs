@@ -1,31 +1,48 @@
-//! The operator surface: experiment configuration, unit control, session
-//! browsing.
+//! The read-only operator surface: what this node is, and what it is running.
 //!
-//! Two rules shape this module.
+//! ## Read-only, by construction rather than by flag
+//!
+//! `csiscope` used to serve an editor for `/etc/csid/config.toml` and the
+//! per-experiment TOML, buttons that started and stopped capture units, a
+//! session browser and an export trigger — all unauthenticated, with a
+//! `--read-only` flag as the only thing standing between the port and the
+//! radio. The flag was the wrong shape: it made the safe configuration the
+//! explicit one, and it meant every handler carried a `writable()` guard that
+//! had to be remembered.
+//!
+//! The write surface is gone. A capture is armed by merging a plan and letting
+//! the control host's timer act on it (IP-136); a session is read out of the
+//! spool by the tools that own the archive; configuration is Ansible's. None of
+//! those wanted a text box on a lab network. What is left here is a description
+//! of the node — versions, kernel, resolved experiment tuning, unit states,
+//! journal, `csid doctor` — and none of it can change anything.
 //!
 //! **Validation is not reimplemented.** An experiment is parsed with
 //! [`csid::config::ExperimentConfig`] and checked with the same
-//! [`csid::caps::validate_radio`] the daemon runs, so the console rejects
-//! exactly what `csid validate` rejects. A second implementation would drift,
+//! [`csid::caps::validate_radio`] the daemon runs, so the console describes
+//! exactly what `csid validate` would say. A second implementation would drift,
 //! and the drift would surface four hours into an unattended run.
 //!
-//! **No authentication is not the same as no input validation.** The console is
-//! deliberately unauthenticated — it is a lab instrument on a lab network — but
-//! every name that reaches the filesystem or `systemctl` is checked against a
-//! strict pattern first, and unit control is restricted to units this project
-//! owns. Nothing here interpolates into a shell.
+//! **No authentication is still not the same as no input validation.** Every
+//! name that reaches the filesystem or `systemctl` is checked against a strict
+//! pattern first, and the journal is readable only for units this project owns.
+//! Nothing here interpolates into a shell.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use csid::config::{ExperimentConfig, GlobalConfig};
+use csid::config::ExperimentConfig;
 
-/// Units `csiscope` is willing to act on. Anything else is refused, so an
-/// unauthenticated console can never be talked into restarting sshd.
-const CONTROLLABLE: &[&str] = &["csid-sync", "csid-prune", "csid-driver-guard"];
+/// Units `csiscope` is willing to *read* the journal of.
+///
+/// Nothing here is controllable any more — the console has no write surface —
+/// but the allow-list stays, because `journalctl -u <anything>` on an
+/// unauthenticated port is its own disclosure. A console on a lab network may
+/// describe this project's capture units and nothing else.
+const READABLE: &[&str] = &["csid-sync", "csid-prune", "csid-driver-guard"];
 
 // -- names --------------------------------------------------------------------
 
@@ -62,14 +79,14 @@ pub fn resolve_unit(unit: &str) -> Result<String> {
         .strip_suffix(".service")
         .or_else(|| unit.strip_suffix(".timer"))
         .unwrap_or(unit);
-    if CONTROLLABLE.contains(&base) {
+    if READABLE.contains(&base) {
         return Ok(if unit.contains('.') {
             unit.to_string()
         } else {
             format!("{base}.service")
         });
     }
-    bail!("{unit} is not a unit csiscope controls")
+    bail!("{unit} is not a unit csiscope reports on")
 }
 
 // -- shelling out -------------------------------------------------------------
@@ -252,75 +269,6 @@ pub fn read_experiment(dir: &Path, name: &str) -> Result<Experiment> {
     })
 }
 
-/// Write an experiment, refusing anything the daemon would reject.
-///
-/// The write is atomic (temp file + rename) so a half-written file can never be
-/// what a `systemctl start` picks up.
-pub fn write_experiment(dir: &Path, name: &str, text: &str) -> Result<Check> {
-    safe_name(name)?;
-    let check = check_experiment(text);
-    if !check.valid {
-        bail!(
-            "refusing to write an invalid configuration: {}",
-            check.error.as_deref().unwrap_or("unknown error")
-        );
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    atomic_write(&dir.join(format!("{name}.toml")), text)?;
-    Ok(check)
-}
-
-/// Delete an experiment file.
-pub fn delete_experiment(dir: &Path, name: &str) -> Result<()> {
-    safe_name(name)?;
-    let path = dir.join(format!("{name}.toml"));
-    std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
-}
-
-/// Parse-check a candidate node-global configuration.
-pub fn check_global(text: &str) -> Check {
-    match toml::from_str::<GlobalConfig>(text) {
-        Ok(cfg) => Check {
-            valid: true,
-            config: serde_json::to_value(&cfg).ok(),
-            ..Default::default()
-        },
-        Err(e) => Check {
-            valid: false,
-            error: Some(format!("TOML: {e}")),
-            ..Default::default()
-        },
-    }
-}
-
-/// Write the node-global configuration, atomically, after a parse check.
-pub fn write_global(path: &Path, text: &str) -> Result<Check> {
-    let check = check_global(text);
-    if !check.valid {
-        bail!(
-            "refusing to write an invalid configuration: {}",
-            check.error.as_deref().unwrap_or("unknown error")
-        );
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    atomic_write(path, text)?;
-    Ok(check)
-}
-
-/// Write via a sibling temp file and rename, so readers never see a partial
-/// file and a failed write leaves the previous configuration intact.
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("csiscope-tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("installing {}", path.display()))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
-}
-
 // -- systemd ------------------------------------------------------------------
 
 /// A unit's state, as `systemctl show` reports it.
@@ -377,15 +325,6 @@ pub fn unit_status(unit: &str) -> UnitStatus {
     }
 }
 
-/// `systemctl start|stop|restart <unit>`, with the unit checked first.
-pub fn unit_action(unit: &str, action: &str) -> Result<Run> {
-    let unit = resolve_unit(unit)?;
-    if !matches!(action, "start" | "stop" | "restart") {
-        bail!("action must be start, stop or restart");
-    }
-    Ok(run("systemctl", &[action, &unit]))
-}
-
 /// Recent journal lines for a unit.
 pub fn journal(unit: &str, lines: usize) -> Result<String> {
     let unit = resolve_unit(unit)?;
@@ -399,77 +338,6 @@ pub fn journal(unit: &str, lines: usize) -> Result<String> {
     } else {
         out.stdout
     })
-}
-
-// -- sessions -----------------------------------------------------------------
-
-/// A capture session in the spool, described by its sidecar.
-#[derive(Debug, Clone, Serialize)]
-pub struct Session {
-    pub id: String,
-    pub path: String,
-    pub raw_bytes: u64,
-    pub csiq_bytes: u64,
-    pub modified_ns: u64,
-    /// The sidecar verbatim. Design rule from IP-120: it alone must suffice to
-    /// interpret the capture, so the console shows all of it rather than a
-    /// curated subset.
-    pub sidecar: Option<serde_json::Value>,
-}
-
-/// List spool sessions, newest first.
-pub fn list_sessions(spool: &Path, limit: usize) -> Vec<Session> {
-    let Ok(entries) = std::fs::read_dir(spool) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Session> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| {
-            let path = e.path();
-            let id = path.file_name()?.to_string_lossy().to_string();
-            safe_name(&id).ok()?;
-            Some(describe_session(&path, id))
-        })
-        .collect();
-    out.sort_by_key(|s| std::cmp::Reverse(s.modified_ns));
-    out.truncate(limit);
-    out
-}
-
-fn describe_session(path: &Path, id: String) -> Session {
-    let size = |name: &str| {
-        std::fs::metadata(path.join(name))
-            .map(|m| m.len())
-            .unwrap_or(0)
-    };
-    let modified_ns = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-
-    Session {
-        sidecar: std::fs::read_to_string(path.join("metadata.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok()),
-        raw_bytes: size("capture.raw"),
-        csiq_bytes: size("capture.csiq"),
-        modified_ns,
-        path: path.display().to_string(),
-        id,
-    }
-}
-
-/// Resolve a session id to a directory inside the spool.
-pub fn session_dir(spool: &Path, id: &str) -> Result<PathBuf> {
-    safe_name(id)?;
-    let dir = spool.join(id);
-    if !dir.is_dir() {
-        bail!("no session {id} under {}", spool.display());
-    }
-    Ok(dir)
 }
 
 #[cfg(test)]
@@ -518,7 +386,7 @@ on_close = true
     }
 
     #[test]
-    fn only_project_units_are_controllable() {
+    fn only_project_units_are_readable() {
         assert_eq!(resolve_unit("csid@smoke").unwrap(), "csid@smoke.service");
         assert_eq!(
             resolve_unit("csid@drift-24h.service").unwrap(),
@@ -529,6 +397,33 @@ on_close = true
 
         for bad in ["sshd", "csid@../root", "csid@a b", "systemd-logind", ""] {
             assert!(resolve_unit(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    /// The write surface is gone from the module, not merely unrouted.
+    ///
+    /// A handler can be un-wired and a function left behind for "later"; the
+    /// next person wires it back. This is the cheapest way to state that the
+    /// console cannot write, and it fails the moment one of them returns.
+    #[test]
+    fn nothing_in_this_module_can_change_the_node() {
+        // Matched at the start of a line, so this test's own list of names —
+        // which is quoted and indented — does not satisfy its own assertion.
+        let src = include_str!("console.rs");
+        for gone in [
+            "\npub fn write_experiment",
+            "\npub fn delete_experiment",
+            "\npub fn write_global",
+            "\nfn atomic_write",
+            "\npub fn unit_action",
+            "\npub fn list_sessions",
+            "\npub fn session_dir",
+        ] {
+            assert!(
+                !src.contains(gone),
+                "{} is back; the console is meant to be read-only",
+                gone.trim()
+            );
         }
     }
 
@@ -571,72 +466,4 @@ on_close = true
         assert!(c.error.unwrap().contains("160MHz"));
     }
 
-    #[test]
-    fn writes_are_atomic_and_gated_on_validity() {
-        let dir = std::env::temp_dir().join(format!("csiscope-console-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        write_experiment(&dir, "unit-test", GOOD).unwrap();
-        let back = read_experiment(&dir, "unit-test").unwrap();
-        assert!(back.check.valid);
-        assert_eq!(back.toml, GOOD);
-
-        // A rejected write must leave the good file in place.
-        let err = write_experiment(&dir, "unit-test", "this is not toml").unwrap_err();
-        assert!(err.to_string().contains("refusing"));
-        assert_eq!(read_experiment(&dir, "unit-test").unwrap().toml, GOOD);
-        assert!(
-            !dir.join("unit-test.csiscope-tmp").exists(),
-            "no temp file may survive"
-        );
-
-        assert!(write_experiment(&dir, "../escape", GOOD).is_err());
-
-        let listed = list_experiments(&dir);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "unit-test");
-
-        delete_experiment(&dir, "unit-test").unwrap();
-        assert!(list_experiments(&dir).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn global_config_round_trips() {
-        let text = r#"
-[node]
-spool = "/var/lib/csid"
-
-[driver]
-vendor_oui = 0x001735
-"#;
-        let c = check_global(text);
-        assert!(c.valid, "{:?}", c.error);
-        assert_eq!(c.config.unwrap()["node"]["spool"], "/var/lib/csid");
-        assert!(!check_global("[node]\nspool = 12").valid);
-    }
-
-    #[test]
-    fn sessions_are_described_from_the_sidecar() {
-        let dir = std::env::temp_dir().join(format!("csiscope-spool-{}", std::process::id()));
-        let s = dir.join("monad05_smoke_20260722-093107");
-        std::fs::create_dir_all(&s).unwrap();
-        std::fs::write(s.join("capture.raw"), vec![0u8; 4096]).unwrap();
-        std::fs::write(
-            s.join("metadata.json"),
-            r#"{"session_id":"monad05_smoke_20260722-093107","status":"complete"}"#,
-        )
-        .unwrap();
-
-        let list = list_sessions(&dir, 10);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].raw_bytes, 4096);
-        assert_eq!(list[0].csiq_bytes, 0);
-        assert_eq!(list[0].sidecar.as_ref().unwrap()["status"], "complete");
-
-        assert!(session_dir(&dir, "monad05_smoke_20260722-093107").is_ok());
-        assert!(session_dir(&dir, "nope").is_err());
-        assert!(session_dir(&dir, "../etc").is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

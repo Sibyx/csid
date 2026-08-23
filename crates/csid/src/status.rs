@@ -102,6 +102,21 @@ pub struct Snapshot {
 
     /// CSI records the parser produced.
     pub records: u64,
+    /// Of those, how many arrived with an all-zero I/Q matrix.
+    ///
+    /// A subset of [`Snapshot::records`], and the reason `records` alone
+    /// overstates what a session measured: an empty record has a valid header,
+    /// a correct payload length and a plausible RSSI, and carries no channel
+    /// estimate at all. Measured across the fleet on 2026-08-23 at 15–16% of
+    /// delivered records while the yield read 97–99%.
+    ///
+    /// `#[serde(default)]` so a document written by an older csid still parses;
+    /// a reader must treat 0 as "not reported" only when the whole field is
+    /// absent, which it cannot see through this default. That is deliberate —
+    /// the alternative, `Option<u64>`, would push a "was this even measured?"
+    /// branch into every consumer for a field that is now always written.
+    #[serde(default)]
+    pub empty_records: u64,
     /// Frames the radio delivered, whether or not they carried a channel
     /// estimate. The denominator of the yield.
     pub frames_seen: u64,
@@ -122,6 +137,25 @@ impl Snapshot {
     /// at all — which is a different fact from a yield of zero.
     pub fn yield_ratio(&self) -> Option<f64> {
         (self.frames_seen > 0).then(|| self.records as f64 / self.frames_seen as f64)
+    }
+
+    /// The same ratio counting only records that carry a channel estimate.
+    ///
+    /// [`Snapshot::yield_ratio`] answers "did the radio hand us a record?".
+    /// This answers "did we measure the channel?", and on this fleet the two
+    /// differ by fifteen points. Quote this one wherever a corpus size or a
+    /// delivery fraction is being claimed.
+    pub fn useful_yield_ratio(&self) -> Option<f64> {
+        (self.frames_seen > 0).then(|| {
+            self.records.saturating_sub(self.empty_records) as f64 / self.frames_seen as f64
+        })
+    }
+
+    /// Share of delivered records that carried no channel estimate.
+    ///
+    /// `None` when no records have arrived — distinct from a share of zero.
+    pub fn empty_fraction(&self) -> Option<f64> {
+        (self.records > 0).then(|| self.empty_records as f64 / self.records as f64)
     }
 }
 
@@ -228,6 +262,7 @@ mod tests {
             center_freq_mhz: None,
             interval_us: 10_000,
             records: 7791,
+            empty_records: 0,
             frames_seen: 8854,
             rate_hz: 63.8,
             capture_bytes: 5_452_800,
@@ -235,6 +270,40 @@ mod tests {
             live_dropped: 0,
             ble: None,
         }
+    }
+
+    /// The fleet's measured failure: a healthy-looking yield over a stream in
+    /// which one record in six carries nothing.
+    #[test]
+    fn an_empty_record_counts_for_the_yield_and_not_for_the_measurement() {
+        let mut s = snap();
+        s.records = 1000;
+        s.frames_seen = 1015;
+        s.empty_records = 154;
+
+        // What the console used to show, and it is not wrong — the radio really
+        // did deliver 1000 records.
+        assert!((s.yield_ratio().unwrap() - 0.985_221).abs() < 1e-5);
+        // What it measured.
+        assert!((s.useful_yield_ratio().unwrap() - 0.833_497).abs() < 1e-5);
+        assert!((s.empty_fraction().unwrap() - 0.154).abs() < 1e-9);
+
+        // No records at all is a different fact from none of them being empty.
+        s.records = 0;
+        s.empty_records = 0;
+        assert_eq!(s.empty_fraction(), None);
+    }
+
+    /// A document written before the field existed must still parse, and must
+    /// not claim the session was clean.
+    #[test]
+    fn an_older_document_parses_without_the_empty_count() {
+        let s = snap();
+        let mut v: serde_json::Value = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("empty_records");
+        let back: Snapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(back.empty_records, 0);
+        assert_eq!(back.records, s.records);
     }
 
     #[test]

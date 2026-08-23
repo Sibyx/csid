@@ -121,6 +121,45 @@ pub struct Bandplan {
 /// over the DC region and 15 dB of roll-off in the outer few tones.
 pub const ARTEFACT_TONES: usize = 3;
 
+/// The plan for a capture whose channel is in dispute: there isn't one.
+///
+/// The record says one channel and the daemon says another (see
+/// `wire::RadioInfo::channel_mismatch`). Every number below the channel is a
+/// function of it, so the honest output is the disagreement itself. Drawing the
+/// plan for either candidate would state a finding — "BLE cannot appear here",
+/// or a list of advertisers that do — from a premise nobody has established.
+///
+/// The artefact zones are still filled: they are functions of the tone grid
+/// alone, which is not in dispute.
+pub fn disputed(
+    record_channel: u32,
+    tuned_channel: Option<u32>,
+    ntone: usize,
+    spacing_hz: f64,
+) -> Bandplan {
+    let zones = tones::artefact_zones(ntone, ARTEFACT_TONES);
+    Bandplan {
+        applicable: false,
+        wifi_channel: record_channel,
+        ntone,
+        spacing_khz: spacing_hz / 1e3,
+        dc_zone: zones.dc,
+        low_edge_zone: zones.low_edge,
+        high_edge_zone: zones.high_edge,
+        verdict: match tuned_channel {
+            Some(t) => format!(
+                "No band plan: the records carry channel {record_channel} and csid \
+                 says the radio is tuned to channel {t}. Everything here is a \
+                 function of the channel, so nothing is drawn until those agree. \
+                 Check that the tune took effect before trusting this capture."
+            ),
+            None => "No band plan: the capture's channel could not be established."
+                .to_string(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Build the bandplan for a capture on `channel` with `ntone` tones at
 /// `spacing_hz`.
 pub fn compute(channel: u32, ntone: usize, spacing_hz: f64) -> Bandplan {

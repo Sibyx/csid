@@ -157,7 +157,8 @@ fn bench_doppler(c: &mut Criterion) {
     c.bench_function("doppler/256", |b| {
         b.iter(|| {
             let s = dsp::doppler_series(&recs, &ticks, 0, Some(1));
-            std::hint::black_box(dsp::doppler(&s, 256, dsp::wavelength_m(5180.0)))
+            // A pinned axis, as the console always supplies one.
+            std::hint::black_box(dsp::doppler(&s, 256, dsp::wavelength_m(5180.0), 600.0))
         });
     });
 }

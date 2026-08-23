@@ -162,7 +162,7 @@ pub struct CsiRecord {
     pub ntone: u16,
     /// Per-chain RSSI in **dBm** (negative), one entry per RX chain.
     ///
-    /// The absolute amplitude reference for the record: `iq` is AGC-normalised
+    /// The absolute amplitude reference for the record: `iq` is AGC-*relative*
     /// and carries channel *shape* only, so any absolute scale must come from
     /// here. `0` means the chain reported no measurement, not 0 dBm.
     ///
@@ -176,7 +176,8 @@ pub struct CsiRecord {
     /// Monitor-interface width at capture time.
     pub width: Width,
     /// Interleaved I/Q, `i16`, length `2 * ntone * nrx * ntx`, row-major over
-    /// `[tone][chain]`. Stored verbatim (AGC-normalised amplitude).
+    /// `[tone][chain]`. Stored verbatim, so the amplitude carries the
+    /// receiver's gain setting as well as the channel — see `rssi`.
     pub iq: Vec<i16>,
 }
 

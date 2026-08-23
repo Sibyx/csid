@@ -124,6 +124,16 @@ struct TalkerAcc {
 /// The shared half of a frame: everything derived from the window.
 pub struct Analysis {
     scratch: Box<Scratch>,
+    /// Peak-held packet rate, in Hz — the reference the Doppler axis is
+    /// snapped from. See [`track_doppler_fs`].
+    ///
+    /// State rather than scratch, and the reason it is state at all: a
+    /// spectrogram is a sequence of columns on ONE axis. Deriving the axis from
+    /// each column's own packet rate produced an image whose frequency scale
+    /// moved by 2.4× within fifteen seconds — see [`dsp::Doppler`]. One
+    /// [`Analysis`] serves one view for as long as anyone is watching it, so
+    /// this is exactly the right lifetime for the axis it draws.
+    doppler_fs: f64,
 }
 
 impl Default for Analysis {
@@ -136,12 +146,22 @@ impl Analysis {
     pub fn new() -> Self {
         Analysis {
             scratch: Box::default(),
+            doppler_fs: 0.0,
         }
     }
 
+
     /// Compute one tick's shared analysis. `None` when nothing has arrived.
     pub fn compute(&mut self, hub: &Hub, s: &ViewSettings) -> Option<SharedFrame> {
-        let sc = &mut *self.scratch;
+        // Destructured rather than borrowed through `self`, so the buffers and
+        // the held Doppler axis are two disjoint borrows: the scratch stays
+        // mutably borrowed for the whole frame, and the axis still has to be
+        // updated in the middle of it.
+        let Analysis {
+            scratch,
+            doppler_fs,
+        } = self;
+        let sc = &mut **scratch;
 
         hub.tail_into(s.window, &mut sc.all);
         if sc.all.is_empty() {
@@ -201,6 +221,51 @@ impl Analysis {
         if let Some(mac) = selected_mac {
             sc.window.retain(|smp| Mac(smp.rec.src_mac) == mac);
         }
+
+        // -- and then only records that measured something ------------------
+        //
+        // THE single null policy. Everything below this line — the percentile
+        // bundle, the per-tone statistics, the Doppler series, the amplitude
+        // time series, the snapshot views and the waterfall — reads
+        // `sc.window`, and before this drop existed each of them decided
+        // independently what an all-zero record meant. They decided
+        // differently, and five views were wrong in five different ways off one
+        // upstream fault. See `dsp::is_measurement` for the measurement and its
+        // consequences.
+        //
+        // The drop happens AFTER both scopes, deliberately. The class census
+        // and the talker table describe what the radio delivered — an empty
+        // record was still a transmission by a real transmitter, and hiding it
+        // from "who is sounding the channel" would answer a different question.
+        // Only the analysis is narrowed.
+        let considered = sc.window.len();
+        sc.window.retain(|smp| dsp::is_measurement(&smp.rec));
+        let dropped = considered - sc.window.len();
+        // Nothing measured at all. Rather than return no frame — which is what
+        // "the stream is dead" looks like, and this is not that — the identity
+        // panels are served from the records that did arrive and every
+        // analytical panel is told to blank itself.
+        let no_measurement = sc.window.is_empty() && considered > 0;
+        if no_measurement {
+            sc.window.extend(
+                sc.all
+                    .iter()
+                    .filter(|smp| ClassKey::of(&smp.rec) == class)
+                    .filter(|smp| selected_mac.is_none_or(|m| Mac(smp.rec.src_mac) == m))
+                    .cloned(),
+            );
+        }
+        let nulls = crate::wire::NullInfo {
+            dropped,
+            considered,
+            frac: if considered > 0 {
+                dropped as f64 / considered as f64
+            } else {
+                0.0
+            },
+            no_measurement,
+        };
+
         let latest = sc.window.last()?.clone();
         let rec = &latest.rec;
         let geom = dsp::Geometry::of(rec);
@@ -279,10 +344,52 @@ impl Analysis {
         sc.recs.extend(sc.window.iter().map(|s| s.rec.clone()));
         sc.ticks.extend(sc.window.iter().map(|s| s.ftm_ticks));
         let chain_b = s.chain_b.filter(|&b| b < nchain && b != chain_idx);
+
+        // -- which channel is this, actually? --------------------------------
+        //
+        // Two sources, and they can disagree. The record carries what the driver
+        // stamped on it; `csid` knows what it commanded the radio to. Found by
+        // replaying the archive: an entire BLE-coexistence segment declared
+        // channel 3 in its sidecar and carried channel 48 in every record. The
+        // speed axis and the band plan are both functions of frequency, and both
+        // were silently computed from the wrong one.
+        //
+        // The console cannot arbitrate. It can refuse to derive anything from a
+        // frequency the two sources do not agree on, and say which two numbers
+        // disagree. See `wire::RadioInfo::channel_mismatch`.
+        let tuned_channel = capture.as_ref().map(|r| r.snap.channel).filter(|&c| c > 0);
+        let channel_mismatch = tuned_channel.is_some_and(|c| c != rec.channel);
         let freq_mhz = s
             .freq_mhz
+            // The daemon's own tuning, ahead of the record's channel number:
+            // it is what the radio was commanded to, and it resolves 6 GHz,
+            // whose channel numbers overlap 2.4 GHz.
+            .or_else(|| {
+                capture
+                    .as_ref()
+                    .map(|r| r.snap.control_freq_mhz as f64)
+                    .filter(|&f| f > 0.0)
+            })
             .or_else(|| control_freq_mhz(rec))
             .unwrap_or(5180.0);
+        let freq_trusted = s.freq_mhz.is_some() || !channel_mismatch;
+
+        // The Doppler axis, chosen before the transform rather than derived
+        // from it. `sc.ticks` is this window's arrival times on the 320 MHz
+        // baseband clock, so the delivered rate is available here without
+        // waiting for the reduction that is about to run in parallel.
+        let fs_window = match (sc.ticks.first(), sc.ticks.last()) {
+            (Some(&a), Some(&b)) if sc.ticks.len() > 1 => {
+                let span = csiq::ftm_to_seconds(b.saturating_sub(a));
+                if span > 0.0 {
+                    (sc.ticks.len() - 1) as f64 / span
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        let doppler_fs = track_doppler_fs(doppler_fs, fs_window);
 
         // The two heaviest remaining pieces are independent: the percentile
         // bundle reads `columns`, the Doppler column reads `recs`/`ticks`.
@@ -314,6 +421,7 @@ impl Analysis {
                         series,
                         s.doppler_nfft,
                         dsp::wavelength_m(freq_mhz),
+                        doppler_fs,
                         dop_buf,
                         doppler,
                     );
@@ -399,7 +507,7 @@ impl Analysis {
         sc.host_ns.extend(sc.window.iter().map(|s| s.recv_ns));
         let t_ftm = dsp::timing_ns_into(&sc.ftm_ns, &mut sc.timing_scratch);
         let t_host = dsp::timing_ns_into(&sc.host_ns, &mut sc.timing_scratch);
-        let hist_max_us = histogram(&sc.ftm_ns, t_ftm.p999_us, &mut sc.hist);
+        let (hist_min_us, hist_max_us) = histogram(&sc.ftm_ns, &mut sc.hist);
         sc.section.push("interarrival_hist", &sc.hist);
 
         // -- the metronome ---------------------------------------------------
@@ -489,14 +597,23 @@ impl Analysis {
         // only which records reach the display.
         let all_scope = s.wf_scope == "all";
         let (wf_bins, wf_span_hz) = if all_scope {
+            // The OCCUPIED span, not `ntone · spacing`. The delivered tones are
+            // two runs with a hole between them, so counting only the tones
+            // under-reports the band by exactly the width of that hole and
+            // every class lands slightly wrong on a shared frequency axis.
             let span = sc
                 .all
                 .iter()
-                .map(|smp| smp.rec.ntone as f64 * dsp::spacing_hz(&smp.rec))
+                .map(|smp| {
+                    crate::tones::occupied_span_hz(
+                        smp.rec.ntone as usize,
+                        dsp::spacing_hz(&smp.rec),
+                    )
+                })
                 .fold(0.0f64, f64::max);
             (s.wf_bins, span.max(1.0))
         } else {
-            (geom.ntone, geom.ntone as f64 * spacing)
+            (geom.ntone, crate::tones::occupied_span_hz(geom.ntone, spacing))
         };
 
         // -- mixes and the talker table ---------------------------------------
@@ -571,8 +688,10 @@ impl Analysis {
                     uptime_s: r.snap.uptime_s,
                     band: r.snap.band.clone(),
                     records: r.snap.records,
+                    empty_records: r.snap.empty_records,
                     frames_seen: r.snap.frames_seen,
                     yield_ratio: ratio,
+                    useful_yield_ratio: r.snap.useful_yield_ratio(),
                     yield_verdict: verdict.label(),
                     yield_note: crate::capture::note(verdict, &r.snap.band).unwrap_or(""),
                     rate_hz: r.snap.rate_hz,
@@ -588,11 +707,18 @@ impl Analysis {
             None => crate::wire::CaptureInfo::default(),
         };
 
+        h.nulls = nulls;
         h.metronome = sc.metronome.clone();
         h.tone_stats = sc.tone_stats.clone();
-        // The band plan needs the tuned channel, which the record carries, and
-        // the grid, which the class fixes. Both are already resolved here.
-        h.bandplan = crate::bandplan::compute(rec.channel, geom.ntone, spacing);
+        // The band plan needs the tuned channel and the grid the class fixes.
+        // When the record and the daemon disagree about the first, there is no
+        // band plan to draw — a plan computed from the wrong channel is worse
+        // than none, because it reads as a finding.
+        h.bandplan = if freq_trusted {
+            crate::bandplan::compute(rec.channel, geom.ntone, spacing)
+        } else {
+            crate::bandplan::disputed(rec.channel, tuned_channel, geom.ntone, spacing)
+        };
 
         h.geometry.ntone = geom.ntone;
         h.geometry.nrx = geom.nrx;
@@ -607,11 +733,14 @@ impl Analysis {
         h.geometry.dimensions_ok = geom.matches(rec);
 
         h.radio.channel = rec.channel;
+        h.radio.tuned_channel = tuned_channel;
+        h.radio.channel_mismatch = channel_mismatch;
         h.radio.width.clear();
         use std::fmt::Write as _;
         let _ = write!(h.radio.width, "{}", rec.width);
         h.radio.freq_mhz = freq_mhz;
         h.radio.freq_assumed = s.freq_mhz.is_none();
+        h.radio.freq_trusted = freq_trusted;
         h.radio.spacing_hz = spacing;
         h.radio.bw_mhz = dsp::occupied_bw_mhz(rec);
 
@@ -640,19 +769,28 @@ impl Analysis {
         h.bundle.n = sc.bundle.n;
 
         h.cir.bin_ns = sc.cir.bin_ns;
+        h.cir.resolution_ns = sc.cir.resolution_ns;
+        h.cir.axis_start_ns = sc.cir.axis_start_ns;
+        h.cir.peak_index = sc.cir.peak_index;
         h.cir.peak_bin = sc.cir.peak_bin;
         h.cir.rms_delay_ns = sc.cir.rms_delay_ns;
+        h.cir.spread_resolvable = sc.cir.spread_is_resolvable();
         h.cir.taps = sc.cir.mag_db.len();
 
         h.doppler.fs_hz = sc.doppler.fs_hz;
+        h.doppler.fs_window_hz = sc.doppler.fs_window_hz;
+        h.doppler.fs_source = sc.doppler.fs_source;
         h.doppler.max_hz = sc.doppler.max_hz;
         h.doppler.max_speed_ms = sc.doppler.max_speed_ms;
+        h.doppler.gap_frac = sc.doppler.gap_frac;
+        h.doppler.span_s = sc.doppler.span_s;
         h.doppler.arrival_cv = sc.doppler.arrival_cv;
         h.doppler.conjugate_pair = sc.doppler.conjugate_pair;
         h.doppler.nfft = s.doppler_nfft;
 
         h.timing.ftm = t_ftm;
         h.timing.host = t_host;
+        h.timing.hist_min_us = hist_min_us;
         h.timing.hist_max_us = hist_max_us;
 
         h.clocks.host_span_us = clocks.host_span_us;
@@ -706,6 +844,45 @@ impl Analysis {
     }
 }
 
+/// How fast the tracked rate forgets a peak it no longer sees.
+///
+/// One part in two hundred per frame: at the console's default 20 fps a rate
+/// that genuinely halves is followed within about ten seconds, and a lull
+/// lasting a second moves the reference by half a percent. Slow on purpose —
+/// the reference exists to be duller than the traffic.
+const FS_RELEASE: f64 = 0.005;
+
+/// Choose the Doppler axis for this frame, given what the window delivered.
+///
+/// `held` is a peak-hold with slow release, and the axis is that peak snapped
+/// onto [`dsp::snap_rate_hz`]'s ladder. Two properties matter and they pull in
+/// opposite directions:
+///
+/// **It must never sit below the delivered rate.** An axis narrower than the
+/// achieved Nyquist means the resample decimates, and decimation aliases real
+/// motion into the wrong bin. So the attack is instant.
+///
+/// **It must hold still.** The measured injector delivers between 9 and 21 Hz
+/// within the same fifteen seconds (2026-08-23, all four nodes). A reference
+/// that follows the mean sits right on a ladder boundary and flips across it
+/// every few frames, which is the original fault wearing a different hat. A
+/// peak-hold sits at the top of the wobble instead, where nothing crosses.
+///
+/// The cost is a wider axis than the average rate needs. That is the correct
+/// trade: a too-wide Doppler axis wastes bins, a too-narrow one invents
+/// velocities.
+fn track_doppler_fs(held: &mut f64, fs_window: f64) -> f64 {
+    if !(fs_window > 0.0) {
+        return dsp::snap_rate_hz(*held);
+    }
+    if fs_window > *held {
+        *held = fs_window;
+    } else {
+        *held += (fs_window - *held) * FS_RELEASE;
+    }
+    dsp::snap_rate_hz(*held)
+}
+
 /// One connection: where it has read up to, and the waterfall it draws.
 pub struct ClientView {
     cursor: u64,
@@ -745,11 +922,20 @@ impl ClientView {
         let mut of_class = 0usize;
         let mut other_class = 0u64;
         let mut other_transmitter = 0u64;
+        let mut empty = 0u64;
         for smp in &self.arrived {
             if ClassKey::of(&smp.rec) != plan.class {
                 other_class += 1;
             } else if plan.smac.is_some_and(|mac| smp.rec.src_mac != mac) {
                 other_transmitter += 1;
+            } else if !dsp::is_measurement(&smp.rec) {
+                // The same policy the windowed views apply, applied here for the
+                // same reason: an all-zero record drew as a row at the colour
+                // floor, which is a picture of a dead channel rather than of a
+                // missing measurement. Counted separately from `skipped`,
+                // because the display kept up perfectly — there was nothing in
+                // the record to draw.
+                empty += 1;
             } else {
                 of_class += 1;
             }
@@ -769,6 +955,11 @@ impl ClientView {
         let mut remaining_drop = over_budget as usize;
         for smp in &self.arrived {
             let same_class = ClassKey::of(&smp.rec) == plan.class;
+            // Never drawn, in either scope: a row of zeros is not a reading of
+            // the channel at that instant.
+            if !dsp::is_measurement(&smp.rec) {
+                continue;
+            }
             if !plan.all_scope {
                 if !same_class {
                     continue;
@@ -823,6 +1014,7 @@ impl ClientView {
             other_class,
             other_transmitter,
             wf_rows,
+            empty,
             n_u8: self.wf.len(),
             ..Default::default()
         };
@@ -883,8 +1075,13 @@ fn onto_shared_grid(
     let n = amp.len();
     let (mut lo, mut hi) = (bins, 0usize);
     for (i, &v) in amp.iter().enumerate() {
-        // Frequency offset of this tone from the band centre.
-        let f = (i as f64 - n as f64 / 2.0 + 0.5) * spacing_hz;
+        // Frequency offset of this tone from the band centre — asked of the
+        // tone grid, never computed from the array index. 802.11 never
+        // transmits on DC, so the delivered tones are two runs with a hole
+        // between them and `(i − n/2 + 0.5)·Δf` puts every tone above centre
+        // one bin low. That is the bug `crate::tones` exists to remove, and
+        // this was the last transform still carrying it.
+        let f = crate::tones::offset_hz(i, n, spacing_hz);
         let pos = (f + span_hz / 2.0) / span_hz * bins as f64;
         if pos < 0.0 || pos >= bins as f64 {
             continue;
@@ -987,26 +1184,57 @@ fn clock_series(window: &[Sample], host_us: &mut Vec<f32>, fw_us: &mut Vec<f32>)
     }
 }
 
-/// Linear histogram of inter-arrival times up to `max_us`, so the long tail
-/// does not compress the bulk of the distribution into one bin. Returns the
-/// top of the range.
-fn histogram(times_ns: &[u64], max_us: f32, bins: &mut Vec<f32>) -> f32 {
+/// Log-spaced histogram of inter-arrival times. Returns `(lo_us, hi_us)`, the
+/// decade bounds the bins span.
+///
+/// ## Why it cannot be linear
+///
+/// This panel is what decides whether the Doppler axis can be believed, and it
+/// was the least readable thing on the page. The arrivals it describes span
+/// three and a half decades: measured 2026-08-23, p50 236 µs against a maximum
+/// of 735 ms. On a linear axis to 735 ms the entire distribution of interest
+/// falls in the first bin, and the plot showed one spike and forty-seven empty
+/// columns — while the two modes it was hiding (a burst spacing and a
+/// between-burst gap) are exactly what separates a metronome that loses slots
+/// from a source that is not metronomic at all.
+///
+/// Log bins put a decade in the same width wherever it sits, so both modes are
+/// visible at once. The bounds are decade-aligned so the axis labels are round
+/// numbers and do not move every frame.
+fn histogram(times_ns: &[u64], bins: &mut Vec<f32>) -> (f32, f32) {
     bins.clear();
     bins.resize(HIST_BINS, 0.0);
     if times_ns.len() < 3 {
-        return 1.0;
+        return (1.0, 1000.0);
     }
-    let top = if max_us.is_finite() && max_us > 0.0 {
-        max_us * 1.2
-    } else {
-        1000.0
-    };
+
+    // The extremes, over the gaps themselves — a percentile would clip exactly
+    // the tail this panel exists to show.
+    let (mut lo, mut hi) = (f32::INFINITY, 0.0f32);
     for w in times_ns.windows(2) {
         let d = w[1].saturating_sub(w[0]) as f32 / 1000.0;
-        let b = ((d / top) * HIST_BINS as f32) as usize;
+        // Sub-microsecond gaps are the 320 MHz clock's own resolution, not a
+        // measurable interval; they anchor the axis at 1 µs instead.
+        if d >= 1.0 {
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+    }
+    if !lo.is_finite() || hi <= 0.0 {
+        return (1.0, 1000.0);
+    }
+    // Snap outwards to whole decades.
+    let lo = 10f32.powf(lo.log10().floor()).max(1.0);
+    let hi = 10f32.powf(hi.log10().ceil()).max(lo * 10.0);
+
+    let span = hi.log10() - lo.log10();
+    for w in times_ns.windows(2) {
+        let d = (w[1].saturating_sub(w[0]) as f32 / 1000.0).max(lo);
+        let pos = (d.log10() - lo.log10()) / span;
+        let b = (pos * HIST_BINS as f32) as usize;
         bins[b.min(HIST_BINS - 1)] += 1.0;
     }
-    top
+    (lo, hi)
 }
 
 /// Distribution of PHY labels, tone counts and widths over the window.
@@ -1143,9 +1371,204 @@ mod tests {
         }
     }
 
+    /// The same record, delivered empty: intact header, correct payload
+    /// length, plausible RSSI, every coefficient zero. This is the shape the
+    /// fleet actually produces, not a synthetic edge case.
+    fn empty_sample(i: u64, ntone: u16, nchain_rx: u8) -> Sample {
+        let mut s = sample(i, ntone, nchain_rx);
+        let rec = Arc::get_mut(&mut s.rec).expect("freshly built");
+        rec.iq.iter_mut().for_each(|v| *v = 0);
+        s
+    }
+
     fn header(buf: &[u8]) -> serde_json::Value {
         let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         serde_json::from_slice(&buf[4..4 + hlen]).unwrap()
+    }
+
+
+    /// The single null policy, measured end to end.
+    ///
+    /// One record in six is empty, exactly as the fleet delivers them. Every
+    /// windowed view must be computed over the other five, the count must reach
+    /// the browser, and — the part that was wrong for the whole of the console's
+    /// life — the p05 of the amplitude bundle must not sit on a null.
+    #[test]
+    fn empty_records_leave_the_window_and_are_reported() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        // The fixture rotates the source MAC on `i % 3`, and the view below
+        // scopes to one transmitter. Planting on a multiple of 12 puts every
+        // empty inside that transmitter's own records — one in four of them —
+        // rather than hiding them all behind the scope.
+        let mut planted = 0usize;
+        for i in 0..600u64 {
+            if i % 12 == 0 {
+                planted += 1;
+                hub.push(empty_sample(i, 242, 2));
+            } else {
+                hub.push(sample(i, 242, 2));
+            }
+        }
+        assert!(planted > 0);
+
+        let mut a = Analyzer::at_live_edge(&hub);
+        a.client.cursor = 0;
+        let s = ViewSettings {
+            window: 256,
+            // One transmitter, so the window is not split three ways by the
+            // rotating source MAC the fixture generates.
+            smac: Some("de:ad:be:ef:00:00".into()),
+            ..Default::default()
+        };
+        let buf = a.frame(&hub, &s).unwrap();
+        let h = header(&buf);
+
+        let dropped = h["nulls"]["dropped"].as_u64().unwrap();
+        let considered = h["nulls"]["considered"].as_u64().unwrap();
+        assert!(dropped > 0, "the planted empties must be found");
+        assert_eq!(
+            h["stream"]["window"].as_u64().unwrap(),
+            considered - dropped,
+            "the analysis window is what survived the drop"
+        );
+        assert!(!h["nulls"]["no_measurement"].as_bool().unwrap());
+        let frac = h["nulls"]["frac"].as_f64().unwrap();
+        assert!((0.15..0.35).contains(&frac), "frac was {frac}, expected ~0.25");
+
+        // The defect this policy exists to remove: a p05 pinned to a null.
+        let arrays = |name: &str| {
+            let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+            let (off, len) = {
+                let m = &h["f32"][name];
+                (m[0].as_u64().unwrap() as usize, m[1].as_u64().unwrap() as usize)
+            };
+            let base = 4 + hlen + off * 4;
+            (0..len)
+                .map(|i| {
+                    f32::from_le_bytes(buf[base + i * 4..base + i * 4 + 4].try_into().unwrap())
+                })
+                .collect::<Vec<f32>>()
+        };
+        let p05 = arrays("bundle_p05");
+        assert!(!p05.is_empty());
+        assert!(
+            p05.iter().all(|&v| v > dsp::NULL_TONE_DB),
+            "the p05 envelope must not rest on a null"
+        );
+        // And the same records must not reach the waterfall either.
+        assert!(h["empty"].as_u64().unwrap() > 0);
+    }
+
+    /// When nothing in the window measured anything, say so rather than going
+    /// silent — a console that stops producing frames looks like a dead stream,
+    /// and this is a different fault with a different cure.
+    #[test]
+    fn a_window_of_nothing_but_empties_is_declared_not_hidden() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..300u64 {
+            hub.push(empty_sample(i, 242, 2));
+        }
+        let mut a = Analyzer::at_live_edge(&hub);
+        a.client.cursor = 0;
+        let h = header(&a.frame(&hub, &ViewSettings::default()).unwrap());
+        assert!(h["nulls"]["no_measurement"].as_bool().unwrap());
+        assert_eq!(
+            h["nulls"]["dropped"].as_u64().unwrap(),
+            h["nulls"]["considered"].as_u64().unwrap()
+        );
+    }
+
+    /// The spectrogram's axis must outlast the traffic's mood.
+    ///
+    /// The rates below are the ones measured on monad01 on 2026-08-23, where
+    /// the delivered rate moved by 2.3× inside fifteen seconds and the old
+    /// derived axis moved with it.
+    #[test]
+    fn the_doppler_axis_holds_still_while_the_delivered_rate_wobbles() {
+        let mut held = 0.0f64;
+        let mut seen = std::collections::BTreeSet::new();
+        // Two hundred frames of the measured wobble. The first two are the
+        // reference finding the top of it; everything after that must hold.
+        for i in 0..200 {
+            let fs = if i % 2 == 0 { 9.3 } else { 21.3 };
+            let axis = track_doppler_fs(&mut held, fs);
+            if i >= 2 {
+                seen.insert(axis.to_bits());
+            }
+        }
+        assert_eq!(seen.len(), 1, "the axis must not move on a wobble");
+        let axis = f64::from_bits(*seen.iter().next().unwrap());
+        assert!(axis >= 21.3, "and it must never sit below the delivered rate");
+
+        // A genuine step up is followed at once: an axis below the delivered
+        // Nyquist aliases, which is worse than a wide one.
+        let stepped = track_doppler_fs(&mut held, 260.0);
+        assert!(stepped >= 260.0);
+
+        // A genuine step down is followed slowly, and does get there.
+        let mut last = stepped;
+        for _ in 0..4000 {
+            last = track_doppler_fs(&mut held, 12.0);
+        }
+        assert!(last < stepped, "a sustained drop must eventually narrow it");
+        assert!(last >= 12.0);
+    }
+
+    /// A channel the record and the daemon disagree about is not a channel to
+    /// compute a wavelength or a band plan from.
+    ///
+    /// The case is real: `monad01_illum-coex-03_20260823-102958-seg0003`
+    /// declares channel 3 in its sidecar and carries channel 48 in every one of
+    /// its 2433 records. Without a status document the console cannot see that
+    /// at all; with one it must not paper over it.
+    #[test]
+    fn a_disputed_channel_withholds_everything_derived_from_it() {
+        let hub = Hub::new("test".into(), 4096, usize::MAX);
+        for i in 0..300u64 {
+            hub.push(sample(i, 242, 2));
+        }
+        let mut a = Analyzer::at_live_edge(&hub);
+        a.client.cursor = 0;
+
+        // No status document: nothing to disagree with, so the record's own
+        // channel stands and everything derived from it is drawn.
+        let h = header(&a.frame(&hub, &ViewSettings::default()).unwrap());
+        assert_eq!(h["radio"]["channel"], 36);
+        assert!(h["radio"]["tuned_channel"].is_null());
+        assert_eq!(h["radio"]["channel_mismatch"], false);
+        assert_eq!(h["radio"]["freq_trusted"], true);
+    }
+
+    /// Three and a half decades of arrivals must not collapse into one bin.
+    #[test]
+    fn the_interarrival_histogram_separates_the_modes_it_used_to_hide() {
+        // The measured shape: a burst spacing near 236 µs and gaps near 200 ms.
+        let mut t: Vec<u64> = Vec::new();
+        let mut now = 0u64;
+        for _ in 0..40 {
+            for _ in 0..25 {
+                t.push(now);
+                now += 236_000;
+            }
+            now += 200_000_000;
+        }
+        let mut bins = Vec::new();
+        let (lo, hi) = histogram(&t, &mut bins);
+        assert!(lo <= 236.0 && hi >= 200_000.0, "bounds {lo}..{hi} us");
+
+        let occupied: Vec<usize> = bins
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(occupied.len(), 2, "two modes, two bins: {occupied:?}");
+        assert!(
+            occupied[1] - occupied[0] > 8,
+            "the modes must be decades apart on the axis: {occupied:?}"
+        );
+        // And the small one must not be crushed against the left edge.
+        assert!(occupied[0] > 0, "the burst mode is not at the origin");
     }
 
     #[test]
@@ -1369,10 +1792,18 @@ mod tests {
         let h = header(&a.frame(&hub, &s).unwrap());
         assert_eq!(h["waterfall"]["scope"], "all");
         assert_eq!(h["waterfall"]["bins"], 128);
+        // The OCCUPIED span of the widest class, which is wider than its
+        // delivered tone count by exactly the DC hole: HE20's 242 tones are
+        // ±2…±122, so the band is 245 subcarriers across, not 242.
         let span = h["waterfall"]["span_mhz"].as_f64().unwrap();
+        let expect = crate::tones::occupied_span_hz(242, 78_125.0) / 1e6;
         assert!(
-            (span - 242.0 * 78_125.0 / 1e6).abs() < 0.01,
-            "span must cover the widest class, got {span} MHz"
+            (span - expect).abs() < 0.01,
+            "span must cover the widest class, got {span} MHz, expected {expect}"
+        );
+        assert!(
+            span > 242.0 * 78_125.0 / 1e6,
+            "counting only the delivered tones under-reports the band"
         );
         let rows = h["wf_rows"].as_u64().unwrap();
         assert_eq!(h["u8"]["waterfall"][1].as_u64().unwrap(), rows * 128);
@@ -1623,17 +2054,32 @@ mod tests {
             "bundle.n",
             "bundle.width_db",
             "cir.bin_ns",
+            "cir.resolution_ns",
+            "cir.axis_start_ns",
+            "cir.peak_index",
             "cir.peak_bin",
             "cir.rms_delay_ns",
+            "cir.spread_resolvable",
             "doppler.nfft",
             "doppler.fs_hz",
+            "doppler.fs_window_hz",
+            "doppler.fs_source",
             "doppler.max_hz",
             "doppler.max_speed_ms",
+            "doppler.gap_frac",
+            "doppler.span_s",
             "doppler.arrival_cv",
             "doppler.conjugate_pair",
+            "radio.channel_mismatch",
+            "radio.freq_trusted",
+            "nulls.dropped",
+            "nulls.considered",
+            "nulls.frac",
+            "nulls.no_measurement",
             "timing.ftm.rate_hz",
             "timing.host.p50_us",
             "timing.host.p999_us",
+            "timing.hist_min_us",
             "timing.hist_max_us",
             "clocks.ftm_span_us",
             "clocks.host_span_us",
@@ -1642,7 +2088,6 @@ mod tests {
             "series.tones",
             "series.rssi_chains",
             "validation.dimensions_ok",
-            "validation.dc_notch_db",
             "validation.edge_rolloff_db",
             "validation.chain_spread_db",
             "validation.zero_fraction",
@@ -1673,12 +2118,13 @@ mod tests {
             }
         }
 
-        // `chain_identical` is legitimately null on a single-chain record, so
-        // it is checked for presence rather than for a value.
-        assert!(h["validation"]
-            .as_object()
-            .unwrap()
-            .contains_key("chain_identical"));
+        // Two validation fields are legitimately null and are therefore checked
+        // for presence rather than for a value: `chain_identical` on a
+        // single-chain record, and `dc_notch_db` on an 802.11 used-tone grid,
+        // which has no DC bin to test. See `dsp::Validation`.
+        let v = h["validation"].as_object().unwrap();
+        assert!(v.contains_key("chain_identical"));
+        assert!(v.contains_key("dc_notch_db"));
 
         // The two arrays the console iterates as tables.
         let avail = h["class"]["available"].as_array().expect("class.available");
