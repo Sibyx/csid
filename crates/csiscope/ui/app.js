@@ -1368,18 +1368,38 @@ function renderStrip(f) {
   // and both shrink it. A Doppler spectrogram computed over 139 records when
   // 256 were asked for is a different measurement, so the narrowing is stated
   // rather than left to be discovered.
+  // What the analysis ran over, in one sentence that HOLDS STILL.
+  //
+  // This line used to mix two kinds of number and it read as noise. The window
+  // counts are properties of the window and change slowly; `skipped`,
+  // `other_class` and `other_transmitter` are per-FRAME counts of what arrived
+  // in the last 50 ms, so at 20 fps they flickered between "1 other
+  // transmitter" and "2 other transmitters" and nothing several times a second,
+  // in a footer nobody can read at that rate. Worse, the two were separated
+  // only by a dot, so a per-frame count looked like a property of the capture.
+  //
+  // Now: the footer states the scope, which is stable, and says how many
+  // transmitters and classes are ON THE CHANNEL — both from the census, which
+  // is a window quantity. The per-frame arrival counts belong to the waterfall,
+  // which is where they are already reported and where they refer to something
+  // the reader can see.
   const st = h.stream;
-  const scope = [];
-  if (st.window_all !== st.window_class) scope.push(`${st.window_class} of class`);
-  if (st.window_class !== st.window) {
-    scope.push(`${st.window} from ${h.transmitter.selected || 'one transmitter'}`);
-  }
   const parts = [`${st.window_all} in window`];
-  if (scope.length) parts.push('→ ' + scope.join(' → '));
-  if (h.skipped) parts.push(`${h.skipped} not drawn`);
-  if (h.other_class) parts.push(`${h.other_class} other classes`);
-  if (h.other_transmitter) parts.push(`${h.other_transmitter} other transmitters`);
-  $('s-skip').textContent = parts.join(' · ');
+  if (st.window_all !== st.window_class) {
+    parts.push(`${st.window_class} of ${h.class.label}`);
+  }
+  if (st.window_class !== st.window) {
+    parts.push(`${st.window} from ${h.transmitter.selected || 'one transmitter'}`);
+  }
+  const others = Math.max(0, (h.transmitter.available || []).length - 1);
+  if (others > 0) {
+    parts.push(`${others} other transmitter${others === 1 ? '' : 's'} on air`);
+  }
+  const classes = Math.max(0, (h.class.available || []).length - 1);
+  if (classes > 0) {
+    parts.push(`${classes} other class${classes === 1 ? '' : 'es'}`);
+  }
+  $('s-skip').textContent = parts.join(' → ');
 }
 
 // -- the render loop ----------------------------------------------------------
