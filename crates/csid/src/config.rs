@@ -781,12 +781,60 @@ impl Default for StreamConfig {
 }
 
 /// Post-capture export behaviour.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     /// Produce a `.csiq` alongside `capture.raw` when the session closes.
     #[serde(default)]
     pub on_close: bool,
+    /// Keep the 272-byte driver header verbatim in every record (TLV `0x14`).
+    ///
+    /// Lossless provenance: a field this build cannot name is still in the blob
+    /// at the offset the spec's Appendix A gives it, so a later reader recovers
+    /// it with no re-capture. That is how per-frame bandwidth was recovered for
+    /// the whole archive from `rate_n_flags` — except that one happened to be
+    /// stored already, and the next one will not be.
+    ///
+    /// Costs 272 B per record before compression. The header is 203 constant
+    /// bytes out of 272 on a real capture, which is the most compressible thing
+    /// in the record, so the exported `.csiq.zst` absorbs most of it — see
+    /// [`crate::export::CSIQ_NAME`].
+    ///
+    /// Default **on**: the whole point of Phase 6 is that the archive stops
+    /// discarding 238 of 272 bytes it was already handed.
+    #[serde(default = "default_true")]
+    pub keep_vendor_hdr: bool,
+    /// Record node and host state in the stream, once per this many seconds.
+    ///
+    /// `0` disables it. See [`crate::nodestate`] for why the file carries state
+    /// the metrics store already has.
+    #[serde(default = "default_node_state_seconds")]
+    pub node_state_seconds: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_node_state_seconds() -> u64 {
+    60
+}
+
+/// Hand-written, NOT derived.
+///
+/// `derive(Default)` would give `keep_vendor_hdr = false` when the whole
+/// `[export]` table is absent while serde's field default gives `true` when the
+/// table exists without the key — one setting with two answers, decided by
+/// whether an unrelated key happens to be present. Every default lives here and
+/// the field attributes point at the same functions.
+impl Default for ExportConfig {
+    fn default() -> Self {
+        ExportConfig {
+            on_close: false,
+            keep_vendor_hdr: default_true(),
+            node_state_seconds: default_node_state_seconds(),
+        }
+    }
 }
 
 // -- loading + validation -----------------------------------------------------

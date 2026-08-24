@@ -173,6 +173,33 @@ pub struct EnvironmentMeta {
     pub build: BuildMeta,
 }
 
+/// One node-and-host-state reading, stamped with when it was taken.
+///
+/// A sparse SERIES, not a per-record column. It lives in the session block
+/// rather than on the records because the `.csiq` is derived from `capture.raw`
+/// at teardown: a per-record sample attached during export would carry the
+/// teardown instant on every record, which is a fabricated timestamp on a real
+/// measurement. Sampling in the capture loop and stamping each reading is the
+/// only way the times mean anything.
+///
+/// The TLV codes `0x40`–`0x43` remain allocated for the live datagram path,
+/// where a record IS produced in the moment and the stamp is implicit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStateSample {
+    /// Seconds since the session opened. Relative on purpose — the fleet has no
+    /// RTC and `chrony` may step the wallclock mid-session, which would move an
+    /// absolute stamp and leave the reading describing the wrong instant.
+    pub at_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_mc: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle_flags: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_m: Option<u32>,
+}
+
 /// Close-time capture statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SummaryMeta {
@@ -219,6 +246,12 @@ pub struct SummaryMeta {
     /// the same mistake as reading a frame rate as a CSI rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transmitters: Option<TransmitterCensus>,
+    /// Node and host state through the session (IP-139 Phase 6).
+    ///
+    /// Empty when sampling is disabled or the session was too short for a tick.
+    /// An empty series means "not sampled", never "the node was idle and cool".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_state: Vec<NodeStateSample>,
 }
 
 /// Per-source-MAC record counts for one capture directory.

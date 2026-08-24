@@ -233,6 +233,38 @@ pub struct PhyLabel {
     pub nss: u8,
 }
 
+/// Node and host state, sampled periodically rather than per record.
+///
+/// A capture a stranger can interpret must carry the conditions it was taken
+/// under, and this project's own experience says which ones matter: the SoC die
+/// temperature orders phase drift, a throttled node is a different instrument,
+/// and a spool at its floor is how a 16-hour arm loses its last three hours.
+///
+/// Every field is optional because the sampler attaches a tick to the FIRST
+/// record after it fires. Most records carry none, and a reader must treat these
+/// as a sparse series, never as a per-record column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeState {
+    /// SoC die temperature, millidegrees Celsius.
+    pub temp_mc: Option<i32>,
+    /// Raspberry Pi throttle bitmask. Non-zero means the SoC was capped.
+    pub throttle_flags: Option<u32>,
+    /// Bytes free on the capture spool filesystem.
+    pub spool_free_bytes: Option<u64>,
+    /// 1-minute load average times 1000.
+    pub load_m: Option<u32>,
+}
+
+impl NodeState {
+    /// True when the sampler attached nothing to this record.
+    pub fn is_empty(&self) -> bool {
+        self.temp_mc.is_none()
+            && self.throttle_flags.is_none()
+            && self.spool_free_bytes.is_none()
+            && self.load_m.is_none()
+    }
+}
+
 /// A single CSI record: the triple-clock provenance, PHY labels, per-chain
 /// RSSI, geometry, source, and the raw CSI matrix.
 ///
@@ -259,6 +291,23 @@ pub struct CsiRecord {
     /// record whose `rnf` was unavailable. Absent is not 20 MHz.
     #[serde(default)]
     pub bw_antsel: Option<BwAntsel>,
+    /// `CLOCK_MONOTONIC` microseconds, the clock an NTP step cannot distort.
+    ///
+    /// **`None` means this record is the node's own transmission looped back**,
+    /// not that the clock was unavailable. Measured as an exact biconditional
+    /// over 2,433 records on one node — see [`crate::raw::decode_mono_us`].
+    #[serde(default)]
+    pub mono_us: Option<u64>,
+    /// The 272-byte driver header verbatim, when the writer kept it.
+    ///
+    /// Lossless provenance: a field this build cannot name is still in here at
+    /// the offset Appendix A gives it, so a later reader can recover it with no
+    /// re-capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_hdr: Option<Vec<u8>>,
+    /// Node and host state, when the sampler attached a tick to this record.
+    #[serde(default, skip_serializing_if = "NodeState::is_empty")]
+    pub node: NodeState,
     /// 802.11 sequence byte (NOT a reliable completeness counter — see spec).
     pub seq: u8,
     /// Number of RX chains.

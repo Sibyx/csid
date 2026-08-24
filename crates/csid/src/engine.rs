@@ -559,6 +559,17 @@ pub fn run_session(
     let mut last_status = Instant::now();
     let mut last_status_records: u64 = 0;
     let mut last_status_ble: u64 = 0;
+
+    // Node and host state, sampled in the CAPTURE loop so each reading carries
+    // the instant it was taken. The export cannot do this: it runs at teardown
+    // and would stamp every reading with the same, wrong, moment.
+    let mut node_sampler = (cfg.export.node_state_seconds > 0).then(|| {
+        crate::nodestate::Sampler::new(
+            global.node.spool.clone(),
+            Duration::from_secs(cfg.export.node_state_seconds),
+        )
+    });
+    let mut node_state: Vec<crate::sidecar::NodeStateSample> = Vec::new();
     status_snap.state = crate::status::STATE_CAPTURING.to_string();
 
     let status = loop {
@@ -577,6 +588,19 @@ pub fn run_session(
         }
 
         crate::notify::watchdog();
+
+        if let Some(s) = node_sampler.as_mut() {
+            let reading = s.take();
+            if !reading.is_empty() {
+                node_state.push(crate::sidecar::NodeStateSample {
+                    at_s: started.elapsed().as_secs(),
+                    temp_mc: reading.temp_mc,
+                    throttle_flags: reading.throttle_flags,
+                    spool_free_bytes: reading.spool_free_bytes,
+                    load_m: reading.load_m,
+                });
+            }
+        }
 
         if let Some(w) = &status_writer {
             if last_status.elapsed() >= STATUS_EVERY {
@@ -725,6 +749,11 @@ pub fn run_session(
         summarize(&raw_paths, cfg, &counters, &ts_macs)
     };
 
+    // The series the capture loop measured. Attached here rather than inside
+    // `summarize`, which reads `capture.raw` and has no access to a clock that
+    // ran while the capture did.
+    summary.node_state = node_state;
+
     // A persisted session gets its rate from the FTM span across `capture.raw`,
     // which is the better clock. A stream-only session has no file to span, so
     // without this its sidecar would report the records it captured beside a rate
@@ -780,11 +809,12 @@ pub fn run_session(
     if cfg.export.on_close {
         if let Some(p) = &raw_path {
             let session = serde_json::to_value(&sidecar).ok();
-            match export::raw_to_csiq_with_session(
+            match export::raw_to_csiq_lossless(
                 p,
-                &dir.join("capture.csiq"),
+                &dir.join(export::CSIQ_NAME),
                 cfg.radio.width.to_csiq(),
                 session.as_ref(),
+                cfg.export.keep_vendor_hdr,
             ) {
                 Ok(n) => tracing::info!(records = n, "exported capture.csiq"),
                 Err(e) => tracing::error!(error = %e, "CSIQ export failed (raw capture is intact)"),
@@ -1111,6 +1141,9 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
         // reader to serve. Left to the segments, which is where it answers a
         // question that could not otherwise be answered before teardown.
         transmitters: None,
+        // Filled by the caller from the capture loop's own sampler; this
+        // constructor has no clock and must not invent one.
+        node_state: Vec::new(),
     }
 }
 

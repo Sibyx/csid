@@ -49,6 +49,7 @@ pub mod fleet;
 pub mod hci;
 pub mod inject;
 pub mod marker;
+pub mod nodestate;
 pub mod notify;
 pub mod radio;
 pub mod segment;

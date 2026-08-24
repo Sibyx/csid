@@ -17,7 +17,7 @@
 use std::io::{self, Read};
 
 use crate::error::{CsiqError, Result};
-use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, PhyLabel, Width};
+use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, NodeState, PhyLabel, Width};
 
 /// The header length the iax stream declares (and this parser expects).
 pub const HEADER_LEN: usize = 272;
@@ -35,6 +35,7 @@ mod off {
     pub const US: usize = 88; // u32, microsecond fw clock
     pub const RNF: usize = 92; // u32, rate_n_flags v2
                                // flq extension (present when hdr_len covers these offsets):
+    pub const MONO_US: usize = 200; // u64, CLOCK_MONOTONIC microseconds
     pub const UNIX_TS_NS: usize = 208; // u64
     pub const CHANNEL: usize = 216; // u8 (driver writes one byte); 217..220 reserved
 }
@@ -142,6 +143,43 @@ pub fn decode_bw_antsel(rnf: u32) -> Option<BwAntsel> {
     })
 }
 
+/// The monotonic microsecond clock at header offset 200.
+///
+/// The fleet has no RTC, so nodes boot in the past and `chrony` steps them —
+/// and a step mid-capture shifts every `unix_ts_ns` with no symptom in the file.
+/// `ftm` wraps every 13.42 s and `us` every 71.6 min, so this is the only
+/// monotonic wall-time a record carries.
+///
+/// # Zero means "own transmission", not "unavailable"
+///
+/// Measured over 2,433 records of a real illuminated capture, as an exact
+/// biconditional with no exceptions:
+///
+/// | source MAC | `mono_us` set | records |
+/// |---|---|---:|
+/// | `ef:be:ad:de:ad:de` (this node's injector) | **no** | 1,743 |
+/// | three ambient transmitters | **yes** | 690 |
+///
+/// A locally generated frame never traverses the receive path that stamps this
+/// clock, so the field reads zero. That makes `None` a *semantic* marker — the
+/// record is the node's own transmission looped back — and it is the only
+/// per-record marker for that fact the CSI stream has. The timesync receiver
+/// counts the same thing separately as `own_transmissions`.
+///
+/// Verified on one node and one capture. Treat a future capture that breaks the
+/// biconditional as a finding, not as noise.
+///
+/// Sanity of the clock itself, same file: strictly monotonic over its non-zero
+/// samples, spanning 60.007 s against the host clock's 60.008 s — 3 ppm — with
+/// an implied uptime of 110.9 h at the first sample.
+pub fn decode_mono_us(hdr: &[u8]) -> Option<u64> {
+    if hdr.len() < off::MONO_US + 8 {
+        return None;
+    }
+    let v = le_u64(hdr, off::MONO_US);
+    (v != 0).then_some(v)
+}
+
 /// Decode `rate_n_flags` v2 into a [`PhyLabel`].
 ///
 /// v2 layout (iwlwifi): MCS in bits 0–3, NSS-1 in bits 4–5, modulation type in
@@ -178,6 +216,21 @@ pub fn decode_rnf(rnf: u32) -> Option<PhyLabel> {
 /// the caller supplies the monitor width it configured. `csi` is the raw CSI
 /// byte payload (interleaved little-endian `i16` I/Q).
 pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
+    parse_record_opts(hdr, csi, width, false)
+}
+
+/// [`parse_record`], with control over whether the driver header is kept.
+///
+/// `keep_vendor_hdr` stores the 272 bytes verbatim on the record. It is off by
+/// default because the blob triples a 52-tone record's metadata, and on only
+/// where the caller has somewhere to put it — the exporter, which writes a
+/// compressed container.
+pub fn parse_record_opts(
+    hdr: &[u8],
+    csi: &[u8],
+    width: Width,
+    keep_vendor_hdr: bool,
+) -> Result<CsiRecord> {
     if hdr.len() < off::RNF + 4 {
         return Err(CsiqError::Malformed("header shorter than base fields"));
     }
@@ -216,6 +269,11 @@ pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
         rnf,
         phy: decode_rnf(rnf),
         bw_antsel: decode_bw_antsel(rnf),
+        mono_us: decode_mono_us(hdr),
+        // The parser does not keep the blob by default: it is 272 B per record
+        // and the caller decides whether lossless provenance is worth it.
+        vendor_hdr: keep_vendor_hdr.then(|| hdr.to_vec()),
+        node: NodeState::default(),
         seq: hdr[off::SEQ],
         nrx,
         ntx,
@@ -232,13 +290,28 @@ pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
 pub struct RawReader<R: Read> {
     inner: R,
     width: Width,
+    keep_vendor_hdr: bool,
 }
 
 impl<R: Read> RawReader<R> {
     /// Wrap a raw byte source. `width` is the monitor width the session used
     /// (stamped onto every record, since the raw header does not carry it).
     pub fn new(inner: R, width: Width) -> Self {
-        RawReader { inner, width }
+        RawReader {
+            inner,
+            width,
+            keep_vendor_hdr: false,
+        }
+    }
+
+    /// Keep the 272-byte driver header verbatim on every record it yields.
+    ///
+    /// Builder-style rather than a second constructor: the exporter is the only
+    /// caller that wants the blob, and a `new_with_flags` would make every other
+    /// call site state a preference it does not have.
+    pub fn keeping_vendor_hdr(mut self, keep: bool) -> Self {
+        self.keep_vendor_hdr = keep;
+        self
     }
 
     /// Read the next record, or `Ok(None)` at clean end of stream.
@@ -276,7 +349,7 @@ impl<R: Read> RawReader<R> {
             ));
         }
         let csi = &body[csi_start..csi_end];
-        Ok(Some(parse_record(hdr, csi, self.width)?))
+        Ok(Some(parse_record_opts(hdr, csi, self.width, self.keep_vendor_hdr)?))
     }
 }
 

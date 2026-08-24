@@ -252,7 +252,7 @@ fn seal_one(
     sc.finalise(Status::Complete, Some(summary));
 
     if cfg.export.on_close {
-        let out = seg.dir.join("capture.csiq");
+        let out = seg.dir.join(crate::export::CSIQ_NAME);
         let session = match serde_json::to_value(&sc) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -265,11 +265,12 @@ fn seal_one(
                 None
             }
         };
-        if let Err(e) = crate::export::raw_to_csiq_with_session(
+        if let Err(e) = crate::export::raw_to_csiq_lossless(
             &seg.raw,
             &out,
             cfg.radio.width.to_csiq(),
             session.as_ref(),
+            cfg.export.keep_vendor_hdr,
         ) {
             // Non-fatal: the raw is the source of truth and `csid export` can
             // regenerate the container later. Still mark the segment complete
@@ -723,9 +724,14 @@ on_close = true
     }
 
     fn session_block(csiq_path: &Path) -> serde_json::Value {
-        let f = std::fs::File::open(csiq_path).unwrap();
-        let r = csiq::Reader::new(std::io::BufReader::new(f)).unwrap();
-        r.session().expect("the export must embed a session block").clone()
+        let r = crate::export::open_csiq(csiq_path).unwrap();
+        r.session()
+            .expect("the export must embed a session block")
+            .clone()
+    }
+
+    fn csiq_path(scratch: &Scratch) -> PathBuf {
+        scratch.join(crate::export::CSIQ_NAME)
     }
 
     /// The defect IP-139 P6 records: every segmented capture's `.csiq` claimed
@@ -748,7 +754,7 @@ on_close = true
         let records = seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
         assert_eq!(records, 8);
 
-        let block = session_block(&scratch.join("capture.csiq"));
+        let block = session_block(&csiq_path(&scratch));
         assert_eq!(
             block["status"], "complete",
             "a published file must not claim the capture was truncated"
@@ -782,7 +788,7 @@ on_close = true
         let mut cursor = BleCursor::new(scratch.0.clone());
         seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
 
-        let block = session_block(&scratch.join("capture.csiq"));
+        let block = session_block(&csiq_path(&scratch));
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(scratch.join("metadata.json")).unwrap())
                 .unwrap();
@@ -823,7 +829,7 @@ on_close = true
         );
         let value = serde_json::to_value(&finalised).unwrap();
 
-        let out = scratch.join("capture.csiq");
+        let out = scratch.join("capture.csiq");  // plain, this test drives convert() directly
         crate::export::raw_to_csiq_with_session(
             &raw,
             &out,
@@ -852,7 +858,7 @@ on_close = true
         write_raw(&raw, 3);
 
         // A directory where the writer wants to create a file: File::create fails.
-        std::fs::create_dir_all(scratch.join("capture.csiq")).unwrap();
+        std::fs::create_dir_all(csiq_path(&scratch)).unwrap();
 
         let seg = Sealed {
             dir: scratch.0.clone(),
@@ -869,6 +875,92 @@ on_close = true
         assert_eq!(
             on_disk["status"], "complete",
             "the segment must ship even though its container could not be written"
+        );
+    }
+
+    /// The file is compressed and the FORMAT is not: the bytes inside are a
+    /// plain CSIQ v1 stream, and only the envelope changed.
+    #[test]
+    fn a_sealed_segment_is_a_zstd_envelope_around_an_unchanged_container() {
+        let scratch = Scratch::new("zstd");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 12);
+
+        let seg = Sealed {
+            dir: scratch.0.clone(),
+            raw,
+            index: 1,
+        };
+        let mut cursor = BleCursor::new(scratch.0.clone());
+        seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
+
+        let out = csiq_path(&scratch);
+        assert!(out.is_file(), "the sealer must write {}", crate::export::CSIQ_NAME);
+        assert!(
+            !scratch.join("capture.csiq").exists(),
+            "the plain name must not also be written — one file, one envelope"
+        );
+
+        // The zstd magic, so this is genuinely compressed and not just renamed.
+        let head = std::fs::read(&out).unwrap();
+        assert_eq!(
+            &head[..4],
+            &[0x28, 0xB5, 0x2F, 0xFD],
+            "expected a zstd frame header"
+        );
+
+        // And through the decoder it is an ordinary v1 container.
+        let mut r = crate::export::open_csiq(&out).unwrap();
+        assert_eq!(session_block(&out)["status"], "complete");
+        let mut n = 0;
+        while r.next_record().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 12, "every record must survive the round trip");
+    }
+
+    /// The header blob is the most compressible thing in the record, which is
+    /// the whole argument for keeping it. Measure it rather than assert it.
+    #[test]
+    fn keeping_the_driver_header_costs_little_once_compressed() {
+        let scratch = Scratch::new("hdrcost");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 200);
+
+        let session = serde_json::to_value(template_sidecar()).unwrap();
+        let mut sizes = Vec::new();
+        for (name, keep) in [("lean.csiq.zst", false), ("full.csiq.zst", true)] {
+            let out = scratch.join(name);
+            crate::export::raw_to_csiq_lossless(
+                &raw,
+                &out,
+                csiq::Width::Ht20,
+                Some(&session),
+                keep,
+            )
+            .unwrap();
+            sizes.push(std::fs::metadata(&out).unwrap().len());
+        }
+        let (lean, full) = (sizes[0], sizes[1]);
+
+        // Every record carries the SAME synthetic header here, so this is the
+        // best case for the compressor and the test asserts only the direction
+        // and a generous bound — not a ratio that would pin fixture details.
+        assert!(full >= lean, "the blob cannot make the file smaller");
+        assert!(
+            full < lean + 200 * 272,
+            "compressed cost {} must be well under the raw {} B the blob adds",
+            full - lean,
+            200 * 272
+        );
+
+        // And the blob must actually be there, at full width.
+        let mut r = crate::export::open_csiq(&scratch.join("full.csiq.zst")).unwrap();
+        let rec = r.next_record().unwrap().expect("one record");
+        assert_eq!(
+            rec.vendor_hdr.as_ref().map(|h| h.len()),
+            Some(csiq::raw::HEADER_LEN),
+            "the whole header is kept, so a promoted field keeps its offset"
         );
     }
 

@@ -6,7 +6,7 @@
 //! matrix is just another (large) TLV.
 
 use crate::error::{CsiqError, Result};
-use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, PhyLabel, Width};
+use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, NodeState, PhyLabel, Width};
 
 // -- TLV type codes -----------------------------------------------------------
 // 0x00        reserved / padding
@@ -34,9 +34,48 @@ pub const T_CSI_MATRIX: u8 = 0x10; // i16[2 * ntone * nrx * ntx] (I/Q interleave
 /// This is the frame's own width. [`T_WIDTH`] (`0x0B`) is the *configured
 /// monitor width*, a session constant, and is retained unchanged.
 pub const T_BW_ANTSEL: u8 = 0x11;
-// 0x12..0x1F  reserved: further 272-byte-header recoveries
+
+/// `u64` — `CLOCK_MONOTONIC` microseconds, from driver-header offset 200.
+///
+/// The clock an NTP step cannot distort, on a fleet with no RTC. `UNIX_TS_NS`
+/// is exactly the field a step corrupts, `FTM` wraps every 13.42 s and `US`
+/// every 71.6 min, so this is the only monotonic wall-time the record carries.
+///
+/// **Absent means the record is the node's own transmission**, not that the
+/// clock was unavailable — see [`crate::raw::decode_mono_us`].
+pub const T_MONO_US: u8 = 0x12;
+
+// 0x13 is deliberately NOT allocated. IP-130 proposed a `REC_COUNTER` here; the
+// header has none distinct from `SEQ` (0x0D), which is already a driver record
+// counter. See the SEQ corrigendum in the format spec.
+
+/// The 272-byte driver header, verbatim.
+///
+/// Stored whole rather than only the unclaimed bytes, so a field promoted out of
+/// it later keeps the offset Appendix A gives it. That is the property that lets
+/// a future reader recover a field this build did not know how to name.
+pub const T_VENDOR_HDR: u8 = 0x14;
+
+// 0x15..0x1F  reserved: further 272-byte-header recoveries
 // 0x20..0x2F  reserved: EHT-specific (RU allocation, per-RU tone maps, …)
 // 0x30..0x3F  reserved: 802.11bf sensing metadata
+
+// -- 0x40..0x4F: node and host state, sampled periodically --------------------
+//
+// Not per-record measurements. The sampler attaches them to the first record
+// after each tick, so most records carry none and a reader treats them as a
+// sparse series rather than a column. They are in the FILE, not only in the
+// metrics store, because a published capture must be interpretable by someone
+// who has only the file and the spec — and that reader has no Mimir.
+
+/// `i32` — SoC die temperature in millidegrees Celsius.
+pub const T_NODE_TEMP_MC: u8 = 0x40;
+/// `u32` — Raspberry Pi throttle flag bitmask (`vcgencmd get_throttled`).
+pub const T_NODE_THROTTLE: u8 = 0x41;
+/// `u64` — bytes free on the capture spool filesystem.
+pub const T_NODE_SPOOL_FREE: u8 = 0x42;
+/// `u32` — 1-minute load average times 1000.
+pub const T_NODE_LOAD_M: u8 = 0x43;
 
 // -- little cursor over a byte slice ------------------------------------------
 
@@ -115,6 +154,24 @@ pub fn encode_payload(r: &CsiRecord) -> Vec<u8> {
     if let Some(b) = r.bw_antsel {
         put_tlv(&mut out, T_BW_ANTSEL, &[b.bandwidth.to_code(), b.antenna_sel]);
     }
+    if let Some(m) = r.mono_us {
+        put_tlv(&mut out, T_MONO_US, &m.to_le_bytes());
+    }
+    if let Some(h) = &r.vendor_hdr {
+        put_tlv(&mut out, T_VENDOR_HDR, h);
+    }
+    if let Some(v) = r.node.temp_mc {
+        put_tlv(&mut out, T_NODE_TEMP_MC, &v.to_le_bytes());
+    }
+    if let Some(v) = r.node.throttle_flags {
+        put_tlv(&mut out, T_NODE_THROTTLE, &v.to_le_bytes());
+    }
+    if let Some(v) = r.node.spool_free_bytes {
+        put_tlv(&mut out, T_NODE_SPOOL_FREE, &v.to_le_bytes());
+    }
+    if let Some(v) = r.node.load_m {
+        put_tlv(&mut out, T_NODE_LOAD_M, &v.to_le_bytes());
+    }
     put_tlv(&mut out, T_SEQ, &[r.seq]);
     put_tlv(&mut out, T_NRX, &[r.nrx]);
     put_tlv(&mut out, T_NTX, &[r.ntx]);
@@ -145,6 +202,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
     let mut channel = 0u32;
     let mut width = Width::Unknown(0);
     let mut bw_antsel = None;
+    let mut mono_us = None;
+    let mut vendor_hdr = None;
+    let mut node = NodeState::default();
     let mut iq = Vec::new();
 
     while buf.remaining() > 0 {
@@ -221,6 +281,37 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
                     antenna_sel: val[1],
                 });
             }
+            T_MONO_US => {
+                mono_us = Some(u64::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("mono_us len"))?,
+                ))
+            }
+            T_VENDOR_HDR => vendor_hdr = Some(val.to_vec()),
+            T_NODE_TEMP_MC => {
+                node.temp_mc = Some(i32::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("node temp len"))?,
+                ))
+            }
+            T_NODE_THROTTLE => {
+                node.throttle_flags = Some(u32::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("node throttle len"))?,
+                ))
+            }
+            T_NODE_SPOOL_FREE => {
+                node.spool_free_bytes = Some(u64::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("node spool len"))?,
+                ))
+            }
+            T_NODE_LOAD_M => {
+                node.load_m = Some(u32::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("node load len"))?,
+                ))
+            }
             T_CSI_MATRIX => iq = bytes_to_i16s(val)?,
             _ => { /* unknown type: skip (forward compatibility) */ }
         }
@@ -238,6 +329,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
         // absent. `BW_ANTSEL` IS this function applied at write time, so the
         // fallback returns the same value, not an approximation of it.
         bw_antsel: bw_antsel.or_else(|| crate::raw::decode_bw_antsel(rnf)),
+        mono_us,
+        vendor_hdr,
+        node,
         seq,
         nrx: nrx.ok_or(CsiqError::Malformed("missing nrx"))?,
         ntx: ntx.ok_or(CsiqError::Malformed("missing ntx"))?,

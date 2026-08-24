@@ -30,6 +30,12 @@ libc = "0.2"
 # low-level column writer is all `ble_rssi.parquet` needs, and the `arrow`
 # feature would drag a columnar runtime onto a capture node for nothing.
 parquet = { version = "59", default-features = false, features = ["snap"] }
+# Compression at rest for the exported container (IP-139 Phase 6). The FORMAT is
+# not compressed — the file is, and it carries the `.zst` extension that says so.
+# Level 3 (the crate default) is the speed/ratio knee on a Pi 5; the header blob
+# this pays for is the most compressible thing in the record.
+zstd = "0.13"
+
 # Per-session device pseudonyms. A cryptographic hash is not something to
 # hand-roll, even in a crate that hand-rolls its own calendar arithmetic.
 sha2 = "0.10"
