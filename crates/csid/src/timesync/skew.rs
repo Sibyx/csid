@@ -41,11 +41,27 @@
 //! that cancels; on a mixed fleet it does not. That is stated in the render, not
 //! hidden in a docstring.
 //!
+//! ## One window, or the skews do not compose
+//!
+//! Every pair in a fleet report is measured over the SAME sequence window. Left
+//! to itself each pair spans whatever interval its own two nodes happened to
+//! share, and a pair that ran twice as long carries twice as much accumulated
+//! relative drift in its median. The estimates then stop composing:
+//! `skew(x,y) + skew(y,z) − skew(x,z)` is not zero, and a node's offset via the
+//! reference depends on which peer it was routed through. On the real
+//! `coex-03_20260823-101235` arm — two nodes hearing to seq 74,587 while four
+//! peers stopped at 30,366 — the triangles containing that long pair missed
+//! closure by 42–62 µs, against 1–11 µs for the co-windowed ones. See
+//! [`common_window`] for which nodes get a vote on the window and why.
+//!
 //! ## The degenerate cases, all handled explicitly
 //!
 //! * **One node.** No pair exists. Reported as such; never as "0 ns skew".
 //! * **No common sequence numbers.** Two nodes that saw disjoint traffic are
 //!   *unmeasured*, which is not the same as coherent.
+//! * **No common window.** The nodes overlap in a chain rather than all at
+//!   once. Every pair is unmeasured and nothing is certified — reporting the
+//!   measurable pairs on different intervals is the bug, not the fix.
 //! * **A clock step mid-session.** The difference series is then bimodal and its
 //!   median is a number that describes neither half. Detected by splitting the
 //!   common sequences in two and comparing the halves; a non-stationary pair is
@@ -78,6 +94,12 @@ pub struct PairSkew {
     pub n: usize,
     /// Pairs discarded as implausible (see [`MAX_PLAUSIBLE_DIFF_NS`]).
     pub discarded: usize,
+    /// Sequence numbers both nodes saw that fell OUTSIDE the fleet window.
+    /// What the common window cost this pair, counted rather than swallowed.
+    pub outside_window: usize,
+    /// The fleet window this estimate was taken over, inclusive.
+    pub seq_lo: u64,
+    pub seq_hi: u64,
     /// **The point estimate**: median of `t_a − t_b`, +ve = `a` ahead.
     pub median_ns: i64,
     /// Median absolute deviation of the per-packet differences — the robust
@@ -125,28 +147,55 @@ fn median_i64(v: &mut [i64]) -> i64 {
     }
 }
 
-/// Per-packet differences for the sequence numbers both nodes saw.
+/// The one sequence interval every pair in a fleet report is measured over.
 ///
-/// Duplicates keep the **earliest** arrival for a sequence number: a repeat is
-/// either a retransmission or a driver re-delivery, and the first sighting is
-/// the one with the least delay in it.
-fn common_differences(a: &[Arrival], b: &[Arrival]) -> (Vec<i64>, usize) {
-    let index = |v: &[Arrival]| -> std::collections::BTreeMap<u64, u64> {
-        let mut m = std::collections::BTreeMap::new();
-        for x in v {
-            m.entry(x.seq)
-                .and_modify(|t: &mut u64| *t = (*t).min(x.unix_ts_ns))
-                .or_insert(x.unix_ts_ns);
-        }
-        m
-    };
-    let (ia, ib) = (index(a), index(b));
+/// Inclusive at both ends. See [`fleet_transfer_skew`] for why one window is
+/// not a detail but the thing that makes the skews compose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeqWindow {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl SeqWindow {
+    fn contains(&self, seq: u64) -> bool {
+        seq >= self.lo && seq <= self.hi
+    }
+}
+
+/// Earliest arrival per sequence number, in sequence order.
+///
+/// Duplicates keep the **earliest** sighting: a repeat is either a
+/// retransmission or a driver re-delivery, and the first has the least delay in
+/// it. BTreeMap so iteration is sequence-ordered, which is what the half-split
+/// stationarity test needs.
+fn seq_index(v: &[Arrival]) -> std::collections::BTreeMap<u64, u64> {
+    let mut m = std::collections::BTreeMap::new();
+    for x in v {
+        m.entry(x.seq)
+            .and_modify(|t: &mut u64| *t = (*t).min(x.unix_ts_ns))
+            .or_insert(x.unix_ts_ns);
+    }
+    m
+}
+
+/// Per-packet differences for the sequence numbers both nodes saw **inside
+/// `window`**.
+///
+/// Returns the differences, how many were dropped as implausible, and how many
+/// shared sequence numbers fell outside the window. The last is reported rather
+/// than swallowed: it is what the fleet window cost this pair.
+fn common_differences(a: &[Arrival], b: &[Arrival], window: SeqWindow) -> (Vec<i64>, usize, usize) {
+    let (ia, ib) = (seq_index(a), seq_index(b));
     let mut diffs = Vec::new();
     let mut discarded = 0usize;
-    // BTreeMap iteration is sequence-ordered, which is what the half-split
-    // stationarity test needs.
+    let mut outside_window = 0usize;
     for (seq, ta) in &ia {
         let Some(tb) = ib.get(seq) else { continue };
+        if !window.contains(*seq) {
+            outside_window += 1;
+            continue;
+        }
         let d = *ta as i128 - *tb as i128;
         if d.abs() > MAX_PLAUSIBLE_DIFF_NS as i128 {
             discarded += 1;
@@ -154,22 +203,28 @@ fn common_differences(a: &[Arrival], b: &[Arrival]) -> (Vec<i64>, usize) {
         }
         diffs.push(d as i64);
     }
-    (diffs, discarded)
+    (diffs, discarded, outside_window)
 }
 
-/// Estimate the skew between two nodes from their arrival streams.
+/// Estimate the skew between two nodes over one sequence `window`.
 ///
-/// Returns `None` when fewer than `min_common` sequence numbers are shared —
-/// two nodes that saw disjoint traffic are *unmeasured*, and saying so is the
-/// whole point.
+/// Returns `None` when fewer than `min_common` sequence numbers are shared
+/// inside the window — two nodes that saw disjoint traffic are *unmeasured*,
+/// and saying so is the whole point. A pair that had enough packets overall but
+/// not inside the window is `None` for the same reason: an estimate taken over
+/// a different interval than its peers is not comparable with them.
+///
+/// The window is a fleet-level fact, so [`fleet_transfer_skew`] computes it.
+/// Measuring one isolated pair means passing that pair's own span.
 pub fn pair_skew(
     a_name: &str,
     a: &[Arrival],
     b_name: &str,
     b: &[Arrival],
     min_common: usize,
+    window: SeqWindow,
 ) -> Option<PairSkew> {
-    let (diffs, discarded) = common_differences(a, b);
+    let (diffs, discarded, outside_window) = common_differences(a, b, window);
     if diffs.len() < min_common.max(2) {
         return None;
     }
@@ -214,6 +269,9 @@ pub fn pair_skew(
         b: b_name.to_string(),
         n,
         discarded,
+        outside_window,
+        seq_lo: window.lo,
+        seq_hi: window.hi,
         median_ns,
         mad_ns,
         min_ns,
@@ -229,6 +287,9 @@ pub fn pair_skew(
 pub struct TransferReport {
     /// The transmitter whose stream this was measured on.
     pub tx_id: String,
+    /// The one sequence window every pair below was measured over. `None` when
+    /// the nodes share no common window, in which case `pairs` is empty.
+    pub window: Option<SeqWindow>,
     /// Every pair that could be estimated.
     pub pairs: Vec<PairSkew>,
     /// Nodes that contributed no arrivals at all.
@@ -255,6 +316,18 @@ impl TransferReport {
             "fleet skew via the illumination stream (transmitter {})\n\n",
             self.tx_id
         );
+        match self.window {
+            Some(w) => s.push_str(&format!(
+                "  measured over the common sequence window [{}, {}] — one window for every \
+                 pair,\n  so the skews compose\n\n",
+                w.lo, w.hi
+            )),
+            None => s.push_str(
+                "  NO COMMON SEQUENCE WINDOW — the nodes' streams overlap in a chain, not \
+                 all at\n  once. Every pair is UNMEASURED, which is not the same as \
+                 coherent.\n\n",
+            ),
+        }
         if self.pairs.is_empty() {
             s.push_str("  no node pair shared enough packets to estimate anything.\n");
         } else {
@@ -272,6 +345,11 @@ impl TransferReport {
                     )
                 } else if p.discarded > 0 {
                     format!("{} pair(s) discarded as implausible", p.discarded)
+                } else if p.outside_window > 0 {
+                    format!(
+                        "{} shared packet(s) outside the fleet window",
+                        p.outside_window
+                    )
                 } else {
                     String::new()
                 };
@@ -331,10 +409,63 @@ impl TransferReport {
     }
 }
 
+/// The one sequence window every pair must be measured over.
+///
+/// **Why one window.** Left to itself each pair spans whatever interval its own
+/// two nodes happened to share, and the skews then STOP COMPOSING: a pair that
+/// ran twice as long carries twice as much accumulated relative drift in its
+/// median, so `skew(x,y) + skew(y,z) − skew(x,z)` is not zero. Measured on the
+/// `coex-03_20260823-101235` arm, where two nodes heard to seq 74,587 and four
+/// peers stopped at 30,366, the triangles containing that long pair missed
+/// closure by 42–62 µs against 1–11 µs for the co-windowed ones.
+///
+/// **Which nodes get a vote.** The window is the intersection of the spans of
+/// the nodes that can be composed onto the **anchor** — the best-heard node,
+/// ties broken on name so the answer never depends on iteration order. A node
+/// sharing fewer than `min_common` sequence numbers with the anchor is left out
+/// of the vote deliberately: it cannot be placed on the anchor's timeline under
+/// any window, so letting it clamp one would destroy every measurable pair in
+/// order to describe none. A node that merely joined **late** does get a vote,
+/// and does clamp — it is composable, and composability is the point.
+///
+/// `None` when the voting nodes' spans have no sequence in common at all: a
+/// chain rather than a window. Every pair is then unmeasured, which is not the
+/// same as the fleet being coherent.
+fn common_window(heard: &[(&str, &[Arrival])], min_common: usize) -> Option<SeqWindow> {
+    let floor = min_common.max(2);
+    let indexed: Vec<(&str, std::collections::BTreeMap<u64, u64>)> = heard
+        .iter()
+        .map(|(name, a)| (*name, seq_index(a)))
+        .filter(|(_, ix)| ix.len() >= floor)
+        .collect();
+    // Best-heard first, then by name: a deterministic anchor.
+    let anchor = indexed
+        .iter()
+        .min_by(|x, y| y.1.len().cmp(&x.1.len()).then(x.0.cmp(y.0)))?;
+
+    let mut lo = u64::MIN;
+    let mut hi = u64::MAX;
+    for (name, ix) in &indexed {
+        let composable =
+            *name == anchor.0 || ix.keys().filter(|s| anchor.1.contains_key(*s)).count() >= floor;
+        if !composable {
+            continue;
+        }
+        lo = lo.max(*ix.keys().next()?);
+        hi = hi.min(*ix.keys().next_back()?);
+    }
+    (lo <= hi).then_some(SeqWindow { lo, hi })
+}
+
 /// Compute every pair's skew from per-node arrival streams.
 ///
 /// `nodes` is `(name, arrivals)` for one transmitter. Nodes are compared in
 /// name order so the output is stable between runs.
+///
+/// Every pair is measured over the single window [`common_window`] picks, so
+/// the estimates compose: a node's offset via the reference is the same number
+/// whichever peer you route it through, to within the RX-floor term this method
+/// cannot see.
 pub fn fleet_transfer_skew(
     tx_id: &str,
     nodes: &[(String, Vec<Arrival>)],
@@ -349,18 +480,25 @@ pub fn fleet_transfer_skew(
         .filter(|(_, a)| a.is_empty())
         .map(|(n, _)| n.clone())
         .collect();
-    let heard: Vec<&&(String, Vec<Arrival>)> =
-        sorted.iter().filter(|(_, a)| !a.is_empty()).collect();
+    let heard: Vec<(&str, &[Arrival])> = sorted
+        .iter()
+        .filter(|(_, a)| !a.is_empty())
+        .map(|(n, a)| (n.as_str(), a.as_slice()))
+        .collect();
+
+    let window = common_window(&heard, min_common);
 
     let mut pairs = Vec::new();
     let mut unpaired = Vec::new();
     for i in 0..heard.len() {
         for j in (i + 1)..heard.len() {
-            let (an, aa) = &**heard[i];
-            let (bn, bb) = &**heard[j];
-            match pair_skew(an, aa, bn, bb, min_common) {
+            let (an, aa) = heard[i];
+            let (bn, bb) = heard[j];
+            // No common window means no comparable estimate for anyone. Fail
+            // closed: every pair is unpaired, so `within_budget` is false.
+            match window.and_then(|w| pair_skew(an, aa, bn, bb, min_common, w)) {
                 Some(p) => pairs.push(p),
-                None => unpaired.push((an.clone(), bn.clone())),
+                None => unpaired.push((an.to_string(), bn.to_string())),
             }
         }
     }
@@ -369,6 +507,7 @@ pub fn fleet_transfer_skew(
 
     TransferReport {
         tx_id: tx_id.to_string(),
+        window,
         pairs,
         silent,
         unpaired,
@@ -381,6 +520,13 @@ pub fn fleet_transfer_skew(
 mod tests {
     use super::*;
     use crate::fleet::gates::G4B_BUDGET_NS;
+
+    /// A window that clips nothing. The tests below pin the ESTIMATOR, so they
+    /// must see exactly the series they build; the window has its own tests.
+    const ALL: SeqWindow = SeqWindow {
+        lo: u64::MIN,
+        hi: u64::MAX,
+    };
 
     const T0: u64 = 1_786_000_000_000_000_000;
     /// 25 Hz, the injector's default pace.
@@ -412,12 +558,170 @@ mod tests {
             .collect()
     }
 
+    /// A node whose clock walks away at a constant rate, with no jitter, and an
+    /// optional first sequence number. Relative drift is the whole point of the
+    /// common-window rule: it is what makes a median depend on the interval it
+    /// was taken over.
+    fn drifting(first_seq: u64, n: u64, offset_ns: i64, drift_ns_per_seq: i64) -> Vec<Arrival> {
+        (first_seq..first_seq + n)
+            .map(|i| Arrival {
+                seq: i,
+                unix_ts_ns: (T0 as i64
+                    + (i * PERIOD_NS) as i64
+                    + offset_ns
+                    + drift_ns_per_seq * i as i64) as u64,
+            })
+            .collect()
+    }
+
+    fn named(v: &[(&str, Vec<Arrival>)]) -> Vec<(String, Vec<Arrival>)> {
+        v.iter().map(|(n, a)| (n.to_string(), a.clone())).collect()
+    }
+
+    fn skew_of(r: &TransferReport, a: &str, b: &str) -> i64 {
+        r.pairs
+            .iter()
+            .find(|p| p.a == a && p.b == b)
+            .unwrap_or_else(|| panic!("no pair {a}↔{b}"))
+            .median_ns
+    }
+
+    #[test]
+    fn pairs_measured_over_different_windows_would_not_compose() {
+        // THE DEFECT, stated as arithmetic. Two nodes run to seq 999, a third
+        // stops at 299. The second drifts 1 µs per sequence against the first,
+        // so its median is -149,500 ns across 0..299 and -499,500 ns across
+        // 0..999 — it depends entirely on the interval it was taken over.
+        //
+        // Measured per pair, `skew(a,b) + skew(b,c) - skew(a,c)` misses zero by
+        // 350 µs. That is the 42-62 µs non-closure seen on the real
+        // coex-03_20260823-101235 arm, reproduced large enough to be
+        // unmistakable.
+        let a = drifting(0, 1000, 0, 0);
+        let b = drifting(0, 1000, 0, 1_000);
+        let c = drifting(0, 300, 7_000_000, 0);
+
+        // What the old per-pair behaviour produced, still reachable by asking
+        // for one isolated pair over its own span.
+        let long_pair = pair_skew("a", &a, "b", &b, 20, ALL).unwrap().median_ns;
+        assert_eq!(long_pair, -499_500, "a pair left to its own span drifts");
+
+        let r = fleet_transfer_skew(
+            "tx",
+            &named(&[("a", a), ("b", b), ("c", c)]),
+            G4B_BUDGET_NS,
+            20,
+        );
+        assert_eq!(r.window, Some(SeqWindow { lo: 0, hi: 299 }));
+        assert_eq!(
+            skew_of(&r, "a", "b"),
+            -149_500,
+            "the long pair must be measured over the SHARED window, not its own"
+        );
+
+        let closure = skew_of(&r, "a", "b") + skew_of(&r, "b", "c") - skew_of(&r, "a", "c");
+        assert_eq!(
+            closure, 0,
+            "one window means the skews compose; off by {closure} ns"
+        );
+    }
+
+    #[test]
+    fn a_node_that_heard_a_disjoint_stretch_does_not_clamp_the_window() {
+        // The rule must not cure the disease by killing the patient. A node
+        // sharing no sequence numbers with anyone cannot be composed onto the
+        // anchor under ANY window, so it gets no vote. Letting it vote would
+        // empty the window and take every measurable pair down with it.
+        let a = stream(300, 0, 1_000, 1);
+        let b = stream(300, 4_000_000, 1_000, 2);
+        let orphan: Vec<Arrival> = stream(300, 0, 1_000, 3)
+            .into_iter()
+            .map(|x| Arrival {
+                seq: x.seq + 50_000,
+                ..x
+            })
+            .collect();
+
+        let r = fleet_transfer_skew(
+            "tx",
+            &named(&[("monad01", a), ("monad02", b), ("monad07", orphan)]),
+            G4B_BUDGET_NS,
+            20,
+        );
+        assert_eq!(r.window, Some(SeqWindow { lo: 0, hi: 299 }));
+        assert_eq!(r.pairs.len(), 1, "the measurable pair must survive");
+        assert!((skew_of(&r, "monad01", "monad02") + 4_000_000).abs() < 100_000);
+        // The orphan is still reported as unmeasured, never as coherent.
+        assert_eq!(r.unpaired.len(), 2);
+        assert!(!r.within_budget());
+    }
+
+    #[test]
+    fn a_late_joiner_clamps_the_window_and_the_cost_is_reported() {
+        // A node that joined halfway DOES clamp, because it can be composed
+        // onto the anchor and composability is the point. What that cost is not
+        // silent: `outside_window` counts the shared packets the window dropped.
+        let a = stream(1000, 0, 1_000, 4);
+        let b = stream(1000, 2_000_000, 1_000, 5);
+        let late: Vec<Arrival> = stream(500, 0, 1_000, 6)
+            .into_iter()
+            .map(|x| Arrival {
+                seq: x.seq + 500,
+                ..x
+            })
+            .collect();
+
+        let r = fleet_transfer_skew(
+            "tx",
+            &named(&[("monad01", a), ("monad02", b), ("monad03", late)]),
+            G4B_BUDGET_NS,
+            20,
+        );
+        assert_eq!(r.window, Some(SeqWindow { lo: 500, hi: 999 }));
+        let long = r
+            .pairs
+            .iter()
+            .find(|p| p.a == "monad01" && p.b == "monad02")
+            .unwrap();
+        assert_eq!(long.n, 500);
+        assert_eq!(
+            long.outside_window, 500,
+            "the discarded half must be counted, not dropped quietly"
+        );
+        assert_eq!((long.seq_lo, long.seq_hi), (500, 999));
+    }
+
+    #[test]
+    fn a_chain_of_overlaps_is_not_a_window_and_certifies_nothing() {
+        // Both peers share well over `min_common` with the anchor, so both get a
+        // vote — but they sit at opposite ends of it and share nothing with each
+        // other. There is no interval every pair can be measured over, so the
+        // report FAILS CLOSED: no pairs, no certification. Reporting the two
+        // measurable pairs on different intervals is the exact bug this rule
+        // exists to remove.
+        let wide = drifting(0, 1000, 0, 0); //     0..999, far the best-heard
+        let early = drifting(0, 50, 1_000_000, 0); //  0..49
+        let late = drifting(950, 50, 2_000_000, 0); // 950..999
+
+        let r = fleet_transfer_skew(
+            "tx",
+            &named(&[("a_early", early), ("b_wide", wide), ("c_late", late)]),
+            G4B_BUDGET_NS,
+            20,
+        );
+        assert_eq!(r.window, None);
+        assert!(r.pairs.is_empty());
+        assert_eq!(r.unpaired.len(), 3);
+        assert!(!r.within_budget(), "an unmeasured fleet is never certified");
+        assert!(r.render().contains("NO COMMON SEQUENCE WINDOW"));
+    }
+
     #[test]
     fn a_known_offset_is_recovered_through_the_jitter() {
         // B is 12 ms behind A; both have up to 400 µs of RX jitter.
         let a = stream(600, 0, 400_000, 1);
         let b = stream(600, -12_000_000, 400_000, 2);
-        let p = pair_skew("monad01", &a, "monad02", &b, MIN_COMMON_DEFAULT).unwrap();
+        let p = pair_skew("monad01", &a, "monad02", &b, MIN_COMMON_DEFAULT, ALL).unwrap();
         assert_eq!(p.n, 600);
         assert!(
             (p.median_ns - 12_000_000).abs() < 200_000,
@@ -437,7 +741,7 @@ mod tests {
     fn the_minimum_is_biased_low_and_the_median_is_not() {
         let a = stream(800, 0, 2_000_000, 11);
         let b = stream(800, 0, 2_000_000, 97);
-        let p = pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT).unwrap();
+        let p = pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT, ALL).unwrap();
         assert!(
             p.median_ns.abs() < 150_000,
             "two coherent nodes must estimate ~0, got {}",
@@ -461,7 +765,7 @@ mod tests {
         for x in b.iter_mut().skip(200) {
             x.unix_ts_ns -= 300_000_000;
         }
-        let p = pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT).unwrap();
+        let p = pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT, ALL).unwrap();
         assert!(!p.stationary, "a 300 ms step must show in the half split");
         assert!(
             p.half_split_delta_ns.abs() > 250_000_000,
@@ -494,7 +798,7 @@ mod tests {
                 ..x
             })
             .collect();
-        assert!(pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT).is_none());
+        assert!(pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT, ALL).is_none());
 
         let r = fleet_transfer_skew(
             "tx",
@@ -559,14 +863,14 @@ mod tests {
         for x in b.iter_mut() {
             x.unix_ts_ns += 3_600_000_000_000;
         }
-        assert!(pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT).is_none());
+        assert!(pair_skew("a", &a, "b", &b, MIN_COMMON_DEFAULT, ALL).is_none());
 
         // Half the packets are from the same run; those alone must decide.
         let mut mixed = stream(300, 5_000_000, 100_000, 13);
         for x in mixed.iter_mut().skip(150) {
             x.unix_ts_ns += 3_600_000_000_000;
         }
-        let p = pair_skew("a", &a, "b", &mixed, 20).unwrap();
+        let p = pair_skew("a", &a, "b", &mixed, 20, ALL).unwrap();
         assert_eq!(p.n, 150);
         assert_eq!(p.discarded, 150);
         assert!((p.median_ns + 5_000_000).abs() < 200_000, "{}", p.median_ns);
@@ -598,7 +902,7 @@ mod tests {
                 unix_ts_ns: T0 + PERIOD_NS,
             },
         ];
-        let (d, _) = common_differences(&a, &b);
+        let (d, _, _) = common_differences(&a, &b, ALL);
         assert_eq!(d, vec![5_000, 0], "the 900 µs re-delivery must not win");
     }
 
@@ -607,8 +911,8 @@ mod tests {
     fn the_estimate_is_antisymmetric() {
         let a = stream(400, 3_000_000, 200_000, 21);
         let b = stream(400, -3_000_000, 200_000, 21);
-        let ab = pair_skew("a", &a, "b", &b, 20).unwrap();
-        let ba = pair_skew("b", &b, "a", &a, 20).unwrap();
+        let ab = pair_skew("a", &a, "b", &b, 20, ALL).unwrap();
+        let ba = pair_skew("b", &b, "a", &a, 20, ALL).unwrap();
         assert_eq!(ab.median_ns, -ba.median_ns);
         assert_eq!(ab.mad_ns, ba.mad_ns);
     }

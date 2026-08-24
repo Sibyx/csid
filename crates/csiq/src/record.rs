@@ -78,6 +78,107 @@ impl Width {
     }
 }
 
+/// Channel bandwidth **of the received frame**, decoded from `rate_n_flags` v2.
+///
+/// Not to be confused with [`Width`], which is the *configured monitor width* —
+/// a session constant that bounds what is decodable and does not describe any
+/// individual frame. An ambient channel interleaves PHY types frame by frame,
+/// so on those captures `Width` is the wrong answer for every record and this
+/// is the right one.
+///
+/// Codes are the driver's own (`RATE_MCS_CHAN_WIDTH_*`), so the wire value is
+/// the firmware value and no table sits between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bandwidth {
+    W20,
+    W40,
+    W80,
+    W160,
+    /// 802.11be 320 MHz — the AX210 cannot reach this, kept so the format need
+    /// not change when EHT hardware arrives.
+    W320,
+    /// A code this build does not know, carried verbatim.
+    Unknown(u8),
+}
+
+impl Bandwidth {
+    /// The driver's `RATE_MCS_CHAN_WIDTH_*` code.
+    pub fn to_code(self) -> u8 {
+        match self {
+            Bandwidth::W20 => 0,
+            Bandwidth::W40 => 1,
+            Bandwidth::W80 => 2,
+            Bandwidth::W160 => 3,
+            Bandwidth::W320 => 4,
+            Bandwidth::Unknown(v) => v,
+        }
+    }
+
+    /// Decode the driver's `RATE_MCS_CHAN_WIDTH_*` code.
+    pub fn from_code(v: u8) -> Self {
+        match v {
+            0 => Bandwidth::W20,
+            1 => Bandwidth::W40,
+            2 => Bandwidth::W80,
+            3 => Bandwidth::W160,
+            4 => Bandwidth::W320,
+            other => Bandwidth::Unknown(other),
+        }
+    }
+
+    /// Nominal channel bandwidth in MHz, or `None` for an unknown code.
+    ///
+    /// This is the *channel*, not the occupied tone span. A 20 MHz HE frame
+    /// carries 242 tones at 78.125 kHz, which occupy about 18.9 MHz.
+    pub fn mhz(self) -> Option<u32> {
+        match self {
+            Bandwidth::W20 => Some(20),
+            Bandwidth::W40 => Some(40),
+            Bandwidth::W80 => Some(80),
+            Bandwidth::W160 => Some(160),
+            Bandwidth::W320 => Some(320),
+            Bandwidth::Unknown(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Bandwidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.mhz() {
+            Some(m) => write!(f, "{m}MHz"),
+            None => write!(f, "unknown({})", self.to_code()),
+        }
+    }
+}
+
+/// Per-frame bandwidth and antenna selection, recovered from `rate_n_flags`.
+///
+/// Both fields were parsed into the same 32-bit word csid has always stored and
+/// then discarded. They cost no extra capture and no driver change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BwAntsel {
+    pub bandwidth: Bandwidth,
+    /// Active-antenna bitmask: bit 0 = antenna A, bit 1 = antenna B.
+    ///
+    /// The driver's own encoding (`RATE_MCS_ANT_A_MSK` / `_B_MSK` shifted down
+    /// to bit 0). `0` means the word named no antenna, which is what a receive
+    /// record normally carries — the field is set on transmit descriptors.
+    pub antenna_sel: u8,
+}
+
+impl BwAntsel {
+    /// True when antenna A is named active.
+    pub fn ant_a(self) -> bool {
+        self.antenna_sel & 0b01 != 0
+    }
+
+    /// True when antenna B is named active.
+    pub fn ant_b(self) -> bool {
+        self.antenna_sel & 0b10 != 0
+    }
+}
+
 /// PHY modulation family, decoded from `rate_n_flags` v2 (iwlwifi).
 ///
 /// Measured on the AX210: HE 2×2 records carry `Modulation::He`.
@@ -152,6 +253,12 @@ pub struct CsiRecord {
     pub rnf: u32,
     /// Decoded PHY label (may be absent if `rnf` was unavailable).
     pub phy: Option<PhyLabel>,
+    /// Per-frame bandwidth and antenna selection, decoded from the same `rnf`.
+    ///
+    /// `None` on a record written before CSIQ carried the field, and on any
+    /// record whose `rnf` was unavailable. Absent is not 20 MHz.
+    #[serde(default)]
+    pub bw_antsel: Option<BwAntsel>,
     /// 802.11 sequence byte (NOT a reliable completeness counter — see spec).
     pub seq: u8,
     /// Number of RX chains.

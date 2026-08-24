@@ -773,10 +773,19 @@ pub fn run_session(
 
     sidecar.close(status, Some(summary.clone()));
 
-    // Optional CSIQ export.
+    // Optional CSIQ export. The sidecar is already closed above, so the
+    // in-memory value IS the finalised block — taking it directly rather than
+    // re-reading the file it was just written from removes a failure mode and
+    // keeps this path identical to the segment sealer's.
     if cfg.export.on_close {
         if let Some(p) = &raw_path {
-            match export::raw_to_csiq(p, &dir.join("capture.csiq"), cfg, sidecar.path()) {
+            let session = serde_json::to_value(&sidecar).ok();
+            match export::raw_to_csiq_with_session(
+                p,
+                &dir.join("capture.csiq"),
+                cfg.radio.width.to_csiq(),
+                session.as_ref(),
+            ) {
                 Ok(n) => tracing::info!(records = n, "exported capture.csiq"),
                 Err(e) => tracing::error!(error = %e, "CSIQ export failed (raw capture is intact)"),
             }

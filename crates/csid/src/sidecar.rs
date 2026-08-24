@@ -47,6 +47,113 @@ pub struct RadioMeta {
     pub mac_filter: Vec<String>,
 }
 
+/// What the radio was allowed to report (IP-139 Phase 3, C3).
+///
+/// A filter is a claim about the data, not a tuning detail. A capture taken
+/// with `frame_types = ["data"]` and one taken without it are not the same
+/// measurement, and a reader must not have to guess which they hold. So the
+/// selection in force is recorded whether or not any of it is set.
+///
+/// **Every field here is currently `None`, and that is the finding, not an
+/// omission.** `csiscope` scopes each analytical panel to one record class in
+/// software because the radio was told to report everything from everyone. The
+/// driver has supported `csi_frame_types` and `csi_rate_n_flags_val`/`_mask`
+/// the whole time (`debugfs::knob` names all nine parameters and csid drives
+/// four). Driving them is Phase 4. Recording the state is this phase, so the
+/// archive gains a clean boundary: every file from 0.2.0 onward *declares* that
+/// no PHY selection was in force, instead of leaving it unrecoverable.
+///
+/// The other two selection knobs csid does drive are not repeated here —
+/// `csi_interval` is `radio.interval_us` and `csi_addresses` is
+/// `radio.mac_filter`. One fact belongs in one field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilterMeta {
+    /// `csi_frame_types` — 802.11 frame-type bitmap. `None` = not driven.
+    pub frame_types: Option<u64>,
+    /// `csi_rate_n_flags_val` — collect only for this PHY. `None` = not driven.
+    pub rate_n_flags_val: Option<u32>,
+    /// `csi_rate_n_flags_mask` — which bits of the above are compared.
+    pub rate_n_flags_mask: Option<u32>,
+    /// `csi_count` — stop after N reports. `None` = not driven.
+    pub count: Option<u64>,
+    /// `csi_timeout` — stop after N microseconds. `None` = not driven.
+    pub timeout_us: Option<u64>,
+    /// Stable digest over the resolved selection triple, or [`NO_FILTER`].
+    ///
+    /// It exists so two differently-filtered captures cannot land in one
+    /// poolable group by accident. This project has already paid for the
+    /// software version of that mistake by mixing record classes in one tensor.
+    pub fingerprint: String,
+}
+
+/// The reserved `fingerprint` value meaning "the radio filtered nothing".
+///
+/// Reserved rather than empty: an absent fingerprint and an unfiltered capture
+/// are different facts, and a grouping key must not conflate them.
+pub const NO_FILTER: &str = "no-filter";
+
+impl FilterMeta {
+    /// The filter csid actually put in force for this session.
+    ///
+    /// Takes the config so the signature does not change when Phase 4 begins
+    /// populating it — only the body does, and no reader has to be revisited.
+    pub fn resolve(_cfg: &ExperimentConfig) -> Self {
+        let f = FilterMeta::default();
+        FilterMeta {
+            fingerprint: f.compute_fingerprint(),
+            ..f
+        }
+    }
+
+    /// Digest over `(frame_types, rate_n_flags_val, rate_n_flags_mask)`.
+    ///
+    /// `count` and `timeout_us` are deliberately excluded. They bound how much
+    /// the radio reports, not which frames it selects, so two captures that
+    /// differ only in duration must stay poolable.
+    fn compute_fingerprint(&self) -> String {
+        if self.frame_types.is_none()
+            && self.rate_n_flags_val.is_none()
+            && self.rate_n_flags_mask.is_none()
+        {
+            return NO_FILTER.to_string();
+        }
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.frame_types.unwrap_or(0).to_le_bytes());
+        h.update(self.rate_n_flags_val.unwrap_or(0).to_le_bytes());
+        h.update(self.rate_n_flags_mask.unwrap_or(0).to_le_bytes());
+        format!("{:x}", h.finalize())[..16].to_string()
+    }
+}
+
+/// Which csid build wrote this capture (IP-139 Phase 3).
+///
+/// `csid_version` stays the semantic version and keeps its meaning unchanged —
+/// redefining an existing field's format mid-archive would make old and new
+/// rows incomparable in the measurement lake, which already has a
+/// `csid_version` column. The build identity is therefore recorded *beside* it
+/// rather than inside it.
+///
+/// `revision_source` is the field to read first. `none` means this build could
+/// not name its own revision, which is a different fact from a revision that
+/// happens to be a bare hash — see [`crate::build_info`] for why a fleet node
+/// cannot always read one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildMeta {
+    /// `git describe --always --dirty --tags`, an operator-supplied identity,
+    /// or empty when neither was available.
+    pub revision: String,
+    /// `git` · `supplied` · `none`.
+    pub revision_source: String,
+    /// When the binary was compiled, RFC 3339 UTC.
+    pub built_at: String,
+    pub rustc: String,
+    /// `release` on anything that ships, `debug` on a developer build.
+    pub profile: String,
+    /// The CSIQ container version this build writes.
+    pub csiq_format_version: u16,
+}
+
 /// Host/driver/firmware environment — the part that makes a capture
 /// interpretable years later.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,6 +165,12 @@ pub struct EnvironmentMeta {
     pub regdomain: Option<String>,
     pub cpu_governor: Option<String>,
     pub csid_version: String,
+    /// `serde(default)` is load-bearing: every sidecar in the archive predates
+    /// this group, and a required field here would make csid unable to read its
+    /// own back catalogue. An all-empty `build` therefore means "written before
+    /// build provenance existed".
+    #[serde(default)]
+    pub build: BuildMeta,
 }
 
 /// Close-time capture statistics.
@@ -297,6 +410,14 @@ pub struct Sidecar {
     /// Present only when time transfer is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timesync: Option<TimesyncMeta>,
+    /// What the radio was allowed to report.
+    ///
+    /// `serde(default)` for the same reason as `environment.build`: the whole
+    /// archive predates this group, and csid must keep reading its own back
+    /// catalogue. A default `FilterMeta` carries an empty `fingerprint`, which
+    /// is distinct from [`NO_FILTER`] — "not recorded" is not "nothing filtered".
+    #[serde(default)]
+    pub filter: FilterMeta,
     pub environment: EnvironmentMeta,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -398,6 +519,7 @@ impl Sidecar {
             inject,
             ble,
             timesync,
+            filter: FilterMeta::resolve(cfg),
             environment: capture_environment(global, &cfg.radio.interface),
             started_at: rfc3339_utc(util::now_unix()),
             ended_at: None,
@@ -409,13 +531,37 @@ impl Sidecar {
         Ok(sc)
     }
 
-    /// Finalise the sidecar with an outcome and (optional) summary.
-    pub fn close(&mut self, status: Status, summary: Option<SummaryMeta>) {
+    /// Finalise the sidecar **in memory only** — no I/O.
+    ///
+    /// Split out of [`close`](Self::close) so a caller that must publish the
+    /// finalised document somewhere *before* it may appear on disk can do so
+    /// from one value. Segment sealing is that caller: the CSIQ export embeds
+    /// this block, and `csid-sync` reads the on-disk `status` as its
+    /// ready-to-ship signal, so the two must be written in opposite orders.
+    ///
+    /// Stamping `ended_at` here rather than at write time is the point. A
+    /// segment's export takes seconds to minutes, so finalising and writing at
+    /// two different instants would give the embedded block and the sidecar two
+    /// different close times for one segment — a difference no reader could
+    /// explain and every clock-seam check would flag.
+    pub fn finalise(&mut self, status: Status, summary: Option<SummaryMeta>) {
         self.status = status;
         self.ended_at = Some(rfc3339_utc(util::now_unix()));
         self.summary = summary;
+    }
+
+    /// Finalise the sidecar with an outcome and (optional) summary, then persist.
+    pub fn close(&mut self, status: Status, summary: Option<SummaryMeta>) {
+        self.finalise(status, summary);
+        self.persist();
+    }
+
+    /// Write the sidecar, logging rather than propagating a failure.
+    ///
+    /// A sidecar that cannot be written must never invalidate captured data —
+    /// the raw stream is the source of truth and is already on disk.
+    pub fn persist(&self) {
         if let Err(e) = self.write() {
-            // Never let a sidecar write failure invalidate captured data.
             tracing::error!(error = %e, "writing close-time sidecar failed; raw capture is intact");
         }
     }
@@ -486,6 +632,20 @@ pub fn capture_environment(global: &GlobalConfig, iface: &str) -> EnvironmentMet
         regdomain: crate::radio::regdomain(),
         cpu_governor,
         csid_version: env!("CARGO_PKG_VERSION").to_string(),
+        build: build_meta(),
+    }
+}
+
+/// The build identity baked in by `build.rs`.
+pub fn build_meta() -> BuildMeta {
+    use crate::build_info;
+    BuildMeta {
+        revision: build_info::REVISION.to_string(),
+        revision_source: build_info::REVISION_SOURCE.to_string(),
+        built_at: build_info::built_at(),
+        rustc: build_info::RUSTC.to_string(),
+        profile: build_info::PROFILE.to_string(),
+        csiq_format_version: csiq::FORMAT_VERSION,
     }
 }
 
@@ -558,5 +718,122 @@ mod legacy_sidecar_tests {
         let sc: Sidecar = serde_json::from_value(json).expect("legacy sidecar must parse");
         assert_eq!(sc.run_id, "", "legacy sidecars carry no run id");
         assert!(!sc.run_id_generated);
+
+        // The IP-139 groups must not make the back catalogue unreadable.
+        assert_eq!(sc.environment.build.revision_source, "");
+        assert_eq!(
+            sc.filter.fingerprint, "",
+            "an unrecorded filter is not the same fact as an unfiltered capture"
+        );
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    /// The archive carries exactly ONE distinct `csid_version` — `0.1.0`, the
+    /// never-bumped literal — across every capture ever taken, while the daemon
+    /// gained injection, time transfer, segmentation, the BLE scanner and the
+    /// empty-record counter. A file's provenance could therefore not tell a
+    /// July capture from an August one.
+    #[test]
+    fn a_build_names_itself_or_says_it_cannot() {
+        let b = build_meta();
+        assert!(
+            matches!(b.revision_source.as_str(), "git" | "supplied" | "none"),
+            "revision_source is a closed vocabulary, got {:?}",
+            b.revision_source
+        );
+        assert_eq!(
+            b.revision.is_empty(),
+            b.revision_source == "none",
+            "a build with no revision must say so, and one with a revision must name its origin"
+        );
+        assert_eq!(b.csiq_format_version, csiq::FORMAT_VERSION);
+    }
+
+    /// The version literal is what P7 is about. Pin the bump so the next reader
+    /// of this file cannot quietly ship another year on `0.1.0`.
+    #[test]
+    fn the_semantic_version_moved_off_the_never_bumped_literal() {
+        assert_ne!(
+            env!("CARGO_PKG_VERSION"),
+            "0.1.0",
+            "0.1.0 is the string the whole archive already carries"
+        );
+    }
+
+    /// A capture that filtered nothing must SAY it filtered nothing. Leaving
+    /// the group empty would make "unfiltered" and "unrecorded" the same value,
+    /// and the poolable-group key cannot conflate those.
+    #[test]
+    fn an_unfiltered_capture_declares_itself_unfiltered() {
+        let cfg: ExperimentConfig = toml::from_str(
+            r#"
+[radio]
+interface = "wlp1s0"
+channel = 11
+width = "HT20"
+"#,
+        )
+        .unwrap();
+
+        let f = FilterMeta::resolve(&cfg);
+        assert_eq!(f.fingerprint, NO_FILTER);
+        assert!(f.frame_types.is_none());
+        assert!(f.rate_n_flags_val.is_none());
+        assert!(f.rate_n_flags_mask.is_none());
+    }
+
+    /// Two differently-filtered captures must not land in one poolable group.
+    /// This project has already paid for the software version of that mistake
+    /// by mixing record classes in one tensor.
+    #[test]
+    fn different_selections_fingerprint_differently() {
+        let a = FilterMeta {
+            rate_n_flags_val: Some(0x4100),
+            rate_n_flags_mask: Some(0x7F00),
+            ..Default::default()
+        };
+        let b = FilterMeta {
+            rate_n_flags_val: Some(0x4200),
+            rate_n_flags_mask: Some(0x7F00),
+            ..Default::default()
+        };
+
+        let fa = a.compute_fingerprint();
+        let fb = b.compute_fingerprint();
+        assert_ne!(fa, fb);
+        assert_ne!(fa, NO_FILTER);
+        assert_eq!(fa, a.compute_fingerprint(), "the digest must be stable");
+    }
+
+    /// Duration is not selection. Two captures that differ only in how long the
+    /// radio was allowed to report are the same measurement and must pool.
+    #[test]
+    fn bounds_do_not_change_the_fingerprint() {
+        let a = FilterMeta {
+            frame_types: Some(0b1000),
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.count = Some(50_000);
+        b.timeout_us = Some(600_000_000);
+
+        assert_eq!(a.compute_fingerprint(), b.compute_fingerprint());
+    }
+
+    /// `empty_records` must be present on every summary. `NULL` is not zero:
+    /// it means the counter did not exist when the file was written, and
+    /// `useful_yield` is uncomputable rather than perfect.
+    #[test]
+    fn empty_records_is_always_serialised() {
+        let json = serde_json::to_value(SummaryMeta::default()).unwrap();
+        assert!(
+            json.get("empty_records").is_some(),
+            "a summary that omits the field makes a zero-yield capture look flawless"
+        );
+        assert_eq!(json["empty_records"], 0);
     }
 }

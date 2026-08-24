@@ -6,7 +6,7 @@
 //! matrix is just another (large) TLV.
 
 use crate::error::{CsiqError, Result};
-use crate::record::{CsiRecord, Modulation, PhyLabel, Width};
+use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, PhyLabel, Width};
 
 // -- TLV type codes -----------------------------------------------------------
 // 0x00        reserved / padding
@@ -24,8 +24,19 @@ pub const T_WIDTH: u8 = 0x0B; // u16
 pub const T_RSSI: u8 = 0x0C; // i16[nrx]
 pub const T_SEQ: u8 = 0x0D; // u8
 pub const T_CSI_MATRIX: u8 = 0x10; // i16[2 * ntone * nrx * ntx] (I/Q interleaved)
-                                   // 0x20..0x2F  reserved: EHT-specific (RU allocation, per-RU tone maps, …)
-                                   // 0x30..0x3F  reserved: 802.11bf sensing metadata
+
+/// Per-frame bandwidth and antenna selection: `u8 bandwidth_code, u8 antenna_sel`.
+///
+/// First of the `0x11..0x1F` range, which is reserved for fields recovered from
+/// the 272-byte driver header. It takes the first slot because its bytes were
+/// already parsed and discarded — see [`crate::raw::decode_bw_antsel`].
+///
+/// This is the frame's own width. [`T_WIDTH`] (`0x0B`) is the *configured
+/// monitor width*, a session constant, and is retained unchanged.
+pub const T_BW_ANTSEL: u8 = 0x11;
+// 0x12..0x1F  reserved: further 272-byte-header recoveries
+// 0x20..0x2F  reserved: EHT-specific (RU allocation, per-RU tone maps, …)
+// 0x30..0x3F  reserved: 802.11bf sensing metadata
 
 // -- little cursor over a byte slice ------------------------------------------
 
@@ -101,6 +112,9 @@ pub fn encode_payload(r: &CsiRecord) -> Vec<u8> {
         };
         put_tlv(&mut out, T_PHY, &[mod_code, p.mcs, p.nss]);
     }
+    if let Some(b) = r.bw_antsel {
+        put_tlv(&mut out, T_BW_ANTSEL, &[b.bandwidth.to_code(), b.antenna_sel]);
+    }
     put_tlv(&mut out, T_SEQ, &[r.seq]);
     put_tlv(&mut out, T_NRX, &[r.nrx]);
     put_tlv(&mut out, T_NTX, &[r.ntx]);
@@ -130,6 +144,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
     let mut src_mac = [0u8; 6];
     let mut channel = 0u32;
     let mut width = Width::Unknown(0);
+    let mut bw_antsel = None;
     let mut iq = Vec::new();
 
     while buf.remaining() > 0 {
@@ -197,6 +212,15 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
                 width = Width::from_code(code);
             }
             T_RSSI => rssi = bytes_to_i16s(val)?,
+            T_BW_ANTSEL => {
+                if val.len() < 2 {
+                    return Err(CsiqError::Malformed("bw_antsel len"));
+                }
+                bw_antsel = Some(BwAntsel {
+                    bandwidth: Bandwidth::from_code(val[0]),
+                    antenna_sel: val[1],
+                });
+            }
             T_CSI_MATRIX => iq = bytes_to_i16s(val)?,
             _ => { /* unknown type: skip (forward compatibility) */ }
         }
@@ -208,6 +232,12 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
         unix_ts_ns,
         rnf,
         phy,
+        // No `0x11` in this record — every file written before csid 0.2.0. The
+        // same bits are in `rnf`, which the record already carries, so recover
+        // them rather than reporting a field the capture genuinely holds as
+        // absent. `BW_ANTSEL` IS this function applied at write time, so the
+        // fallback returns the same value, not an approximation of it.
+        bw_antsel: bw_antsel.or_else(|| crate::raw::decode_bw_antsel(rnf)),
         seq,
         nrx: nrx.ok_or(CsiqError::Malformed("missing nrx"))?,
         ntx: ntx.ok_or(CsiqError::Malformed("missing ntx"))?,

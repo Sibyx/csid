@@ -12,18 +12,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::ExperimentConfig;
-
-/// Convert a raw capture into a `.csiq`, embedding the sidecar as the session
+/// Convert a raw capture into a `.csiq`, embedding `session` as the session
 /// block. Returns the number of records written.
-pub fn raw_to_csiq(
+///
+/// The session block is taken **by value, never by path**. A live capture
+/// already holds its sidecar in memory, and the on-disk copy is deliberately
+/// stale while a segment seals — it says `capturing` until the export lands, so
+/// that a crash mid-export leaves a directory `csid-sync` skips. Re-reading it
+/// here is what made every segmented capture's `.csiq` claim it was never
+/// finished. Passing the value makes the write order a caller's choice and
+/// removes the trap from the format.
+pub fn raw_to_csiq_with_session(
     raw: &Path,
     out: &Path,
-    cfg: &ExperimentConfig,
-    sidecar_path: &Path,
+    width: csiq::Width,
+    session: Option<&Value>,
 ) -> Result<u64> {
-    let session = read_sidecar(sidecar_path);
-    convert(raw, out, cfg.radio.width.to_csiq(), session.as_ref())
+    convert(raw, out, width, session)
 }
 
 /// Export a session directory (`capture.raw` + `metadata.json`) to `.csiq`,

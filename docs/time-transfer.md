@@ -45,11 +45,27 @@ filter is right for one one-way delay and wrong for a difference of two:
 estimates `skew_AB + min(rx_A) − max(rx_B)` — biased low by the whole width of
 B's jitter distribution. `min`/`max` are reported as the observed envelope only.
 
+**One window, or the skews do not compose.** Every pair in a report is measured
+over the same sequence window, printed above the table. Left to itself each pair
+spans whatever interval its own two nodes shared, and a pair that ran twice as
+long carries twice as much accumulated relative drift in its median — so
+`skew(x,y) + skew(y,z) - skew(x,z)` is not zero and a node's offset depends on
+which peer it was routed through. Measured on `coex-03_20260823-101235`, where
+two nodes heard to seq 74,587 and four peers stopped at 30,366: the triangles
+containing that long pair missed closure by 42-62 µs, against 1-11 µs for the
+co-windowed ones. The window is the intersection of the spans of the nodes that
+share at least `--min-common` sequences with the best-heard node. A node that
+heard a *disjoint* stretch gets no vote — it cannot be placed on that timeline
+under any window, so letting it clamp one would destroy every measurable pair.
+A node that merely joined **late** does get a vote and does clamp, and what that
+cost each pair is printed rather than swallowed.
+
 **What survives and is not observable:** a fixed difference between the two
 nodes' RX pipeline *floors* (driver path, interrupt coalescing, whether one node
 got a kernel timestamp and the other did not). On identical hardware running one
 image it is common-mode and cancels; on a mixed fleet it does not. The render
-says so.
+says so. Triangle closure over a co-windowed fleet is the closest handle on that
+term: on the arm above it is 8-27 µs once the window is common.
 
 ### 2. Phone → fleet affine offset, continuously
 

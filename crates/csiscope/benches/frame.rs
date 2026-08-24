@@ -50,6 +50,7 @@ fn record(i: u64, ntone: u16, nchain: u8) -> CsiRecord {
             mcs: 2,
             nss: 1,
         }),
+        bw_antsel: None,
         seq: 0,
         nrx: nchain,
         ntx: 1,

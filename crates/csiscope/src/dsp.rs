@@ -324,19 +324,47 @@ pub fn chain_amp_db_into_slice(rec: &CsiRecord, chain: usize, out: &mut [f32]) {
 
 // -- frequency axis -----------------------------------------------------------
 
+/// The two subcarrier spacings 802.11 uses below 320 MHz, in Hz.
+const SPACING_DENSE: f64 = 78_125.0; // HE / EHT
+const SPACING_COARSE: f64 = 312_500.0; // legacy / HT / VHT
+
 /// Subcarrier spacing in Hz.
 ///
 /// HE (802.11ax) quadruples the FFT size for the same bandwidth, so its tones
 /// are 78.125 kHz apart against 312.5 kHz for legacy/HT/VHT. The PHY label is
-/// authoritative when present; `ntone` alone is ambiguous (242 tones is HE20
-/// *or* VHT80), so the fallback is only used when `rate_n_flags` was absent.
+/// authoritative when present.
+///
+/// When it is absent, the record's **own** bandwidth settles the case that
+/// `ntone` alone cannot. 242 tones is HE20 *or* VHT80, and those differ by a
+/// factor of four in spacing — the old fallback simply assumed HE for any dense
+/// tone count and would have read a VHT80 record's axis four times too narrow.
+/// Occupied span cannot exceed the channel, so the coarse grid is correct
+/// exactly when it fits, and that is a derivation rather than an assumption.
 pub fn spacing_hz(rec: &CsiRecord) -> f64 {
     match rec.phy.map(|p| p.modulation) {
-        Some(Modulation::He) | Some(Modulation::Eht) => 78_125.0,
-        Some(_) => 312_500.0,
-        // No PHY label: assume the dense grid for tone counts only HE produces.
-        None if rec.ntone >= 242 => 78_125.0,
-        None => 312_500.0,
+        Some(Modulation::He) | Some(Modulation::Eht) => SPACING_DENSE,
+        Some(_) => SPACING_COARSE,
+        None => spacing_from_geometry(rec),
+    }
+}
+
+/// Spacing implied by the tone count and the frame's own bandwidth.
+///
+/// Falls back to the historical tone-count heuristic when the record carries no
+/// bandwidth — a file written before CSIQ recorded one, or a record whose
+/// `rate_n_flags` was unavailable.
+fn spacing_from_geometry(rec: &CsiRecord) -> f64 {
+    match rec.bw_antsel.and_then(|b| b.bandwidth.mhz()) {
+        Some(mhz) => {
+            let channel_hz = mhz as f64 * 1e6;
+            if rec.ntone as f64 * SPACING_COARSE <= channel_hz {
+                SPACING_COARSE
+            } else {
+                SPACING_DENSE
+            }
+        }
+        None if rec.ntone >= 242 => SPACING_DENSE,
+        None => SPACING_COARSE,
     }
 }
 
@@ -1981,6 +2009,99 @@ pub fn tone_stats_into(
 }
 
 #[cfg(test)]
+mod spacing_tests {
+    use super::*;
+    use csiq::record::{Bandwidth, BwAntsel};
+
+    fn bare(ntone: u16, phy: Option<csiq::PhyLabel>, bw: Option<Bandwidth>) -> CsiRecord {
+        CsiRecord {
+            ftm: 0,
+            us: 0,
+            unix_ts_ns: 0,
+            rnf: 0,
+            phy,
+            bw_antsel: bw.map(|bandwidth| BwAntsel {
+                bandwidth,
+                antenna_sel: 0,
+            }),
+            seq: 0,
+            nrx: 1,
+            ntx: 1,
+            ntone,
+            rssi: vec![-40],
+            src_mac: [0; 6],
+            channel: 36,
+            width: csiq::Width::W80,
+            iq: Vec::new(),
+        }
+    }
+
+    fn he(mcs: u8) -> Option<csiq::PhyLabel> {
+        Some(csiq::PhyLabel {
+            modulation: csiq::Modulation::He,
+            mcs,
+            nss: 1,
+        })
+    }
+
+    /// The PHY label stays authoritative. Bandwidth is a fallback, never an
+    /// override — a labelled HE record is 78.125 kHz whatever its width.
+    #[test]
+    fn a_phy_label_still_wins() {
+        assert_eq!(spacing_hz(&bare(242, he(2), Some(Bandwidth::W80))), 78_125.0);
+    }
+
+    /// The ambiguity the old fallback got wrong. 242 tones is HE20 *or* VHT80,
+    /// and the two differ by four in spacing. Without a PHY label the old code
+    /// assumed HE for any dense tone count, reading a VHT80 axis four times too
+    /// narrow. The record's own bandwidth settles it.
+    #[test]
+    fn bandwidth_disambiguates_242_tones() {
+        assert_eq!(
+            spacing_hz(&bare(242, None, Some(Bandwidth::W20))),
+            78_125.0,
+            "242 tones cannot fit 20 MHz at the coarse grid, so it is HE20"
+        );
+        assert_eq!(
+            spacing_hz(&bare(242, None, Some(Bandwidth::W80))),
+            312_500.0,
+            "242 coarse tones occupy 75.6 MHz, which fits 80 MHz — VHT80"
+        );
+    }
+
+    /// The other geometries must keep their known answers.
+    #[test]
+    fn the_common_geometries_resolve_correctly() {
+        for (ntone, bw, want) in [
+            (52u16, Bandwidth::W20, 312_500.0),  // legacy / HT20
+            (996, Bandwidth::W80, 78_125.0),     // HE80
+            (484, Bandwidth::W160, 312_500.0),   // VHT160
+            (1992, Bandwidth::W160, 78_125.0),   // HE160
+        ] {
+            assert_eq!(spacing_hz(&bare(ntone, None, Some(bw))), want, "{ntone} @ {bw}");
+        }
+    }
+
+    /// A record with no bandwidth keeps the historical heuristic. Every file in
+    /// the archive is such a record, so this path must not change behaviour.
+    #[test]
+    fn a_record_without_bandwidth_keeps_the_old_heuristic() {
+        assert_eq!(spacing_hz(&bare(52, None, None)), 312_500.0);
+        assert_eq!(spacing_hz(&bare(242, None, None)), 78_125.0);
+    }
+
+    /// An unknown width code carries no MHz, so it must fall through to the
+    /// heuristic rather than resolving as some default channel.
+    #[test]
+    fn an_unknown_bandwidth_falls_through_rather_than_defaulting() {
+        assert_eq!(
+            spacing_hz(&bare(242, None, Some(Bandwidth::Unknown(7)))),
+            78_125.0
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2002,6 +2123,7 @@ mod tests {
             unix_ts_ns: 0,
             rnf: 0,
             phy: None,
+            bw_antsel: None,
             seq: 0,
             nrx,
             ntx,
@@ -2791,6 +2913,7 @@ mod tests {
                 unix_ts_ns: 0,
                 rnf: 0,
                 phy: None,
+                bw_antsel: None,
                 seq: 0,
                 nrx: 2,
                 ntx: 1,
@@ -2825,6 +2948,7 @@ mod tests {
             unix_ts_ns: 0,
             rnf: 0,
             phy: None,
+            bw_antsel: None,
             seq: 0,
             nrx: 1,
             ntx: 1,

@@ -196,10 +196,19 @@ pub fn spawn(template: Sidecar, cfg: ExperimentConfig) -> Result<Sealer> {
 
 /// Write one segment's sidecar and (optionally) its CSIQ export.
 ///
-/// Order matters: the CSIQ export embeds the sidecar, and `csid-sync` treats
-/// the sidecar's `status` as the "ready to ship" signal. So the sidecar is
-/// written **twice** — once as `capturing` so a crash mid-export leaves a
-/// directory sync will skip, then as `complete` only after the export lands.
+/// Order matters, and the two consumers want **opposite** orders:
+///
+/// - `csid-sync` reads the on-disk `status` as its ready-to-ship signal, so the
+///   file must say `capturing` until the export lands. A crash mid-export then
+///   leaves a directory sync skips.
+/// - The `.csiq` embeds the session block, and a published file must describe a
+///   *finished* segment. Embedding `capturing` told every stranger the capture
+///   was truncated, on effectively the whole archive.
+///
+/// Both are satisfied by finalising the sidecar **in memory**, embedding that
+/// value in the export, and only then writing the finalised document to disk.
+/// The on-disk file is still `capturing` for exactly the window the sync
+/// guarantee needs, and the embedded block is true at close.
 fn seal_one(
     seg: &Sealed,
     template: &Sidecar,
@@ -238,9 +247,30 @@ fn seal_one(
         summary.ble = ble_cursor.slice(stats.first_ts_ns, stats.last_ts_ns);
     }
 
+    // Finalise in memory. `ended_at` is stamped exactly once here, so the
+    // embedded block and the sidecar cannot report two close times.
+    sc.finalise(Status::Complete, Some(summary));
+
     if cfg.export.on_close {
         let out = seg.dir.join("capture.csiq");
-        if let Err(e) = crate::export::raw_to_csiq(&seg.raw, &out, cfg, sc.path()) {
+        let session = match serde_json::to_value(&sc) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                // A file with no session block is self-describing about that
+                // absence; a file with a wrong one is not. Export anyway.
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "serialising the segment sidecar failed; exporting without a session block"
+                );
+                None
+            }
+        };
+        if let Err(e) = crate::export::raw_to_csiq_with_session(
+            &seg.raw,
+            &out,
+            cfg.radio.width.to_csiq(),
+            session.as_ref(),
+        ) {
             // Non-fatal: the raw is the source of truth and `csid export` can
             // regenerate the container later. Still mark the segment complete
             // so it ships — a segment with raw but no csiq is worth far more
@@ -252,7 +282,8 @@ fn seal_one(
         }
     }
 
-    sc.close(Status::Complete, Some(summary));
+    // Only now does the on-disk sidecar become the sync signal.
+    sc.persist();
     Ok(records)
 }
 
@@ -581,6 +612,264 @@ mod tests {
         let mut counts = std::collections::HashMap::new();
         counts.insert([0xEF, 0xBE, 0xAD, 0xDE, 0xAD, 0xDE], 1u64);
         assert_eq!(census(counts).top[0].mac, "ef:be:ad:de:ad:de");
+    }
+
+    // ── IP-139 Phase 1: the session block is true at close ──────────────────
+
+    /// A scratch directory that removes itself, so a failed assertion never
+    /// leaves a half-sealed segment behind to confuse the next run.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "csid-seal-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+        fn join(&self, p: &str) -> PathBuf {
+            self.0.join(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One synthetic iax record: `[be32 msg_len][be32 hdr_len][hdr][be32 csi_len][csi]`.
+    ///
+    /// Only the fields `summarize_segment` and the TLV encoder read are set, so
+    /// this stays a fixture for the *sealing* contract and not a second, drifting
+    /// copy of the header layout.
+    fn raw_record(ntone: u16, unix_ts_ns: u64) -> Vec<u8> {
+        const HDR: usize = csiq::raw::HEADER_LEN;
+        let mut hdr = vec![0u8; HDR];
+        hdr[8..12].copy_from_slice(&1_000u32.to_le_bytes()); // ftm
+        hdr[46] = 1; // nrx
+        hdr[47] = 1; // ntx
+        hdr[52..54].copy_from_slice(&ntone.to_le_bytes());
+        hdr[60] = 40; // rssi magnitude -> -40 dBm
+        hdr[68..74].copy_from_slice(&[0x02, 0x6d, 0x6f, 0x6e, 0x00, 0x13]); // src mac
+        hdr[92..96].copy_from_slice(&0x4100u32.to_le_bytes()); // rate_n_flags
+        hdr[208..216].copy_from_slice(&unix_ts_ns.to_le_bytes());
+        hdr[216] = 11; // channel
+
+        // 2 i16 per tone per chain, one chain.
+        let csi = vec![0u8; ntone as usize * 4];
+
+        let mut out = Vec::new();
+        let msg_len = 4 + HDR + 4 + csi.len();
+        out.extend_from_slice(&(msg_len as u32).to_be_bytes());
+        out.extend_from_slice(&(HDR as u32).to_be_bytes());
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(&(csi.len() as u32).to_be_bytes());
+        out.extend_from_slice(&csi);
+        out
+    }
+
+    fn write_raw(path: &Path, records: usize) {
+        let mut buf = Vec::new();
+        for i in 0..records {
+            buf.extend_from_slice(&raw_record(52, 1_700_000_000_000_000_000 + i as u64 * 10_000_000));
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    const SEAL_CFG: &str = r#"
+[radio]
+interface = "wlp1s0"
+channel = 11
+width = "HT20"
+
+[capture]
+mode = "passive"
+
+[export]
+on_close = true
+"#;
+
+    fn seal_cfg() -> ExperimentConfig {
+        toml::from_str(SEAL_CFG).unwrap()
+    }
+
+    /// A sidecar in the state a segment template is in: open, capturing, no
+    /// summary. Built by deserialisation so the test needs no radio, no
+    /// `GlobalConfig` and no host probe.
+    fn template_sidecar() -> crate::sidecar::Sidecar {
+        serde_json::from_value(serde_json::json!({
+            "schema": "csid-session/1",
+            "session_id": "monad03_seal_20260824-120000",
+            "run_id": "seal-test",
+            "experiment": "seal",
+            "tag": null,
+            "radio": {
+                "interface": "wlp1s0", "monitor": "wlp1s0mon0", "band": "2.4",
+                "channel": 11, "control_freq_mhz": 2462, "center_freq_mhz": null,
+                "width": "HT20", "interval_us": 0, "mac_filter": []
+            },
+            "environment": { "csid_version": "0.2.0" },
+            "started_at": "2026-08-24T12:00:00Z",
+            "ended_at": null,
+            "status": "capturing",
+            "summary": null
+        }))
+        .unwrap()
+    }
+
+    fn session_block(csiq_path: &Path) -> serde_json::Value {
+        let f = std::fs::File::open(csiq_path).unwrap();
+        let r = csiq::Reader::new(std::io::BufReader::new(f)).unwrap();
+        r.session().expect("the export must embed a session block").clone()
+    }
+
+    /// The defect IP-139 P6 records: every segmented capture's `.csiq` claimed
+    /// it was never finished, because the export re-read a sidecar deliberately
+    /// left at `capturing` for the sync guarantee. Segments dominate the
+    /// archive, so effectively every published file told a stranger the capture
+    /// was truncated.
+    #[test]
+    fn a_sealed_segments_csiq_says_the_segment_finished() {
+        let scratch = Scratch::new("complete");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 8);
+
+        let seg = Sealed {
+            dir: scratch.0.clone(),
+            raw: raw.clone(),
+            index: 1,
+        };
+        let mut cursor = BleCursor::new(scratch.0.clone());
+        let records = seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
+        assert_eq!(records, 8);
+
+        let block = session_block(&scratch.join("capture.csiq"));
+        assert_eq!(
+            block["status"], "complete",
+            "a published file must not claim the capture was truncated"
+        );
+        assert!(
+            block["ended_at"].is_string(),
+            "a finished segment states when it finished"
+        );
+        assert_eq!(
+            block["summary"]["records"], 8,
+            "the embedded summary must be populated, not null"
+        );
+    }
+
+    /// The embedded block and the on-disk sidecar must report ONE close time.
+    ///
+    /// A segment's export takes seconds to minutes. Finalising and writing at
+    /// two instants would give one segment two `ended_at` values — a difference
+    /// no reader could explain, and the signature every clock-seam check flags.
+    #[test]
+    fn the_embedded_block_and_the_sidecar_agree_on_the_close_time() {
+        let scratch = Scratch::new("onetime");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 4);
+
+        let seg = Sealed {
+            dir: scratch.0.clone(),
+            raw,
+            index: 1,
+        };
+        let mut cursor = BleCursor::new(scratch.0.clone());
+        seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
+
+        let block = session_block(&scratch.join("capture.csiq"));
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scratch.join("metadata.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(on_disk["status"], "complete");
+        assert_eq!(
+            block["ended_at"], on_disk["ended_at"],
+            "one segment, one close time"
+        );
+        assert_eq!(block["summary"]["records"], on_disk["summary"]["records"]);
+    }
+
+    /// The export must never read the sidecar back from disk.
+    ///
+    /// This is the root cause, isolated: while a segment seals, the on-disk file
+    /// says `capturing` on purpose, so that a crash mid-export leaves a
+    /// directory `csid-sync` skips. Taking the session by value is what lets
+    /// both consumers have the order they need.
+    #[test]
+    fn the_export_embeds_the_value_it_is_given_not_the_file_on_disk() {
+        let scratch = Scratch::new("byvalue");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 2);
+
+        // On disk: the deliberately stale, still-capturing sidecar.
+        let mut stale = template_sidecar();
+        stale.set_path(scratch.join("metadata.json"));
+        stale.write().unwrap();
+
+        // In memory: the finalised block the file should carry.
+        let mut finalised = template_sidecar();
+        finalised.finalise(
+            Status::Complete,
+            Some(crate::sidecar::SummaryMeta {
+                records: 2,
+                ..Default::default()
+            }),
+        );
+        let value = serde_json::to_value(&finalised).unwrap();
+
+        let out = scratch.join("capture.csiq");
+        crate::export::raw_to_csiq_with_session(
+            &raw,
+            &out,
+            csiq::Width::Ht20,
+            Some(&value),
+        )
+        .unwrap();
+
+        assert_eq!(session_block(&out)["status"], "complete");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scratch.join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk["status"], "capturing",
+            "the sync guarantee is untouched: the file is still the ready-to-ship signal"
+        );
+    }
+
+    /// A failed export must still ship the segment. The raw is the source of
+    /// truth and `csid export` can regenerate the container later, so a segment
+    /// with raw but no csiq is worth far more off the node than on it.
+    #[test]
+    fn a_failed_export_still_marks_the_segment_complete() {
+        let scratch = Scratch::new("exportfail");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 3);
+
+        // A directory where the writer wants to create a file: File::create fails.
+        std::fs::create_dir_all(scratch.join("capture.csiq")).unwrap();
+
+        let seg = Sealed {
+            dir: scratch.0.clone(),
+            raw,
+            index: 1,
+        };
+        let mut cursor = BleCursor::new(scratch.0.clone());
+        let records = seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
+        assert_eq!(records, 3);
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scratch.join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk["status"], "complete",
+            "the segment must ship even though its container could not be written"
+        );
     }
 
     fn write_log(dir: &Path, rows: &[(u64, &str)]) {

@@ -62,3 +62,41 @@ pub mod util;
 
 /// The `csid` version string, so consumers report the same one the daemon does.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build-time provenance, baked in by `build.rs` (IP-139 Phase 3).
+///
+/// The semantic [`VERSION`] answers "which release is this". These answer
+/// "which build", which is the question the archive could not answer at all:
+/// every capture ever taken carries `csid_version = "0.1.0"`, because that
+/// literal was never bumped while the daemon gained injection, time transfer,
+/// segmentation, the BLE scanner and the empty-record counter.
+///
+/// [`REVISION`] is empty when the build could not name itself, and
+/// [`REVISION_SOURCE`] says why. That happens by design on the fleet: the csid
+/// Ansible role rsyncs the source to each node with `--exclude=.git` and
+/// compiles there, so `git describe` has nothing to read. The control host does
+/// hold the checkout, so it can pass an identity in through the
+/// `CSID_BUILD_REVISION` environment variable at build time — the role already
+/// computes a deterministic source content hash that is exactly the right value.
+///
+/// A build that cannot name its revision says so. It never guesses one.
+pub mod build_info {
+    /// `git describe` output, an operator-supplied identity, or empty.
+    pub const REVISION: &str = env!("CSID_BUILD_REVISION");
+    /// `git` · `supplied` · `none`.
+    pub const REVISION_SOURCE: &str = env!("CSID_BUILD_REVISION_SOURCE");
+    /// Compile time, seconds since the Unix epoch.
+    pub const EPOCH: &str = env!("CSID_BUILD_EPOCH");
+    /// The compiler that built this binary.
+    pub const RUSTC: &str = env!("CSID_BUILD_RUSTC");
+    /// `release` or `debug`.
+    pub const PROFILE: &str = env!("CSID_BUILD_PROFILE");
+
+    /// Compile time as RFC 3339 UTC, or an empty string if it did not parse.
+    pub fn built_at() -> String {
+        match EPOCH.parse::<u64>() {
+            Ok(0) | Err(_) => String::new(),
+            Ok(secs) => crate::util::rfc3339_utc(secs),
+        }
+    }
+}

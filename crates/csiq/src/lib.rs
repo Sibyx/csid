@@ -101,6 +101,7 @@ mod tests {
                 mcs: 2,
                 nss: 1,
             }),
+            bw_antsel: crate::raw::decode_bw_antsel(0x0442),
             seq: 7,
             nrx,
             ntx,
@@ -111,6 +112,123 @@ mod tests {
             width: Width::W80,
             iq,
         }
+    }
+
+    // ── IP-139 Phase 2: per-record PHY truth ────────────────────────────────
+
+    /// The bit positions come from `rs.h` in the driver we run, so pin them
+    /// against words whose meaning is known independently.
+    ///
+    /// `0x4100` is the value 20 fleet arms write to `monitor_tx_rate` for
+    /// 6 Mbps legacy OFDM. Decoding it must reproduce that description exactly,
+    /// including the antenna bit `config.rs` documents but never named.
+    #[test]
+    fn the_fleets_own_injection_word_decodes_to_what_it_is_configured_as() {
+        let phy = crate::raw::decode_rnf(0x4100).expect("a non-zero word decodes");
+        assert_eq!(phy.modulation, Modulation::LegacyOfdm);
+        assert_eq!(phy.mcs, 0, "legacy rate index 0 is 6 Mbps");
+
+        let b = crate::raw::decode_bw_antsel(0x4100).expect("a non-zero word decodes");
+        assert_eq!(b.bandwidth, crate::record::Bandwidth::W20);
+        assert!(b.ant_a(), "bit 14 is RATE_MCS_ANT_A_MSK");
+        assert!(!b.ant_b());
+    }
+
+    /// Bandwidth is bits 13–11, and each code is the driver's own.
+    #[test]
+    fn bandwidth_reads_bits_thirteen_to_eleven() {
+        use crate::record::Bandwidth::*;
+        for (code, want, mhz) in [
+            (0u32, W20, 20u32),
+            (1, W40, 40),
+            (2, W80, 80),
+            (3, W160, 160),
+            (4, W320, 320),
+        ] {
+            // Carry a modulation type as well, so the word is realistic.
+            let rnf = (1 << 8) | (code << 11);
+            let b = crate::raw::decode_bw_antsel(rnf).unwrap();
+            assert_eq!(b.bandwidth, want, "code {code}");
+            assert_eq!(b.bandwidth.mhz(), Some(mhz));
+            assert_eq!(b.bandwidth.to_code(), code as u8, "code round-trips");
+        }
+    }
+
+    /// An unknown width code is carried verbatim rather than coerced to 20 MHz.
+    /// A future firmware that adds one must not silently read as the narrowest.
+    #[test]
+    fn an_unknown_bandwidth_code_is_carried_not_guessed() {
+        let b = crate::raw::decode_bw_antsel((1 << 8) | (7 << 11)).unwrap();
+        assert_eq!(b.bandwidth, crate::record::Bandwidth::Unknown(7));
+        assert_eq!(b.bandwidth.mhz(), None, "unknown has no MHz, not a default");
+    }
+
+    /// Antenna selection is a two-bit mask, not an index.
+    #[test]
+    fn antenna_selection_is_a_mask_over_bits_fifteen_and_fourteen() {
+        let both = crate::raw::decode_bw_antsel((1 << 8) | (1 << 14) | (1 << 15)).unwrap();
+        assert!(both.ant_a() && both.ant_b());
+        assert_eq!(both.antenna_sel, 0b11);
+
+        let b_only = crate::raw::decode_bw_antsel((1 << 8) | (1 << 15)).unwrap();
+        assert!(!b_only.ant_a() && b_only.ant_b());
+    }
+
+    /// A `0x11` written by this build must survive a container round trip.
+    #[test]
+    fn bw_antsel_round_trips_through_the_container() {
+        let rec = sample_record(242, 2, 1);
+        assert!(rec.bw_antsel.is_some(), "the fixture must exercise the field");
+
+        let payload = crate::tlv::encode_payload(&rec);
+        let back = crate::tlv::decode_payload(&payload).expect("round trip");
+        assert_eq!(back.bw_antsel, rec.bw_antsel);
+        assert_eq!(back.rnf, rec.rnf);
+    }
+
+    /// Forward compatibility, both directions — the versioning promise the
+    /// format makes, tested rather than asserted.
+    ///
+    /// A record with no `0x11` (every file in the archive) must decode with the
+    /// field absent, and a record carrying an unknown *future* code must decode
+    /// as if that code were not there.
+    #[test]
+    fn a_reader_tolerates_both_a_missing_and_an_unknown_field() {
+        // A v1 record carries no 0x11, but it does carry `rnf`. The reader
+        // recovers the field from those same bits rather than losing it, which
+        // is what makes the whole existing archive readable without re-capture.
+        let mut old = sample_record(52, 1, 1);
+        old.bw_antsel = None;
+        let back = crate::tlv::decode_payload(&crate::tlv::encode_payload(&old)).unwrap();
+        assert_eq!(
+            back.bw_antsel,
+            crate::raw::decode_bw_antsel(old.rnf),
+            "an absent 0x11 is recovered from rnf, which is the same bits"
+        );
+
+        // A record with neither is genuinely absent, and must stay absent.
+        let mut blank = sample_record(52, 1, 1);
+        blank.bw_antsel = None;
+        blank.rnf = 0;
+        let back = crate::tlv::decode_payload(&crate::tlv::encode_payload(&blank)).unwrap();
+        assert_eq!(back.bw_antsel, None, "no rate information is not 20 MHz");
+
+        // A future field this build has never heard of, appended to a valid record.
+        let mut payload = crate::tlv::encode_payload(&sample_record(52, 1, 1));
+        payload.push(0x7E); // unallocated
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        let back = crate::tlv::decode_payload(&payload).expect("unknown types are skipped");
+        assert_eq!(back.ntone, 52);
+        assert!(back.bw_antsel.is_some());
+    }
+
+    /// `rnf == 0` is the header's "no rate information", and both decoders must
+    /// agree about it. A zero word is not a 20 MHz frame on antenna none.
+    #[test]
+    fn a_zero_rate_word_yields_no_bandwidth_and_no_phy() {
+        assert!(crate::raw::decode_rnf(0).is_none());
+        assert!(crate::raw::decode_bw_antsel(0).is_none());
     }
 
     /// The layout and I/Q order are invisible in amplitude — |a+bi| == |b+ai|,

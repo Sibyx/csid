@@ -1358,6 +1358,7 @@ mod tests {
                     mcs: 2,
                     nss: 1,
                 }),
+                bw_antsel: None,
                 seq: 0,
                 nrx: nchain_rx,
                 ntx: 1,

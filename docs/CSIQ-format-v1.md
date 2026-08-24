@@ -59,11 +59,76 @@ which carries:
 
 | Group | Fields |
 |---|---|
-| identity | `session_id`, `experiment`, `tag`, `schema` |
+| identity | `session_id`, `run_id`, `experiment`, `tag`, `schema` |
 | radio | `interface`, `monitor`, `band`, `channel`, `control_freq_mhz`, `center_freq_mhz`, `width`, `interval_us`, `mac_filter` |
-| environment | `hostname`, `kernel`, `driver_module`, `firmware`, `regdomain`, `cpu_governor`, `csid_version` |
+| filter | `frame_types`, `rate_n_flags_val`, `rate_n_flags_mask`, `count`, `timeout_us`, `fingerprint` |
+| environment | `hostname`, `kernel`, `driver_module`, `firmware`, `regdomain`, `cpu_governor`, `csid_version`, `build` |
 | lifecycle | `started_at`, `ended_at`, `status` |
-| summary | `records`, `capture_bytes`, `mean_rate_hz`, `tone_counts`, `live_dropped` |
+| summary | `records`, `empty_records`, `capture_bytes`, `mean_rate_hz`, `tone_counts`, `live_dropped` |
+
+Adding a group to the sidecar is **not** a CSIQ version bump. The block is
+opaque to the container, and a reader that does not know a group ignores it.
+
+#### `status` is true at close (since csid 0.2.0)
+
+A published file describes a *finished* capture. Before csid 0.2.0 the export
+re-read the sidecar from disk, and a segmented capture deliberately leaves that
+file at `status: capturing` until the export lands — so `csid-sync` skips a
+directory whose export was interrupted. The embedded block therefore said
+`capturing` forever, on effectively every segmented file in the archive.
+
+The export now takes the session block **by value**, so the on-disk file and the
+embedded copy can be written in opposite orders. A file written by csid 0.2.0 or
+later states its real outcome, and both copies carry one `ended_at`.
+
+A file that says `capturing` was written by an earlier build. It is not evidence
+that the capture was truncated.
+
+#### `filter` — what the radio was allowed to report
+
+A filter is a claim about the data. A capture that selected only data frames and
+one that selected nothing are not the same measurement, so the selection in
+force is recorded whether or not any of it is set.
+
+`fingerprint` is a stable digest over `(frame_types, rate_n_flags_val,
+rate_n_flags_mask)`, so two differently-filtered captures cannot land in one
+poolable group by accident. `count` and `timeout_us` are excluded from it: they
+bound how much the radio reports, not which frames it selects, so two captures
+that differ only in duration stay poolable.
+
+Two reserved values, and they are different facts:
+
+| `fingerprint` | Meaning |
+|---|---|
+| `no-filter` | the radio filtered nothing |
+| `""` (empty) | written before the group existed — not recorded |
+
+The two selection knobs `csid` does drive are not repeated here. `csi_interval`
+is `radio.interval_us` and `csi_addresses` is `radio.mac_filter`.
+
+#### `environment.build` — which build wrote this file
+
+`csid_version` is the semantic version and keeps its meaning. `build` names the
+binary beside it:
+
+| Field | Meaning |
+|---|---|
+| `revision` | `git describe` output, an operator-supplied identity, or empty |
+| `revision_source` | `git` · `supplied` · `none` |
+| `built_at` | compile time, RFC 3339 UTC |
+| `rustc`, `profile` | compiler and build profile |
+| `csiq_format_version` | the container version this build writes |
+
+Read `revision_source` first. A build that cannot name its revision says `none`
+and leaves `revision` empty — it never guesses one. That is the expected state
+when the source was deployed without its `.git` directory, which is how the
+capture fleet is built.
+
+An all-empty `build` group means the file predates build provenance. Every such
+file reports `csid_version = "0.1.0"`, because that literal was never bumped
+while the daemon gained injection, time transfer, segmentation, the BLE scanner
+and the empty-record counter. Those files cannot be distinguished by build, and
+no later pass can recover it.
 
 ## Record payload — TLV
 
@@ -97,6 +162,8 @@ Each record payload is a flat sequence of fields:
 | `0x0C` | `RSSI` | `i16[]` — one per RX chain, **dBm** (negative); `-127` = no measurement | |
 | `0x0D` | `SEQ` | `u8` — 802.11 sequence byte | |
 | `0x10` | `CSI_MATRIX` | `i16[]` — interleaved I/Q | |
+| `0x11` | `BW_ANTSEL` | `u8` bandwidth code, `u8` antenna mask (below) | |
+| `0x12`–`0x1F` | *reserved* | further recoveries from the 272-byte driver header | |
 | `0x20`–`0x2F` | *reserved* | 802.11be / EHT (RU allocation, per-RU tone maps) | |
 | `0x30`–`0x3F` | *reserved* | 802.11bf sensing metadata | |
 
@@ -118,6 +185,72 @@ A reader **must** reject a record missing any field marked required, and
 Width is a property of the **monitor interface**, not of the record. It bounds
 what is decodable; the actual CSI type follows the received frame. A 20 MHz HE
 frame captured on a 160 MHz monitor still yields 242 tones.
+
+#### Corrigendum: `WIDTH` is a session constant (2026-08-24)
+
+`WIDTH` was easy to read as the frame's bandwidth. It is not, and never was.
+
+An ambient channel interleaves PHY types frame by frame, so on those captures
+`WIDTH` is the *configured monitor width* for every record and describes none of
+them. Consumers compensated by inferring tone spacing from the modulation label
+and falling back on tone count, which cannot separate HE20 from VHT80 — both
+carry 242 tones, four times apart in spacing.
+
+The field is **retained unchanged**, because what it records is real and worth
+recording: it bounds what the receiver could decode. A wrong description is
+fixed by corrigendum, never by redefining a field that files already carry.
+
+The frame's own bandwidth is `BW_ANTSEL` (`0x11`). Prefer it for anything that
+describes a record. Prefer `WIDTH` for anything that describes the receiver.
+
+### Bandwidth and antenna codes (`0x11`)
+
+`u8 bandwidth_code`, then `u8 antenna_sel`. Both are decoded from the
+`rate_n_flags` word that `RNF` (`0x04`) already carries verbatim, so **every
+CSIQ file ever written contains these bits** — a reader that wants them from an
+older file can decode `0x04` itself, with no re-capture.
+
+| Code | Bandwidth |
+|---:|---|
+| 0 | 20 MHz |
+| 1 | 40 MHz |
+| 2 | 80 MHz |
+| 3 | 160 MHz |
+| 4 | 320 MHz *(reserved; no 802.11be hardware yet)* |
+
+The codes are the driver's own `RATE_MCS_CHAN_WIDTH_*` values, so no table sits
+between the firmware and the file. An unrecognised code is carried verbatim and
+**must not** be coerced to 20 MHz.
+
+`antenna_sel` is a two-bit mask, not an index: bit 0 = antenna A, bit 1 =
+antenna B. It is the driver's `RATE_MCS_ANT_A_MSK` / `_B_MSK` shifted down from
+bits 14–15. A value of `0` means the word named no antenna, which is the normal
+state of a receive record — the field is populated on transmit descriptors.
+
+**An absent `0x11` is not 20 MHz.** It means the writer did not record the
+field, or `rate_n_flags` was unavailable for that record.
+
+**Reader rule.** When `0x11` is absent but `RNF` (`0x04`) is present, a reader
+**should** decode these fields from `RNF` and report them as if the writer had
+emitted them. `BW_ANTSEL` *is* that decode performed at write time, so the two
+paths return the same bits, and this is what makes every file written before
+csid 0.2.0 carry per-frame bandwidth with no re-capture. When neither is
+present, the field is genuinely absent and **must** be reported as such. Both
+reference readers implement this rule.
+
+#### Deriving the tone grid
+
+With per-record bandwidth the tone grid is derivable rather than assumed. The
+occupied span cannot exceed the channel, so:
+
+```
+spacing = 312.5 kHz   if  ntone × 312.5 kHz ≤ bandwidth
+          78.125 kHz  otherwise
+```
+
+242 tones in 20 MHz is HE20 (75.6 MHz would not fit); 242 tones in 80 MHz is
+VHT80. The `PHY` label (`0x05`) remains authoritative when present — this rule
+is what resolves the case where it is absent.
 
 ### Modulation codes (`0x05`)
 

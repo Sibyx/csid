@@ -251,6 +251,7 @@ mod tests {
                 unix_ts_ns: 0,
                 rnf: 0,
                 phy: None,
+                bw_antsel: None,
                 seq: 0,
                 nrx: 1,
                 ntx: 1,

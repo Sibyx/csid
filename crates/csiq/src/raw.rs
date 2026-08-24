@@ -17,7 +17,7 @@
 use std::io::{self, Read};
 
 use crate::error::{CsiqError, Result};
-use crate::record::{CsiRecord, Modulation, PhyLabel, Width};
+use crate::record::{Bandwidth, BwAntsel, CsiRecord, Modulation, PhyLabel, Width};
 
 /// The header length the iax stream declares (and this parser expects).
 pub const HEADER_LEN: usize = 272;
@@ -71,6 +71,77 @@ fn rssi_dbm(raw: u8) -> i16 {
     -(raw as i16)
 }
 
+/// `rate_n_flags` **version 2** field positions.
+///
+/// Transcribed from the driver this project actually runs — `rs.h` in the
+/// pinned `iax` tree (`drivers/net/wireless/intel/iwlwifi/fw/api/rs.h`,
+/// upstream ref `20d21a7f`), section "rate_n_flags bit field version 2". Read
+/// from `/usr/src/iax-csi-iwlwifi-6x-port` on a deployed node, 2026-08-24.
+///
+/// v1 and v2 disagree about almost every field above bit 7, so a v1 constant
+/// used here would misparse silently. The names below are the driver's.
+mod rnf {
+    /// Bits 10–8: `RATE_MCS_MOD_TYPE_MSK`.
+    pub const MOD_TYPE_POS: u32 = 8;
+    pub const MOD_TYPE_MSK: u32 = 0x7;
+
+    /// Bits 13–11: `RATE_MCS_CHAN_WIDTH_MSK`.
+    /// (0) 20 (1) 40 (2) 80 (3) 160 (4) 320 MHz.
+    pub const CHAN_WIDTH_POS: u32 = 11;
+    pub const CHAN_WIDTH_MSK: u32 = 0x7;
+
+    /// Bits 15–14: antenna selection. Bit 14 = antenna A, bit 15 = antenna B.
+    /// `RATE_MCS_ANT_A_MSK` is `1 << 14`, `RATE_MCS_ANT_B_MSK` is `2 << 14`.
+    pub const ANT_POS: u32 = 14;
+    pub const ANT_MSK: u32 = 0x3;
+}
+
+/// Decode the per-frame bandwidth and antenna selection from `rate_n_flags`.
+///
+/// These bits have been in every record csid has ever written — `rnf` is stored
+/// verbatim as TLV `0x04` — and were parsed away. Recovering them needs no new
+/// capture and no driver change, only a decoder.
+///
+/// Returns `None` for `rnf == 0`, which is how the header reports "no rate
+/// information", exactly as [`decode_rnf`] does.
+///
+/// # Validated against real captures
+///
+/// The header gives the layout; these are the records. Decoded across 82 cached
+/// `.csiq` files, 159,716 records, 2026-08-24:
+///
+/// | modulation | bandwidth | antenna | tones | chains | records |
+/// |---|---|---|---:|---:|---:|
+/// | legacy OFDM | 20 MHz | A+B | 52 | 2 | 158,541 |
+/// | HT | 20 MHz | A+B | 56 | 2 | 1,105 |
+/// | HE | 20 MHz | A+B | 242 | 2 | 68 |
+/// | legacy OFDM | 20 MHz | B | 52 | 2 | 2 |
+///
+/// Every row is internally consistent: 52, 56 and 242 tones are exactly what
+/// legacy, HT and HE produce **in 20 MHz**. A misread width field would have
+/// paired 242 tones with 80 MHz, which is VHT80's geometry and not HE20's.
+/// Bits 16 and above are set on precisely the 1,173 non-legacy records
+/// (LDPC/STBC/HE fields), which is a second independent consistency check.
+///
+/// Two limits, stated because they matter:
+///
+/// * **No non-zero bandwidth code has been observed in the wild.** The corpus is
+///   99.76% one PHY geometry, so 20 MHz is all there is to see. The 40/80/160
+///   codes rest on the driver header alone until a wide capture exists.
+/// * Bits 7–5 were zero in all 159,716 records, which is why the NSS mask
+///   divergence noted in [`decode_rnf`] is latent rather than active.
+pub fn decode_bw_antsel(rnf: u32) -> Option<BwAntsel> {
+    if rnf == 0 {
+        return None;
+    }
+    Some(BwAntsel {
+        bandwidth: Bandwidth::from_code(
+            ((rnf >> rnf::CHAN_WIDTH_POS) & rnf::CHAN_WIDTH_MSK) as u8,
+        ),
+        antenna_sel: ((rnf >> rnf::ANT_POS) & rnf::ANT_MSK) as u8,
+    })
+}
+
 /// Decode `rate_n_flags` v2 into a [`PhyLabel`].
 ///
 /// v2 layout (iwlwifi): MCS in bits 0–3, NSS-1 in bits 4–5, modulation type in
@@ -79,9 +150,21 @@ pub fn decode_rnf(rnf: u32) -> Option<PhyLabel> {
     if rnf == 0 {
         return None;
     }
+    // NOTE, 2026-08-24: two divergences from `rs.h` v2, left as they are
+    // because changing them would alter `PhyLabel` on every record ever read,
+    // and neither can produce a wrong value on data seen so far.
+    //
+    //  * NSS is `RATE_MCS_NSS_MSK = 1 << 4` — a SINGLE bit, 0 = one stream,
+    //    1 = two. Reading two bits here would report NSS 3 or 4 if bit 5 were
+    //    ever set. Bits 7–5 are reserved and have been zero in every record
+    //    decoded, and the AX210 has two antennas, so no such value can be real.
+    //  * The legacy rate index is `RATE_LEGACY_RATE_MSK = 0x7` (bits 2–0),
+    //    while `RATE_MCS_CODE_MSK = 0xf` applies to HT/VHT/HE/EHT MCS. The mask
+    //    is therefore modulation-dependent, and 0xF is one bit too wide for a
+    //    legacy record.
     let mcs = (rnf & 0x0F) as u8;
     let nss = (((rnf >> 4) & 0x03) as u8) + 1;
-    let mod_type = ((rnf >> 8) & 0x07) as u8;
+    let mod_type = ((rnf >> rnf::MOD_TYPE_POS) & rnf::MOD_TYPE_MSK) as u8;
     Some(PhyLabel {
         modulation: Modulation::from_rnf_type(mod_type),
         mcs,
@@ -132,6 +215,7 @@ pub fn parse_record(hdr: &[u8], csi: &[u8], width: Width) -> Result<CsiRecord> {
         unix_ts_ns,
         rnf,
         phy: decode_rnf(rnf),
+        bw_antsel: decode_bw_antsel(rnf),
         seq: hdr[off::SEQ],
         nrx,
         ntx,
