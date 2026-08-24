@@ -443,7 +443,8 @@ function renderConstellation(f) {
   readout('r-constellation', `${n} subcarriers`,
     'Each point is one subcarrier\'s complex channel coefficient. A clean ' +
     'single-path channel traces a circle; multipath folds it, and the radius ' +
-    'is |H| — shape only, since the AGC has normalised the absolute scale.');
+    'is |H| — shape only: the level is AGC-relative, so it is not comparable ' +
+    'across packets. The per-chain RSSI is the absolute anchor.');
 }
 
 // -- per-chain small multiples ------------------------------------------------

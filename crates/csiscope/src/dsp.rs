@@ -429,7 +429,10 @@ thread_local! {
 
 // -- amplitude ----------------------------------------------------------------
 
-/// Magnitude in dB (relative — the AGC has already normalised absolute scale).
+/// Magnitude in dB — AGC-relative, not AGC-normalised.
+///
+/// Nothing here divides the receiver gain out, so read shape across subcarriers
+/// rather than level. See the module note.
 pub fn amp_db(h: &[Complex32]) -> Vec<f32> {
     let mut out = Vec::new();
     amp_db_into(h, &mut out);
