@@ -163,9 +163,17 @@ Each record payload is a flat sequence of fields:
 | `0x0D` | `SEQ` | `u8` — 802.11 sequence byte | |
 | `0x10` | `CSI_MATRIX` | `i16[]` — interleaved I/Q | |
 | `0x11` | `BW_ANTSEL` | `u8` bandwidth code, `u8` antenna mask (below) | |
-| `0x12`–`0x1F` | *reserved* | further recoveries from the 272-byte driver header | |
+| `0x12` | `MONO_US` | `u64` — `CLOCK_MONOTONIC` microseconds (below) | |
+| `0x13` | *reserved, unused* | see the `SEQ` corrigendum | |
+| `0x14` | `VENDOR_HDR` | the 272-byte driver header, verbatim | |
+| `0x15`–`0x1F` | *reserved* | further recoveries from the 272-byte driver header | |
 | `0x20`–`0x2F` | *reserved* | 802.11be / EHT (RU allocation, per-RU tone maps) | |
 | `0x30`–`0x3F` | *reserved* | 802.11bf sensing metadata | |
+| `0x40` | `NODE_TEMP_MC` | `i32` — SoC die temperature, millidegrees C | |
+| `0x41` | `NODE_THROTTLE` | `u32` — firmware throttle bitmask | |
+| `0x42` | `NODE_SPOOL_FREE` | `u64` — bytes free on the capture spool | |
+| `0x43` | `NODE_LOAD_M` | `u32` — 1-minute load average × 1000 | |
+| `0x44`–`0x4F` | *reserved* | further node and host state | |
 
 A reader **must** reject a record missing any field marked required, and
 **must** silently skip unknown type codes.
@@ -237,6 +245,84 @@ paths return the same bits, and this is what makes every file written before
 csid 0.2.0 carry per-frame bandwidth with no re-capture. When neither is
 present, the field is genuinely absent and **must** be reported as such. Both
 reference readers implement this rule.
+
+### `MONO_US` (`0x12`) — the clock a time step cannot move
+
+`u64`, microseconds of `CLOCK_MONOTONIC` on the capturing host, from driver
+header offset 200.
+
+Every other clock in the record fails a different way. `FTM` wraps every
+13.42 s and is free-running per radio. `US` wraps every 71.6 min. `UNIX_TS_NS`
+is exactly the field an NTP step corrupts — and on a fleet with no RTC, nodes
+boot in the past and get stepped, mid-capture, with **no symptom in the file**.
+This is the only monotonic wall-time a record carries.
+
+Measured on a real capture: strictly monotonic over its non-zero samples,
+spanning 60.007 s against the host clock's 60.008 s — 3 ppm — with an implied
+uptime of 110.9 h at the first sample.
+
+#### Absent means "own transmission", not "unavailable"
+
+This is the rule to read before using the field. Across 2,433 records, as an
+exact biconditional with no exceptions:
+
+| source MAC | `MONO_US` present | records |
+|---|---|---:|
+| the capturing node's own injector | **no** | 1,743 |
+| three ambient transmitters | **yes** | 690 |
+
+A locally generated frame never traverses the receive path that stamps this
+clock. So an absent `MONO_US` is a **semantic marker**: this record is the
+node's own transmission, looped back. It is the only per-record marker for that
+fact the CSI stream carries — the time-transfer receiver counts the same thing
+separately, as `own_transmissions`.
+
+A consumer wanting only genuinely received frames therefore filters on
+`MONO_US` being present. **Do not read a missing value as zero, and do not read
+it as a broken clock.**
+
+Verified on one node and one capture. A future capture that breaks the
+biconditional is a finding, not noise.
+
+### `VENDOR_HDR` (`0x14`) — the header, kept
+
+The 272-byte driver header verbatim, at the offsets [Appendix A](#appendix-a-the-raw-driver-stream)
+gives. The **whole** header, not only the bytes no type code claims: a field
+promoted out of the blob later must keep the offset the appendix documents, and
+that only holds if the blob is the header rather than a subset of it.
+
+This exists because of what it would have saved. Per-frame bandwidth sat
+unread in `rate_n_flags` for the whole life of the archive and was recoverable
+only because that word happened to be stored already. The next field will not
+be so lucky. With the blob, a recovery costs a decoder; without it, a re-capture.
+
+Measured on a real capture: 203 of 272 header bytes are constant across
+records, which makes this the most compressible thing in the file while the CSI
+matrix barely compresses at all. That is what makes it affordable — see
+[Storage](#storage-the-file-is-compressed-the-format-is-not).
+
+Optional. A writer may omit it, and a reader must not assume it is present.
+
+### `NODE_*` (`0x40`–`0x43`) — the conditions, not the measurement
+
+A **sparse series**, never a per-record column. A writer emits these at an
+interval and attaches them to the next record, so most records carry none and a
+reader must not read absence as zero.
+
+They are in the file, rather than only in whatever metrics store the capturer
+runs, because of the format's own promise: a capture should be interpretable by
+someone who has only the file and this document, and that reader has no metrics
+store. Which conditions are named is not arbitrary — die temperature orders
+phase drift, a throttled SoC is a different instrument, a spool at its floor is
+how a long run loses its last hours, and load separates "the radio delivered
+nothing" from "the host could not keep up".
+
+**In a file, `csid` writes this series into the session block instead.** The
+container is derived from the raw stream at teardown, so a per-record sample
+attached during export would carry the teardown instant on every record — a
+fabricated timestamp on a real measurement. The type codes above are for the
+live datagram path, where a record is produced in the moment and the stamp is
+implicit.
 
 #### Deriving the tone grid
 
@@ -341,16 +427,23 @@ offset. The inter-chain conjugate product is concentrated (circular σ ≈ 2.2°
 around two discrete per-packet states ≈ 15° apart; aligning per record leaves
 ≈ 13° residual — enough for AoA and Doppler work.
 
-## The three clocks
+## The clocks
 
-Every record can carry three timestamps. They are not redundant; they answer
-different questions.
+Every record can carry four timestamps. They are not redundant; they answer
+different questions, and each fails in its own way.
 
 | Field | Source | Resolution | Wraps | Use for |
 |---|---|---|---|---|
 | `FTM` | radio baseband, 320 MHz | 3.125 ns | ≈ 13.42 s | **all timing analysis** |
 | `US` | firmware | 1 µs | ≈ 71.6 min | coarse cross-checks |
 | `UNIX_TS_NS` | host kernel at delivery | ns (µs-jittered) | — | **wallclock anchoring** |
+| `MONO_US` | host `CLOCK_MONOTONIC` | 1 µs | — | **surviving a clock step** |
+
+`MONO_US` (`0x12`) is the newest and the one to reach for when the host's
+wallclock cannot be trusted — a capturer with no RTC boots in the past and gets
+stepped, which moves `UNIX_TS_NS` under a running capture and leaves no trace.
+It is absent on a record the capturing node transmitted itself; see
+[its section above](#mono_us-0x12--the-clock-a-time-step-cannot-move).
 
 **The rule: analyse on `FTM`, anchor wallclock on `UNIX_TS_NS`.** `FTM` is
 stamped in the RF plane before any host software runs, so it is immune to
@@ -368,12 +461,43 @@ reference implementations provide an `FtmUnwrapper`.
 > precision, with no clock-distribution protocol. NTP on `UNIX_TS_NS` is enough
 > to bootstrap the pairing.
 
-### A caution on `SEQ`
+### Corrigendum: `SEQ` is a driver record counter (2026-08-24)
 
-`SEQ` is the low byte of the 802.11 sequence number. It is **not** a reliable
-completeness counter: it is 8 bits of a per-TID 12-bit field, observed over a
-subsampled frame population. Do not compute loss from it. True drop accounting
-requires a known injected cadence.
+The paragraph below stood until 2026-08-24 and was **wrong about what the field
+is**. It is preserved because a reader who acted on it deserves to see what
+changed, not a silently edited page.
+
+> `SEQ` is the low byte of the 802.11 sequence number. It is **not** a reliable
+> completeness counter: it is 8 bits of a per-TID 12-bit field, observed over a
+> subsampled frame population. Do not compute loss from it. True drop accounting
+> requires a known injected cadence.
+
+Measured over 2,433 records of a real capture carrying **four** distinct source
+MACs:
+
+| Observation | Result |
+|---|---|
+| Steps of exactly +1 | **2,432 of 2,432** |
+| Steps across a **transmitter change** | 663, **all +1** |
+| Header byte 77 | constant zero |
+
+An 802.11 sequence number belongs to the transmitter. It cannot advance by one
+across a change of transmitter, let alone across all 663 of them. `SEQ` is
+therefore the **driver's own count of CSI reports**, and byte 77 being constant
+confirms the counter is 8 bits wide rather than a truncation of something
+larger.
+
+**What this means for a reader.** A gap in `SEQ` is a *dropped report*, which is
+the completeness signal the old text said did not exist. Two limits are real:
+
+- it wraps every 256, so a gap is detectable modulo 256 and only for gaps
+  **smaller than 256**;
+- it counts what the driver delivered to userspace, so it cannot see a frame the
+  radio never reported on — that denominator is still `frames_seen`.
+
+IP-130 proposed a new `REC_COUNTER` type code for this. It was not allocated:
+the field already exists, and a second code for one fact is how two answers to
+one question begin. `0x13` stays reserved and unused.
 
 ## Live datagrams
 
@@ -390,6 +514,45 @@ session. `seq` increments per datagram; **gaps are meaningful** — they are
 sender-side drops from the bounded best-effort queue, and counting them is how a
 consumer knows it is falling behind. The payload is byte-identical to a file
 record's payload.
+
+## Storage: the file is compressed, the format is not
+
+A CSIQ container is written as **`capture.csiq.zst`** — a zstd frame around an
+ordinary, unchanged CSIQ byte stream. `version` is still `1`, the magic is still
+`CSIQ`, and a reader that decompresses first meets exactly the bytes this
+document describes.
+
+This is deliberate, and it is the reason the version did not move. Compressing
+the *record stream inside* the container would have changed framing, which the
+versioning policy below correctly calls a version bump — and would have made
+every existing reader fail on a purely additive change. Compressing the *file*
+changes nothing about the format at all.
+
+The extension is the single statement of which envelope a file uses, so a
+directory listing cannot lie about it. Both forms exist and both are valid:
+
+| Name | Written by |
+|---|---|
+| `capture.csiq` | any writer before the `VENDOR_HDR` era |
+| `capture.csiq.zst` | a writer that keeps the driver header |
+
+**Reader rule.** Decide by extension, and support both. A reader that meets a
+`.zst` and has no decoder should say so in those terms rather than reporting a
+corrupt container.
+
+Measured, on a real 2,433-record capture with `VENDOR_HDR` kept on every record:
+
+```
+capture.raw        1,703,100 B    the lossless driver stream
+capture.csiq.zst     796,578 B    46.8% of it, header blob included
+```
+
+The blob alone would have cost 661,776 B uncompressed. The whole compressed
+container is smaller than that, which is what makes lossless provenance
+affordable rather than a 44% tax.
+
+**`capture.raw` is not retired by any of this.** It stays the source of truth,
+which is what makes a re-derivation repeatable and a bad one cost compute only.
 
 ## Versioning policy
 
