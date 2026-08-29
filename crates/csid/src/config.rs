@@ -392,6 +392,11 @@ pub struct InjectConfig {
     #[serde(default = "default_inject_dst_mac")]
     pub dst_mac: String,
     /// Legacy OFDM bitrate in Mbps, requested via the radiotap RATE field.
+    ///
+    /// **Ignored when `monitor_tx_rate` is non-zero.** The radiotap RATE field
+    /// is legacy-only, so `build_frame` omits it entirely once the driver rate
+    /// is forced, rather than stating a second and possibly contradictory rate.
+    /// The forced word carries the rate index in that case.
     #[serde(default = "default_inject_bitrate")]
     pub bitrate_mbps: u32,
     /// Driver-forced `rate_n_flags` for injected monitor-mode frames, written to

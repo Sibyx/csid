@@ -412,6 +412,28 @@ mod tests {
         assert_eq!(s.tx_id, cfg.src_mac);
     }
 
+    /// The recogniser must survive the injector's OTHER radiotap shape.
+    ///
+    /// `build_frame` emits an 8-byte header with no fields when the driver rate
+    /// is forced, which is the shape every fleet arm produces. `recognise`
+    /// reads `it_len` rather than assuming 9, and this pins that.
+    #[test]
+    fn it_recognises_a_frame_built_with_an_empty_radiotap_header() {
+        let mut cfg = crate::config::InjectConfig::default();
+        cfg.monitor_tx_rate = 0x4100;
+        let built = crate::inject::build_frame(&cfg, 11, 1_786_000_000_000_000_002);
+        assert_eq!(
+            u16::from_le_bytes([built[2], built[3]]),
+            8,
+            "the fixture must exercise the empty-header path"
+        );
+        let s = recognise(&built).expect("an empty radiotap header is still radiotap");
+        assert_eq!(s.kind, TxKind::Csid);
+        assert_eq!(s.seq, 11);
+        assert_eq!(s.tx_stamp_ns, 1_786_000_000_000_000_002);
+        assert_eq!(s.tx_id, cfg.src_mac);
+    }
+
     #[test]
     fn the_app_datagram_is_recognised_on_the_monotonic_clock() {
         let session = [0xab; 16];

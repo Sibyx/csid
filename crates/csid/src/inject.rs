@@ -22,8 +22,17 @@
 //!   whole point of the injector is that frames do not arrive in bursts.
 //! - The legacy OFDM bitrate is requested via the radiotap RATE field, so
 //!   receivers see the 52-tone `legacy_ofdm` record class on both bands (the
-//!   band-contrast invariant). The driver-side `monitor_tx_rate` debugfs knob
-//!   is deliberately not driven here until its format is verified on hardware.
+//!   band-contrast invariant). Radiotap alone is not enough: on 2.4 GHz
+//!   mac80211 ignores that field for group-addressed injection and falls back
+//!   to 1 Mbps DSSS, which carries no OFDM preamble and yields no CSI at the
+//!   receiver (measured 2026-08-10: 45,005 frames sent, ~33 records logged).
+//!   So `InjectConfig::monitor_tx_rate` IS driven — written to the iax
+//!   `monitor_tx_rate` debugfs knob at spawn and cleared on teardown. Its
+//!   format was verified on hardware and the fleet pins `0x4100` (antenna A,
+//!   legacy OFDM, 20 MHz, rate index 0). The knob takes any `u32` unchecked,
+//!   so a word this crate cannot decode reaches the firmware unchallenged.
+//!   When the knob is set, `build_frame` emits radiotap with **no fields**, so
+//!   the forced word is the only statement of the rate anywhere in the frame.
 //!
 //! Injection and capture are not exclusive: the radio is in monitor mode
 //! either way, and the driver does not report CSI for locally transmitted
@@ -72,28 +81,49 @@ pub fn parse_mac(s: &str) -> [u8; 6] {
 
 /// Build one injectable frame: radiotap header + 802.11 data header + payload.
 ///
-/// Radiotap carries exactly one field, RATE (bit 2), in 500 kbps units —
-/// mac80211 honours it for legacy-rate injection. Everything else is left to
-/// the driver. The 802.11 header is a plain data frame (ToDS=FromDS=0) with
+/// **Exactly one authority sets the rate.** Which one depends on
+/// `monitor_tx_rate`:
+///
+/// - Knob off (`0`) — radiotap carries the RATE field (bit 2) in 500 kbps
+///   units, and mac80211 honours it for legacy-rate injection. It is the only
+///   rate control available, so the header is 9 bytes.
+/// - Knob on — the header carries **no fields at all** (`it_present = 0`,
+///   `it_len = 8`), and the driver decides everything. The radiotap RATE field
+///   cannot express an HT/VHT/HE rate, so a legacy value sitting beside a
+///   forced HE word would state two different rates and leave the firmware to
+///   resolve the contradiction silently. An empty radiotap header is valid and
+///   is the honest way to say "the driver owns this".
+///
+/// A consequence worth knowing: with the knob set, `bitrate_mbps` reaches the
+/// air through nothing. The forced word carries the rate index instead.
+///
+/// The 802.11 header is a plain data frame (ToDS=FromDS=0) with
 /// `addr3 = addr2` (the sentinel doubles as the BSSID — there is no BSS).
 ///
 /// Payload layout after the 24-byte header:
 /// `b"CSID" | u64 LE seq | u64 LE tx unix ns | zero padding`.
 pub fn build_frame(cfg: &InjectConfig, seq: u64, tx_unix_ns: u64) -> Vec<u8> {
-    const RADIOTAP_LEN: usize = 9; // 8 fixed + 1 rate byte
     const HDR80211_LEN: usize = 24;
+
+    // 8 fixed bytes, plus a rate byte only when radiotap owns the rate.
+    let driver_owns_rate = cfg.monitor_tx_rate != 0;
+    let radiotap_len: usize = if driver_owns_rate { 8 } else { 9 };
 
     let src = parse_mac(&cfg.src_mac);
     let dst = parse_mac(&cfg.dst_mac);
     let mpdu_len = cfg.frame_bytes.max(HDR80211_LEN + 20);
-    let mut f = Vec::with_capacity(RADIOTAP_LEN + mpdu_len);
+    let mut f = Vec::with_capacity(radiotap_len + mpdu_len);
 
     // -- radiotap ---------------------------------------------------------
     f.push(0); // it_version
     f.push(0); // it_pad
-    f.extend_from_slice(&(RADIOTAP_LEN as u16).to_le_bytes()); // it_len
-    f.extend_from_slice(&(1u32 << 2).to_le_bytes()); // it_present: RATE
-    f.push((cfg.bitrate_mbps * 2) as u8); // rate, 500 kbps units
+    f.extend_from_slice(&(radiotap_len as u16).to_le_bytes()); // it_len
+    if driver_owns_rate {
+        f.extend_from_slice(&0u32.to_le_bytes()); // it_present: no fields
+    } else {
+        f.extend_from_slice(&(1u32 << 2).to_le_bytes()); // it_present: RATE
+        f.push((cfg.bitrate_mbps * 2) as u8); // rate, 500 kbps units
+    }
 
     // -- 802.11 data header ----------------------------------------------
     f.extend_from_slice(&[0x08, 0x00]); // FC: type data, subtype data
@@ -107,7 +137,7 @@ pub fn build_frame(cfg: &InjectConfig, seq: u64, tx_unix_ns: u64) -> Vec<u8> {
     f.extend_from_slice(b"CSID");
     f.extend_from_slice(&seq.to_le_bytes());
     f.extend_from_slice(&tx_unix_ns.to_le_bytes());
-    f.resize(RADIOTAP_LEN + mpdu_len, 0);
+    f.resize(radiotap_len + mpdu_len, 0);
     f
 }
 
@@ -399,5 +429,46 @@ mod tests {
         c.frame_bytes = 10; // below the 24 B header — must be clamped, not panic
         let f = build_frame(&c, 0, 0);
         assert!(f.len() >= 9 + 44);
+    }
+
+    /// With the driver rate forced, radiotap must state NOTHING about the rate.
+    ///
+    /// The radiotap RATE field is legacy-only, so leaving a 6 Mbps value beside
+    /// a forced HE word states two different rates in one frame and lets the
+    /// firmware choose without saying so. An empty header (`it_present = 0`,
+    /// `it_len = 8`) is valid radiotap and means "the driver owns this".
+    #[test]
+    fn a_forced_driver_rate_leaves_the_radiotap_header_empty() {
+        let mut c = cfg();
+        c.monitor_tx_rate = 0x5400; // HE80 MCS0, one stream, antenna A
+        let f = build_frame(&c, 7, 123_456_789);
+
+        assert_eq!(f[0], 0, "it_version");
+        assert_eq!(u16::from_le_bytes([f[2], f[3]]), 8, "it_len: no fields");
+        assert_eq!(
+            u32::from_le_bytes([f[4], f[5], f[6], f[7]]),
+            0,
+            "it_present must claim no field, RATE included"
+        );
+        // The MPDU starts one byte earlier than in the radiotap-rate case.
+        assert_eq!(&f[8..10], &[0x08, 0x00], "802.11 data frame at offset 8");
+        assert_eq!(&f[12..18], &[0xff; 6], "addr1 broadcast");
+        assert_eq!(&f[18..24], &parse_mac("ef:be:ad:de:ad:de"), "addr2 sentinel");
+        assert_eq!(&f[32..36], b"CSID", "payload magic");
+        assert_eq!(f.len(), 8 + cfg().frame_bytes);
+    }
+
+    /// `bitrate_mbps` must not leak onto the air once the knob owns the rate.
+    #[test]
+    fn the_configured_bitrate_is_absent_when_the_driver_rate_is_forced() {
+        let mut c = cfg();
+        c.bitrate_mbps = 54; // 108 in 500 kbps units — must appear nowhere
+        c.monitor_tx_rate = 0x4100;
+        let f = build_frame(&c, 0, 0);
+        assert_eq!(u16::from_le_bytes([f[2], f[3]]), 8);
+        assert!(
+            !f[..8].contains(&108u8),
+            "no radiotap byte may carry the configured legacy rate"
+        );
     }
 }
