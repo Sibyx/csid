@@ -127,7 +127,7 @@ pub fn run_session(
 
     // -- radio setup -------------------------------------------------------
     radio::ensure_monitor(&cfg.radio.interface, &cfg.radio.monitor)?;
-    radio::tune(&cfg.radio.monitor, &tuning)?;
+    let achieved = radio::tune(&cfg.radio.monitor, &tuning)?;
 
     let knobs = Knobs::for_interface(&cfg.radio.interface)?;
     knobs.set_interval(cfg.radio.interval_us)?;
@@ -136,7 +136,14 @@ pub fn run_session(
 
     // Sidecar is written *before* capture so a crashed session still has
     // complete provenance on disk.
-    let mut sidecar = Sidecar::open(&dir, session_id.clone(), cfg, global, &tuning)?;
+    let mut sidecar = Sidecar::open(
+        &dir,
+        session_id.clone(),
+        cfg,
+        global,
+        &tuning,
+        Some(&achieved),
+    )?;
 
     // The volatile counterpart of the sidecar (IP-132): what the capture is
     // doing right now, readable while it runs. Built here so it inherits the

@@ -455,6 +455,117 @@ impl Default for InjectConfig {
 /// purpose: they carry no OFDM preamble, so the receiver would get no CSI.
 pub const OFDM_BITRATES_MBPS: [u32; 8] = [6, 9, 12, 18, 24, 36, 48, 54];
 
+/// Reject the `inject.monitor_tx_rate` words this firmware will not transmit.
+///
+/// **Nothing between csid and the antenna checks this word.** In the iax
+/// backport `iwl_dbgfs_monitor_tx_rate_write` is a `kstrtou32` and an
+/// assignment, and `flq_iwl_mvm_set_monitor_tx_rate` copies the value straight
+/// into `tx_cmd->rate_n_flags`. Neither tests modulation, width, MCS or
+/// antenna. The refusal happens in firmware, which reports nothing back. This
+/// function is therefore the only gate that exists anywhere on the path.
+///
+/// # What a refused word looks like
+///
+/// Benched 2026-08-29, monad01 -> monad02, five cells of 40 s. The knob
+/// accepted every HE word, csid sent ~4,004 frames per cell with `errors = 0`,
+/// and `tcpdump -e` on the neighbour printed **zero** frames. An HE arm reports
+/// success, passes verify, runs green and illuminates nothing.
+///
+/// At 80 and 160 MHz it is worse than a dead injector. Holding the width fixed
+/// and changing only the word, `frames_seen` fell from 10,890 to 155 and
+/// timesync reported `rx_stamp_source: none`. The forced word disturbs the
+/// **receive** path as well, and a deaf observer looks exactly like a quiet
+/// channel.
+///
+/// `own_transmissions` read ~4,002 in every cell, including the silent ones, so
+/// it cannot stand in for this check.
+///
+/// # Why HE and EHT are refused, and HT and VHT only warned
+///
+/// Two parties measured HE independently. This project refused `0x4400`,
+/// `0x5400` and `0x5C00`. The backport author's own notes in `mvm/tx.c` mark
+/// `0xc400`, `0xd400` and `0xdc00` — the same three PHYs, both antennas — with
+/// `err`, and leave every HT and VHT word unmarked.
+///
+/// Nobody has shown HT or VHT to fail, so they warn rather than bail. `0xd300`
+/// (VHT80) is the word worth benching: 75.6 MHz of occupied span against HE80's
+/// 77.8 MHz, which is the delay resolution HE80 was wanted for.
+pub fn validate_monitor_tx_rate(word: u32) -> Result<()> {
+    // 0 leaves the knob untouched, and the radiotap RATE field carries the rate.
+    if word == 0 {
+        return Ok(());
+    }
+
+    // `decode_rnf` returns None only for 0, which is handled above.
+    let Some(phy) = csiq::raw::decode_rnf(word) else {
+        return Ok(());
+    };
+
+    match phy.modulation {
+        csiq::Modulation::He | csiq::Modulation::Eht => {
+            anyhow::bail!(
+                "inject.monitor_tx_rate = 0x{:x} selects {:?}, which this firmware accepts and \
+                 does not transmit. Measured 2026-08-29: errors = 0, zero frames on air at the \
+                 neighbour, and at >= 80 MHz the node went deaf as well (frames_seen 10,890 -> \
+                 155, timesync rx_stamp_source: none). The backport author marked the same three \
+                 PHYs `err` in mvm/tx.c. Use 0x4100 (legacy OFDM, 20 MHz, antenna A), or bench \
+                 0xd300 (VHT80) first — it carries the same occupied span.",
+                word,
+                phy.modulation
+            );
+        }
+        csiq::Modulation::Cck => {
+            anyhow::bail!(
+                "inject.monitor_tx_rate = 0x{:x} selects CCK, which carries no OFDM preamble and \
+                 so produces no CSI at the receiver. This is the same reason inject.bitrate_mbps \
+                 is restricted to {:?}.",
+                word,
+                OFDM_BITRATES_MBPS
+            );
+        }
+        csiq::Modulation::Unknown(t) => {
+            anyhow::bail!(
+                "inject.monitor_tx_rate = 0x{:x} carries modulation type {}, which this build \
+                 cannot name. Refusing rather than forcing a word nothing here can reason about.",
+                word,
+                t
+            );
+        }
+        csiq::Modulation::Ht | csiq::Modulation::Vht => {
+            tracing::warn!(
+                monitor_tx_rate = format!("0x{word:x}"),
+                modulation = ?phy.modulation,
+                "inject.monitor_tx_rate selects a PHY no bench has confirmed this firmware will \
+                 transmit. Confirm with tcpdump on a neighbour before trusting the session — \
+                 errors = 0 is not evidence a frame left the antenna."
+            );
+        }
+        csiq::Modulation::LegacyOfdm => {}
+    }
+
+    if let Some(bw) = csiq::raw::decode_bw_antsel(word) {
+        if bw.bandwidth != csiq::record::Bandwidth::W20 {
+            tracing::warn!(
+                monitor_tx_rate = format!("0x{word:x}"),
+                bandwidth = ?bw.bandwidth,
+                "inject.monitor_tx_rate names a width above 20 MHz. No injected frame wider than \
+                 20 MHz has ever been confirmed on air from this fleet, and the 80/160 MHz cells \
+                 of the 2026-08-29 bench were the ones that also broke the receive path."
+            );
+        }
+        if bw.antenna_sel == 0 {
+            tracing::warn!(
+                monitor_tx_rate = format!("0x{word:x}"),
+                "inject.monitor_tx_rate names no antenna (bits 15-14 are zero). Every word this \
+                 fleet has transmitted, and every word the backport author recorded as working, \
+                 names at least one."
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Fleet-side BLE co-capture, run on the same node as the CSI capture so both
 /// streams carry one clock (IP-106 R5 — the BLE-anchored recalibration arm).
 ///
@@ -975,6 +1086,7 @@ impl ExperimentConfig {
                         inj.bitrate_mbps
                     );
                 }
+                validate_monitor_tx_rate(inj.monitor_tx_rate)?;
             }
             other => {
                 anyhow::bail!("capture.mode must be \"passive\" or \"inject\" (got {other:?})")
@@ -1398,5 +1510,98 @@ monad04 = "monad.local"
             back.capture.segment_duration,
             Some(Duration::from_secs(1800))
         );
+    }
+
+    // ── inject.monitor_tx_rate ────────────────────────────────────────────
+    //
+    // The words below are the ones actually written to hardware. `0x4100` is
+    // what all 47 fleet arms carry; the HE trio is what the 2026-08-29 bench
+    // refused; `0xd300` is the VHT80 candidate the backport author left
+    // unmarked. Naming real words keeps the test honest about what it pins.
+
+    /// The word the whole fleet runs on must keep validating, or every arm
+    /// stops at config load.
+    #[test]
+    fn the_fleet_word_is_accepted() {
+        validate_monitor_tx_rate(0x4100).unwrap();
+    }
+
+    /// 0 is "knob off", not a rate. It must not be decoded as CCK (type 0).
+    #[test]
+    fn zero_means_the_knob_is_off_and_is_not_read_as_cck() {
+        validate_monitor_tx_rate(0).unwrap();
+    }
+
+    /// All three words the bench sent with `errors = 0` and nothing on air.
+    #[test]
+    fn every_benched_he_word_is_refused() {
+        for word in [0x4400_u32, 0x5400, 0x5C00] {
+            let err = validate_monitor_tx_rate(word).unwrap_err().to_string();
+            assert!(err.contains("does not transmit"), "0x{word:x}: {err}");
+            assert!(err.contains("He"), "0x{word:x}: {err}");
+        }
+    }
+
+    /// The backport author's own `err`-marked words carry both antennas, so
+    /// the refusal must key on the modulation type and not on the antenna bits.
+    #[test]
+    fn the_backport_authors_err_words_are_refused_too() {
+        for word in [0xc400_u32, 0xd400, 0xdc00] {
+            validate_monitor_tx_rate(word).unwrap_err();
+        }
+    }
+
+    /// EHT is refused on the same grounds, ahead of hardware that could send it.
+    #[test]
+    fn eht_is_refused() {
+        // modulation type 5, 20 MHz, antenna A.
+        validate_monitor_tx_rate(0x4500).unwrap_err();
+    }
+
+    /// CCK carries no OFDM preamble, so it yields no CSI — the same rule
+    /// `inject.bitrate_mbps` already enforces.
+    #[test]
+    fn cck_is_refused_for_the_same_reason_as_a_cck_bitrate() {
+        let err = validate_monitor_tx_rate(0x4000).unwrap_err().to_string();
+        assert!(err.contains("no OFDM preamble"), "{err}");
+    }
+
+    /// A modulation type this build cannot name is refused rather than sent.
+    #[test]
+    fn an_unnameable_modulation_type_is_refused() {
+        // type 6 — reserved, decoded as Unknown(6).
+        let err = validate_monitor_tx_rate(0x4600).unwrap_err().to_string();
+        assert!(err.contains("cannot name"), "{err}");
+    }
+
+    /// HT and VHT warn and pass. Nobody has measured them failing, and VHT80
+    /// is the word worth benching — refusing it would need a deploy to undo.
+    #[test]
+    fn ht_and_vht_words_are_allowed() {
+        for word in [0xc200_u32, 0xca00, 0xc300, 0xcb00, 0xd300, 0xdb00] {
+            validate_monitor_tx_rate(word)
+                .unwrap_or_else(|e| panic!("0x{word:x} should warn, not bail: {e}"));
+        }
+    }
+
+    /// The whole point is that the check runs at config load, before the radio
+    /// is touched — not somewhere the operator has to remember to look.
+    #[test]
+    fn an_he_word_fails_the_experiment_config_validation() {
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.mode = "inject".to_string();
+        cfg.inject.monitor_tx_rate = 0x5400;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("monitor_tx_rate"), "{err}");
+    }
+
+    /// A passive session never injects, so its knob is never written and must
+    /// not be able to block a capture.
+    #[test]
+    fn a_passive_session_ignores_the_inject_knob() {
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.mode = "passive".to_string();
+        cfg.inject.monitor_tx_rate = 0x5400;
+        cfg.validate().unwrap();
     }
 }

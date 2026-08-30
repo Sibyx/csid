@@ -45,6 +45,25 @@ pub struct RadioMeta {
     pub width: String,
     pub interval_us: u32,
     pub mac_filter: Vec<String>,
+    /// What the radio answered when asked, after the tune (`iw dev … info`).
+    ///
+    /// The three fields above them are the **request** — `channel`,
+    /// `control_freq_mhz` and `center_freq_mhz` are computed by
+    /// `caps::center_freq` from the profile, and they say what csid asked for.
+    /// These say what it got. They differ when a tune is accepted by `iw` and
+    /// not honoured by the radio, which leaves a session recording at the
+    /// previous width while closing clean.
+    ///
+    /// `None` means the radio did not say — a monitor interface that is down
+    /// prints no channel line. It is not a mismatch, and it is not a zero.
+    ///
+    /// Absent on every sidecar written before csid 0.2.0.
+    #[serde(default)]
+    pub achieved_control_freq_mhz: Option<u32>,
+    #[serde(default)]
+    pub achieved_width_mhz: Option<u32>,
+    #[serde(default)]
+    pub achieved_center_freq_mhz: Option<u32>,
 }
 
 /// What the radio was allowed to report (IP-139 Phase 3, C3).
@@ -394,6 +413,19 @@ pub struct TimesyncSummary {
     pub frames_seen: u64,
     /// Locally transmitted frames looped back by `AF_PACKET` and skipped. A
     /// node must never "receive" its own injector.
+    ///
+    /// # This is not evidence that a frame reached the air
+    ///
+    /// It counts what the local TX-status path reported, which is upstream of
+    /// the antenna. Measured 2026-08-29 across a five-cell injection ladder:
+    /// this counter read ~4,002 in **every** cell, including the three whose
+    /// `rate_n_flags` word the firmware silently declined to transmit and for
+    /// which `tcpdump -e` on the neighbour printed zero frames.
+    ///
+    /// Only a second node discriminates — the neighbour's `tcpdump`, or its
+    /// `rows_csid`. Treat a healthy number here as "csid tried", never as
+    /// "the room was illuminated". The guard against sending an untransmittable
+    /// word lives in `config::validate_monitor_tx_rate`, not in this field.
     pub own_transmissions: u64,
     /// Encrypted data frames. Large with zero `rows_app` means the experiment
     /// SSID is not open, and the phone's stamps are unreadable from the air.
@@ -460,7 +492,6 @@ pub struct Sidecar {
     path: PathBuf,
 }
 
-
 /// Environment variable carrying the fleet run identifier.
 pub const RUN_ID_ENV: &str = "CSID_RUN_ID";
 
@@ -485,6 +516,7 @@ impl Sidecar {
         cfg: &ExperimentConfig,
         global: &GlobalConfig,
         tuning: &Tuning,
+        achieved: Option<&crate::radio::Achieved>,
     ) -> Result<Self> {
         let (run_id, run_id_generated) = resolve_run_id(&session_id);
 
@@ -498,6 +530,9 @@ impl Sidecar {
             width: cfg.radio.width.iw_token().to_string(),
             interval_us: cfg.radio.interval_us,
             mac_filter: cfg.radio.mac_filter.clone(),
+            achieved_control_freq_mhz: achieved.and_then(|a| a.control_freq_mhz),
+            achieved_width_mhz: achieved.and_then(|a| a.width_mhz),
+            achieved_center_freq_mhz: achieved.and_then(|a| a.center_freq_mhz),
         };
 
         let inject = (cfg.capture.mode == "inject").then(|| InjectMeta {
