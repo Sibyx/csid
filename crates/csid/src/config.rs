@@ -420,6 +420,26 @@ pub struct InjectConfig {
     /// config.
     #[serde(default)]
     pub monitor_tx_rate: u32,
+    /// Permit a `monitor_tx_rate` that [`validate_monitor_tx_rate`] refuses.
+    ///
+    /// **This exists so the refusal itself can be measured, and for nothing
+    /// else.** The guard stops an arm from running green while illuminating
+    /// nothing; it must not stop a bench from testing whether the refusal is
+    /// real, which is how a wrong belief becomes permanent.
+    ///
+    /// The reason it is needed: `zhang2025_72c4` (IEEE Sensors Journal) reports
+    /// injecting every CSI type including HE 160 MHz on this NIC, using this
+    /// driver — `github.com/fflq/iax`, which is the tree we build. Our 2026-08-29
+    /// bench found all three HE words refused on 5 GHz. One difference is known:
+    /// that paper disables the LAR flags to unlock 5 GHz AP mode and we do not.
+    /// Another is untested: their monitor-mode work is on channel 4, i.e.
+    /// 2.4 GHz, and we have never attempted an HE word below 5 GHz.
+    ///
+    /// Any profile setting this MUST be named `explore-*`, because a session is
+    /// named after its profile and a deliberate probe of a known-refused
+    /// configuration is not measurement data.
+    #[serde(default)]
+    pub allow_untransmittable_rate: bool,
 }
 
 fn default_inject_rate() -> u32 {
@@ -447,6 +467,7 @@ impl Default for InjectConfig {
             dst_mac: default_inject_dst_mac(),
             bitrate_mbps: default_inject_bitrate(),
             monitor_tx_rate: 0,
+            allow_untransmittable_rate: false,
         }
     }
 }
@@ -1086,7 +1107,19 @@ impl ExperimentConfig {
                         inj.bitrate_mbps
                     );
                 }
-                validate_monitor_tx_rate(inj.monitor_tx_rate)?;
+                match validate_monitor_tx_rate(inj.monitor_tx_rate) {
+                    Ok(()) => {}
+                    Err(e) if inj.allow_untransmittable_rate => {
+                        tracing::warn!(
+                            refusal = %e,
+                            "inject.allow_untransmittable_rate is set — proceeding with a rate \
+                             word this build believes the firmware will not transmit. Verify on \
+                             air at a NEIGHBOUR (tcpdump, or its rows_csid); errors = 0 and \
+                             own_transmissions are not evidence."
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             other => {
                 anyhow::bail!("capture.mode must be \"passive\" or \"inject\" (got {other:?})")
@@ -1593,6 +1626,28 @@ monad04 = "monad.local"
         cfg.inject.monitor_tx_rate = 0x5400;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("monitor_tx_rate"), "{err}");
+    }
+
+    /// The escape hatch must let a deliberate bench through — otherwise the
+    /// guard freezes a belief instead of protecting a measurement.
+    #[test]
+    fn an_explicit_opt_in_lets_a_refused_word_through() {
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.mode = "inject".to_string();
+        cfg.inject.monitor_tx_rate = 0xc400; // HE20, both antennas
+        cfg.inject.allow_untransmittable_rate = true;
+        cfg.validate().unwrap();
+    }
+
+    /// Without the opt-in the same word is still refused. The hatch must be
+    /// opt-in, never a default, or the guard is decorative.
+    #[test]
+    fn the_opt_in_defaults_off() {
+        assert!(!InjectConfig::default().allow_untransmittable_rate);
+        let mut cfg: ExperimentConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.capture.mode = "inject".to_string();
+        cfg.inject.monitor_tx_rate = 0xc400;
+        cfg.validate().unwrap_err();
     }
 
     /// A passive session never injects, so its knob is never written and must
