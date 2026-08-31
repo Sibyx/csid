@@ -162,6 +162,15 @@ fn parse_throttle(raw: &str) -> Option<Throttle> {
     u32::from_str_radix(t, 16).ok().map(|raw| Throttle { raw })
 }
 
+/// How often the sampler asks the Wi-Fi NIC for its own temperature.
+///
+/// An order of magnitude slower than the SoC cadence, on purpose. The SoC read
+/// is two bytes off sysfs; this one is a firmware round trip that takes
+/// `mvm->mutex` and waits for a DTS notification, so it is the one reading in
+/// this daemon that can cost a whole second. The card's thermal mass makes that
+/// affordable: it does not move meaningfully inside five seconds.
+pub const NIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// What a node's thermals did over the span of a measurement.
 #[derive(Debug, Clone, Default)]
 pub struct ThermalTrace {
@@ -169,6 +178,16 @@ pub struct ThermalTrace {
     pub min_c: f32,
     pub mean_c: f32,
     pub max_c: f32,
+    /// Wi-Fi NIC die temperature samples, whole degrees Celsius.
+    ///
+    /// Counted separately from `samples` because the two are read at different
+    /// cadences and either can be absent on its own: a host with a thermal zone
+    /// and no CSI driver measures one, and an idle radio with the firmware down
+    /// measures the other.
+    pub nic_samples: usize,
+    pub nic_min_c: i32,
+    pub nic_mean_c: f32,
+    pub nic_max_c: i32,
     /// Throttle word at the start, before the workload.
     pub throttle_before: Option<Throttle>,
     /// Throttle word at the end.
@@ -184,6 +203,11 @@ impl ThermalTrace {
         self.samples > 0
     }
 
+    /// Whether the radio answered with its own temperature at all.
+    pub fn nic_is_measured(&self) -> bool {
+        self.nic_samples > 0
+    }
+
     /// Degrees of margin between the hottest sample and the soft limit.
     /// Negative means the firmware was taking the clock away.
     pub fn headroom_c(&self) -> f32 {
@@ -191,6 +215,12 @@ impl ThermalTrace {
     }
 
     /// The verdict a stress run exists to produce.
+    ///
+    /// Deliberately SoC-only. The NIC temperature is reported and never judged,
+    /// because this project has not measured the AX210's own throttle threshold
+    /// — the Pi 5's 80 °C soft limit is a documented firmware behaviour, and
+    /// there is no equivalent number for the card. A verdict built on a guessed
+    /// limit would fail runs for a reason nobody could check.
     pub fn verdict(&self) -> Verdict {
         if !self.is_measured() {
             return Verdict::Unmeasured;
@@ -249,6 +279,7 @@ impl Verdict {
 pub struct Sampler {
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<f32>>>,
+    nic_samples: Arc<Mutex<Vec<i32>>>,
     degraded: Arc<AtomicBool>,
     before: Option<Throttle>,
     handle: Option<thread::JoinHandle<()>>,
@@ -259,16 +290,22 @@ impl Sampler {
     pub fn start(interval: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(Vec::new()));
+        let nic_samples = Arc::new(Mutex::new(Vec::new()));
         let degraded = Arc::new(AtomicBool::new(false));
         let before = read_throttle();
 
         let handle = {
             let stop = stop.clone();
             let samples = samples.clone();
+            let nic_samples = nic_samples.clone();
             let degraded = degraded.clone();
             thread::Builder::new()
                 .name("csid-thermal".into())
                 .spawn(move || {
+                    // The NIC read runs on its own clock, not every Nth tick, so
+                    // its cadence does not silently change when the caller
+                    // passes a different `interval`.
+                    let mut next_nic_at = std::time::Instant::now();
                     while !stop.load(Ordering::Relaxed) {
                         if let Some(c) = read_temp_c() {
                             if let Ok(mut s) = samples.lock() {
@@ -280,6 +317,15 @@ impl Sampler {
                                 degraded.store(true, Ordering::Relaxed);
                             }
                         }
+                        let now = std::time::Instant::now();
+                        if now >= next_nic_at {
+                            next_nic_at = now + NIC_SAMPLE_INTERVAL;
+                            if let Some(c) = crate::debugfs::read_nic_temp_c() {
+                                if let Ok(mut s) = nic_samples.lock() {
+                                    s.push(c);
+                                }
+                            }
+                        }
                         thread::sleep(interval);
                     }
                 })
@@ -289,6 +335,7 @@ impl Sampler {
         Sampler {
             stop,
             samples,
+            nic_samples,
             degraded,
             before,
             handle,
@@ -306,6 +353,11 @@ impl Sampler {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|p| p.into_inner().clone());
+        let nic = self
+            .nic_samples
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|p| p.into_inner().clone());
 
         let mut trace = ThermalTrace {
             samples: samples.len(),
@@ -318,6 +370,12 @@ impl Sampler {
             trace.min_c = samples.iter().copied().fold(f32::INFINITY, f32::min);
             trace.max_c = samples.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             trace.mean_c = samples.iter().sum::<f32>() / samples.len() as f32;
+        }
+        if !nic.is_empty() {
+            trace.nic_samples = nic.len();
+            trace.nic_min_c = nic.iter().copied().min().unwrap_or_default();
+            trace.nic_max_c = nic.iter().copied().max().unwrap_or_default();
+            trace.nic_mean_c = nic.iter().sum::<i32>() as f32 / nic.len() as f32;
         }
         trace
     }
@@ -379,6 +437,7 @@ mod tests {
             throttle_before: Some(Throttle { raw: 0 }),
             throttle_after: Some(Throttle { raw: after }),
             degraded_during: degraded,
+            ..Default::default()
         }
     }
 

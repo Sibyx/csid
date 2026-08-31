@@ -460,6 +460,10 @@ pub fn thermal_cmd(prometheus: bool, write: Option<PathBuf>) -> Result<()> {
     let throttle = thermal::read_throttle();
 
     if !prometheus && write.is_none() {
+        // Human output only. The NIC temperature is deliberately NOT in the
+        // .prom text: `monad_nic_temp_celsius` already ships it from
+        // `roles/observability_node`, and two publishers for one series is how
+        // a dashboard ends up with a value nobody owns.
         match temp {
             Some(c) => println!(
                 "temperature: {c:.1} °C ({:+.1} °C to the {:.0} °C soft limit)",
@@ -471,6 +475,13 @@ pub fn thermal_cmd(prometheus: bool, write: Option<PathBuf>) -> Result<()> {
         match throttle {
             Some(t) => println!("throttle:    0x{:x} ({})", t.raw, t.describe()),
             None => println!("throttle:    unavailable"),
+        }
+        // A NIC read needs the firmware running, so "unavailable" is the normal
+        // answer on an idle node. Saying which of the two it is stops an
+        // operator reading absence as a dead sensor.
+        match crate::debugfs::read_nic_temp_c() {
+            Some(c) => println!("nic:         {c} °C (radio die, driver DTS)"),
+            None => println!("nic:         unavailable (firmware not running, or not root)"),
         }
         return Ok(());
     }
@@ -609,8 +620,16 @@ pub fn bench(
     println!();
 
     println!(
-        "{:<8} {:<8} {:>10} {:>12} {:>10} {:>8} {:>8} {:>10}  tones",
-        "channel", "width", "records", "rate (Hz)", "bytes", "peak °C", "rise °C", "verdict"
+        "{:<8} {:<8} {:>10} {:>12} {:>10} {:>8} {:>8} {:>8} {:>10}  tones",
+        "channel",
+        "width",
+        "records",
+        "rate (Hz)",
+        "bytes",
+        "peak °C",
+        "rise °C",
+        "nic °C",
+        "verdict"
     );
 
     let mut worst = Verdict::Pass;
@@ -646,8 +665,16 @@ pub fn bench(
                 } else {
                     ("-".into(), "-".into())
                 };
+                // The radio's own peak, which the SoC column does not imply: the
+                // active cooler sits on the SoC and the card sits under the HAT.
+                // A dash means the firmware never answered, not 0 °C.
+                let nic_peak = if trace.nic_is_measured() {
+                    format!("{}", trace.nic_max_c)
+                } else {
+                    "-".into()
+                };
                 println!(
-                    "{:<8} {:<8} {:>10} {:>12.1} {:>10} {:>8} {:>8} {:>10} {:?}",
+                    "{:<8} {:<8} {:>10} {:>12.1} {:>10} {:>8} {:>8} {:>8} {:>10} {:?}",
                     ch,
                     cfg.radio.width.iw_token(),
                     o.summary.records,
@@ -655,6 +682,7 @@ pub fn bench(
                     o.summary.capture_bytes,
                     peak,
                     rise,
+                    nic_peak,
                     verdict.label(),
                     o.summary.tone_counts
                 );

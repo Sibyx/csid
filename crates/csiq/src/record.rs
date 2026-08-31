@@ -253,6 +253,17 @@ pub struct NodeState {
     pub spool_free_bytes: Option<u64>,
     /// 1-minute load average times 1000.
     pub load_m: Option<u32>,
+    /// Wi-Fi NIC die temperature, whole degrees Celsius.
+    ///
+    /// Degrees, not millidegrees like `temp_mc`, because the source is whole
+    /// degrees: the driver's `nic_temp` prints the firmware's DTS reading as an
+    /// integer. Scaling it up would fabricate three digits the instrument does
+    /// not have.
+    ///
+    /// This is the RADIO's temperature, and `temp_mc` is the SoC's. They are
+    /// not interchangeable — an enclosure can hold the SoC cool while the card
+    /// under it runs hot, and only one of the two generates the CSI.
+    pub nic_temp_c: Option<i32>,
 }
 
 impl NodeState {
@@ -262,6 +273,7 @@ impl NodeState {
             && self.throttle_flags.is_none()
             && self.spool_free_bytes.is_none()
             && self.load_m.is_none()
+            && self.nic_temp_c.is_none()
     }
 }
 

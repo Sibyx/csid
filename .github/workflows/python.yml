@@ -1,0 +1,156 @@
+name: python
+
+# The `csiq` reader and its optional PyO3 accelerator.
+#
+# Two things this workflow exists to prevent:
+#
+#  1. **A backend divergence reaching a release.** The spec's rule is that two
+#     implementations disagreeing means two bugs; the accelerator makes a third.
+#     `test_backend_parity.py` is therefore run on a matrix WITH the wheel
+#     installed, not just on the pure package.
+#  2. **A publish nobody asked for.** Publishing runs only on a tag, only from a
+#     trusted environment, and never on a push to a branch.
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["py-v*"]
+    paths:
+      - "python/**"
+      - "crates/csiq/**"
+      - "crates/csiq-py/**"
+      - ".github/workflows/python.yml"
+  pull_request:
+    paths:
+      - "python/**"
+      - "crates/csiq/**"
+      - "crates/csiq-py/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The pure path is the one that must always work. It runs first, on every
+  # supported interpreter, with no Rust anywhere near it.
+  pure:
+    name: pure reader (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install (parser plus the optional extras it is tested against)
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[numpy,zstd]' pytest
+      - name: Test
+        working-directory: python
+        run: python -m pytest tests/ -q
+      - name: The pure path must be the default when nothing is compiled
+        working-directory: python
+        run: python -c "import csiq; assert csiq.backend() == 'python', csiq.backend()"
+
+  # Parity is the reason a third implementation is tolerable, so it is a gate.
+  parity:
+    name: backend parity (${{ matrix.os }})
+    needs: pure
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install both backends
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip maturin pytest
+          python -m pip install -e 'python[numpy,zstd]'
+          maturin build --manifest-path crates/csiq-py/Cargo.toml --profile release-py --out dist
+          python -m pip install --find-links dist csiq-fast
+      - name: The accelerator must actually be selected
+        shell: bash
+        run: python -c "import csiq; assert csiq.backend() == 'rust', csiq.backend()"
+      - name: Parity + the full rule suite
+        working-directory: python
+        run: python -m pytest tests/ -q
+
+  wheels:
+    name: wheels (${{ matrix.os }})
+    needs: parity
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # abi3-py310, so ONE wheel per platform covers 3.10 through 3.14+. The
+      # matrix is over platforms, never over interpreter versions.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          # `release` carries `panic = "abort"`, which in an extension module
+          # turns a Rust panic into a dead interpreter instead of an exception.
+          args: --profile release-py --manifest-path crates/csiq-py/Cargo.toml --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  sdists:
+    name: source distributions
+    needs: pure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build both source distributions
+        run: |
+          python -m pip install --upgrade pip build maturin
+          python -m build --sdist --outdir dist python
+          maturin sdist --manifest-path crates/csiq-py/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdists
+          path: dist/*.tar.gz
+
+  # Tag-only, and it needs a human to have created the tag. There is no path
+  # from a branch push to PyPI.
+  publish:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    needs: [wheels, sdists]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # trusted publishing; no API token is stored anywhere
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

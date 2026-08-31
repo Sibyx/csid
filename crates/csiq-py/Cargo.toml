@@ -1,0 +1,22 @@
+[package]
+name = "csiq-py"
+description = "PyO3 bindings for the CSIQ reader — an optional accelerator behind the same Python API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+# `csiq_fast`, not `csiq`: the pure-Python package keeps that name and stays
+# installable on its own. This is a separate distribution the `fast` extra pulls
+# in, so a wheel-less platform loses speed and nothing else.
+name = "csiq_fast"
+crate-type = ["cdylib"]
+
+[dependencies]
+csiq = { workspace = true }
+serde_json = { workspace = true }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }

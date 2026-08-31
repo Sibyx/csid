@@ -76,6 +76,12 @@ pub const T_NODE_THROTTLE: u8 = 0x41;
 pub const T_NODE_SPOOL_FREE: u8 = 0x42;
 /// `u32` — 1-minute load average times 1000.
 pub const T_NODE_LOAD_M: u8 = 0x43;
+/// `i32` — Wi-Fi NIC die temperature in whole degrees Celsius.
+///
+/// Degrees rather than millidegrees, unlike [`T_NODE_TEMP_MC`]: the driver's
+/// `nic_temp` reports the firmware's DTS reading as an integer °C, and scaling
+/// it would assert precision the sensor does not report.
+pub const T_NODE_NIC_TEMP_C: u8 = 0x44;
 
 // -- little cursor over a byte slice ------------------------------------------
 
@@ -171,6 +177,9 @@ pub fn encode_payload(r: &CsiRecord) -> Vec<u8> {
     }
     if let Some(v) = r.node.load_m {
         put_tlv(&mut out, T_NODE_LOAD_M, &v.to_le_bytes());
+    }
+    if let Some(v) = r.node.nic_temp_c {
+        put_tlv(&mut out, T_NODE_NIC_TEMP_C, &v.to_le_bytes());
     }
     put_tlv(&mut out, T_SEQ, &[r.seq]);
     put_tlv(&mut out, T_NRX, &[r.nrx]);
@@ -310,6 +319,12 @@ pub fn decode_payload(payload: &[u8]) -> Result<CsiRecord> {
                 node.load_m = Some(u32::from_le_bytes(
                     val.try_into()
                         .map_err(|_| CsiqError::Malformed("node load len"))?,
+                ))
+            }
+            T_NODE_NIC_TEMP_C => {
+                node.nic_temp_c = Some(i32::from_le_bytes(
+                    val.try_into()
+                        .map_err(|_| CsiqError::Malformed("node nic temp len"))?,
                 ))
             }
             T_CSI_MATRIX => iq = bytes_to_i16s(val)?,

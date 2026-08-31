@@ -173,7 +173,8 @@ Each record payload is a flat sequence of fields:
 | `0x41` | `NODE_THROTTLE` | `u32` — firmware throttle bitmask | |
 | `0x42` | `NODE_SPOOL_FREE` | `u64` — bytes free on the capture spool | |
 | `0x43` | `NODE_LOAD_M` | `u32` — 1-minute load average × 1000 | |
-| `0x44`–`0x4F` | *reserved* | further node and host state | |
+| `0x44` | `NODE_NIC_TEMP_C` | `i32` — Wi-Fi NIC die temperature, **whole degrees** C | |
+| `0x45`–`0x4F` | *reserved* | further node and host state | |
 
 A reader **must** reject a record missing any field marked required, and
 **must** silently skip unknown type codes.
@@ -303,7 +304,7 @@ matrix barely compresses at all. That is what makes it affordable — see
 
 Optional. A writer may omit it, and a reader must not assume it is present.
 
-### `NODE_*` (`0x40`–`0x43`) — the conditions, not the measurement
+### `NODE_*` (`0x40`–`0x44`) — the conditions, not the measurement
 
 A **sparse series**, never a per-record column. A writer emits these at an
 interval and attaches them to the next record, so most records carry none and a
@@ -323,6 +324,104 @@ attached during export would carry the teardown instant on every record — a
 fabricated timestamp on a real measurement. The type codes above are for the
 live datagram path, where a record is produced in the moment and the stamp is
 implicit.
+
+#### The two temperatures: two sensors, two units (`0x40` and `0x44`)
+
+There are two die temperatures in this format and they are **not**
+interchangeable. Getting this wrong is silent, so it is spelled out here rather
+than left to the field names.
+
+| Code | Field | Sensor | Unit | Source |
+|---|---|---|---|---|
+| `0x40` | `NODE_TEMP_MC` | host SoC | **millidegrees** C (`i32`) | `/sys/class/thermal/thermal_zone0/temp` |
+| `0x44` | `NODE_NIC_TEMP_C` | Wi-Fi NIC die | **whole degrees** C (`i32`) | `iwlmvm/nic_temp` (firmware DTS) |
+
+**A reader must not substitute one for the other, and must not rescale one into
+the other.** A reader that treats `0x44` as millidegrees reports a card at
+0.047 °C. A reader that treats `0x40` as degrees reports a node at 61,500 °C.
+Both are absurd enough to catch, which is the only reason this pairing is
+tolerable at all.
+
+##### Why the units differ
+
+**Each unit is the unit of its source.** The SoC's sysfs zone emits
+millidegrees, so the record carries millidegrees. The driver's `nic_temp` emits
+a whole number of degrees, so the record carries whole degrees. Multiplying the
+NIC value by 1000 would produce a field that *looks* like the SoC's and asserts
+three digits of precision the sensor never reported. The format's rule is that a
+field carries the measurement, not a presentation of it, so neither side is
+converted to match the other.
+
+##### Why they are two sensors and not one
+
+The active cooler sits on the SoC. The NIC sits under the M.2 HAT, in still air,
+with a different thermal mass and no fan of its own. A node can therefore hold
+the SoC comfortably in spec while the card climbs, and the card is the part that
+produces the CSI. Reading the SoC and calling it "the temperature" measures the
+enclosure's cooling, not the radio's state.
+
+Neither value implies the other, and neither can be recovered from the other.
+This is unlike `BW_ANTSEL` (`0x11`), which a reader may reconstruct from `rnf`
+because they are the same bits.
+
+##### The NIC reading is a firmware round trip, not a file read
+
+`nic_temp` is not a cached sysfs value. Reading it makes the driver take
+`mvm->mutex`, send a DTS measurement command and wait for the notification, so a
+single read can cost up to a second. Two consequences bind a writer:
+
+1. **Sample it far more slowly than the SoC zone.** The reference writer reads
+   the SoC twice a second and the NIC once a minute during a capture.
+2. **A failed read is the normal state of an idle radio.** `iwl_mvm_get_temp()`
+   returns `-EIO` whenever the firmware is not running, and the debugfs file is
+   mode `0400`. A writer records both as absence.
+
+##### Absence is absence
+
+`NODE_NIC_TEMP_C` is **absent** on every capture written before the field
+existed, and on any tick where the firmware did not answer. It is never written
+as `0`, and **a reader must not read its absence as a cold card, nor fill it
+from the SoC value, nor carry the previous tick's value forward.** The same rule
+already governs the rest of the `NODE_*` series.
+
+##### Why this did not bump the version, and what that guarantees
+
+Adding `0x44` is an added type code, which [the versioning
+policy](#versioning-policy) states is not a version bump. The guarantee that
+makes this safe is not a convention — it is checked:
+
+- **The container `version` field is an equality test**, not a floor. A bump
+  would make every existing file unreadable by the new build *and* every new
+  file unreadable by every old build. An additive type code is therefore the
+  only non-destructive way to extend the record.
+- **Both reference readers skip unknown type codes**, and both have a test that
+  says so. An old reader handed a new file ignores `0x44` and decodes every
+  other field exactly as before.
+- **The session-block schema is permissive**, not strict. An old writer's
+  sidecar decodes with the field defaulted to absent, and a new writer omits the
+  key entirely when it has no reading. The schema name stays `csid-session/1`:
+  nothing validates the sidecar against an enumerated field list, and an
+  optional added key is not a schema change.
+
+##### Nothing in the archive is rewritten, and no re-derive can invent a value
+
+The reading is taken **in the capture loop**, stamped with the moment it was
+taken, and never anywhere else. Export and re-derive do not sample it. This
+matters because `csid export` is run over archived `capture.raw` bytes to
+re-derive containers into the current form: if the exporter sampled node state,
+every re-derived capture would carry a NIC temperature measured on the day of
+the re-derive, stamped onto a capture from months earlier. That is a fabricated
+measurement wearing a real field's name, and the two-layer data model exists to
+prevent exactly this.
+
+Consequences for the existing corpus:
+
+- **No existing `.csiq` or `capture.raw` is modified.** The field appears only in
+  captures written after the change.
+- **A re-derived capture keeps the node-state series its sidecar already had.**
+  `export_session` reads `metadata.json` and never writes it.
+- **A re-derived capture gains no NIC temperature.** The value was never
+  measured for those bytes, and absence is the correct answer.
 
 #### Deriving the tone grid
 

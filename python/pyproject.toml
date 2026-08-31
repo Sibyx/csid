@@ -1,9 +1,9 @@
 [project]
 name = "csiq"
-version = "0.1.0"
-description = "Reference reader for the CSIQ Interchange Format v1 (Wi-Fi Channel State Information)"
+version = "0.2.0"
+description = "Reader and ergonomic layer for the CSIQ Interchange Format v1 (Wi-Fi Channel State Information)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "GPL-2.0-only" }
 authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
 keywords = ["csi", "wifi", "sensing", "802.11", "channel-state-information"]
@@ -18,6 +18,17 @@ dependencies = []
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.21"]
+# Reading a `capture.csiq.zst` on Python < 3.14, which has no stdlib zstd.
+zstd = ["zstandard>=0.22"]
+# Columnar export via Capture.to_arrow() / .to_pandas(). CSIQ is an archival and
+# interchange layer, not a columnar analytics format — these are a convenience
+# for getting OUT of it, never a suggestion to analyse in it.
+arrow = ["pyarrow>=17"]
+pandas = ["pandas>=2"]
+# The PyO3 accelerator. Optional by design: a platform with no wheel falls back
+# to the pure parser, more slowly and with identical results — which
+# `tests/test_backend_parity.py` asserts rather than assumes.
+fast = ["csiq-fast>=0.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/Sibyx/csid"

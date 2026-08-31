@@ -605,6 +605,7 @@ pub fn run_session(
                     throttle_flags: reading.throttle_flags,
                     spool_free_bytes: reading.spool_free_bytes,
                     load_m: reading.load_m,
+                    nic_temp_c: reading.nic_temp_c,
                 });
             }
         }

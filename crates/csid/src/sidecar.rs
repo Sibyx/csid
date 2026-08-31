@@ -217,6 +217,13 @@ pub struct NodeStateSample {
     pub spool_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_m: Option<u32>,
+    /// Wi-Fi NIC die temperature, whole degrees Celsius.
+    ///
+    /// Whole degrees because the driver reports whole degrees. Absent on every
+    /// session captured before this field existed, and absent on any tick where
+    /// the firmware was not running — which is a normal state, not a fault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nic_temp_c: Option<i32>,
 }
 
 /// Close-time capture statistics.

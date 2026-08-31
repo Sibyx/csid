@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/csiq", "crates/csid", "crates/csiscope", "crates/collector"]
+members = ["crates/csiq", "crates/csiq-py", "crates/csid", "crates/csiscope", "crates/collector"]
 
 [workspace.package]
 version = "0.2.0"
@@ -18,6 +18,13 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
+
+# The Python extension cannot inherit `panic = "abort"` from `release`: a Rust
+# panic there would kill the interpreter instead of raising, so a malformed file
+# would take the caller's process down rather than producing a CsiqError.
+[profile.release-py]
+inherits = "release"
+panic = "unwind"
 
 [profile.release]
 # The netlink RX loop is latency-sensitive; prefer predictable codegen over

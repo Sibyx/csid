@@ -13,6 +13,9 @@
 //!
 //! * **Die temperature** orders phase drift across the fleet, and the nodes do
 //!   not share a thermal envelope — some have fans and some do not.
+//! * **NIC die temperature** is the radio's own, and the radio is what makes the
+//!   CSI. It is read separately because the SoC's cooler does not cool the card:
+//!   the two run different envelopes in the same box.
 //! * **Throttle flags** mean the SoC was capped. A throttled node is a different
 //!   instrument, and the fact is invisible in the CSI itself.
 //! * **Spool free bytes**: an overnight arm once ran out of the space the live
@@ -25,7 +28,7 @@
 //!
 //! The sampler ticks on an interval and the next record to be written carries
 //! whatever it produced. Every other record carries nothing. That keeps the cost
-//! at four small TLVs per tick rather than per record, and it is why every field
+//! at five small TLVs per tick rather than per record, and it is why every field
 //! in [`csiq::NodeState`] is optional. A reader that treats these as a per-record
 //! column will find them mostly absent and must not read that as zero.
 //!
@@ -95,6 +98,17 @@ pub fn read_now(spool: &Path) -> NodeState {
         throttle_flags: crate::thermal::read_throttle().map(|t| t.raw),
         spool_free_bytes: free_bytes(spool),
         load_m: load_1m_milli(),
+        // The RADIO's own die temperature, from the driver's DTS. Separate from
+        // `temp_mc` because the two are not the same instrument: the SoC sits
+        // under the active cooler and the card sits under the HAT, so an
+        // enclosure can hold one in spec while the other climbs.
+        //
+        // This is the only reading here that is not a file read — it is a
+        // firmware round trip that can take up to a second (see
+        // `debugfs::read_nic_temp_c`). At the one-minute default that is a
+        // stall the supervisor loop absorbs; it is why this must not be moved
+        // to a faster cadence without measuring what it costs.
+        nic_temp_c: crate::debugfs::read_nic_temp_c(),
     }
 }
 
@@ -164,6 +178,7 @@ mod tests {
             throttle_flags: Some(0),
             spool_free_bytes: Some(0),
             load_m: Some(0),
+            nic_temp_c: Some(0),
         };
         assert!(
             !zeroed.is_empty(),

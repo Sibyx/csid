@@ -226,6 +226,42 @@ mod tests {
         assert!(back.bw_antsel.is_some());
     }
 
+    /// The node-state series round-trips, and the two temperatures do not
+    /// collide. `temp_mc` is the SoC in millidegrees and `nic_temp_c` is the
+    /// radio in whole degrees, so a reader that confused them would report the
+    /// card at a thousand times its temperature.
+    #[test]
+    fn the_two_temperatures_round_trip_in_their_own_units() {
+        let mut r = sample_record(52, 1, 1);
+        r.node = crate::record::NodeState {
+            temp_mc: Some(61_500),
+            throttle_flags: Some(0x8_0000),
+            spool_free_bytes: Some(12_000_000_000),
+            load_m: Some(1_250),
+            nic_temp_c: Some(47),
+        };
+        let back = crate::tlv::decode_payload(&crate::tlv::encode_payload(&r)).unwrap();
+        assert_eq!(back.node, r.node);
+        assert_eq!(back.node.temp_mc, Some(61_500), "SoC stays millidegrees");
+        assert_eq!(back.node.nic_temp_c, Some(47), "NIC stays whole degrees");
+    }
+
+    /// A capture from before `0x44` existed carries no NIC temperature, and the
+    /// reader must report that absence rather than a zero. Unlike `bw_antsel`
+    /// there is nothing in the record to recover it from — the radio's die
+    /// temperature is not implied by any other field.
+    #[test]
+    fn an_older_record_has_no_nic_temperature_and_none_is_invented() {
+        let mut r = sample_record(52, 1, 1);
+        r.node = crate::record::NodeState {
+            temp_mc: Some(61_500),
+            ..Default::default()
+        };
+        let back = crate::tlv::decode_payload(&crate::tlv::encode_payload(&r)).unwrap();
+        assert_eq!(back.node.nic_temp_c, None);
+        assert!(!back.node.is_empty(), "the SoC reading is still a reading");
+    }
+
     /// `rnf == 0` is the header's "no rate information", and both decoders must
     /// agree about it. A zero word is not a 20 MHz frame on antenna none.
     #[test]

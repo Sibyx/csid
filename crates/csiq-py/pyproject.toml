@@ -1,0 +1,29 @@
+[project]
+name = "csiq-fast"
+description = "PyO3 accelerator for the csiq reader. Optional: install as csiq[fast]."
+requires-python = ">=3.10"
+license = { text = "GPL-2.0-only" }
+authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
+keywords = ["csi", "wifi", "sensing", "802.11", "channel-state-information"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Programming Language :: Rust",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Sibyx/csid"
+Specification = "https://github.com/Sibyx/csid/blob/master/docs/CSIQ-format-v1.md"
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "csiq_fast"
+# `release` carries `panic = "abort"`, which in an extension module turns a Rust
+# panic into a dead interpreter instead of a Python exception.
+profile = "release-py"
+# abi3 from 3.10, so one wheel per platform covers every supported Python.
+features = ["pyo3/extension-module"]
