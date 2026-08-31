@@ -40,3 +40,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["csiq"]
+# PEP 561. The package is fully annotated, but without this marker mypy treats
+# every consumer's `from csiq import Capture` as `Any` and silently stops
+# checking the calls — which is worse than no annotations, because it looks
+# clean. Found from monad-knowledge (IP-144 Phase 5).
+artifacts = ["csiq/py.typed"]
