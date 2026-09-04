@@ -23,6 +23,9 @@
 //! | [`ble`] | any | BLE co-capture: pseudonymisation, the durable log, `ble_rssi.parquet` |
 //! | [`hci`] | Linux (AF_BLUETOOTH) | The passive LE scan that feeds [`ble`] |
 //! | [`timesync`] | any (rx: Linux AF_PACKET) | Time transfer over the illumination stream: payload stamps, inter-node skew, the phone affine fit, `time_transfer.parquet` |
+//! | [`census`] | any (rx: Linux AF_PACKET) | Frame census: who is on the air from the raw 802.11 header, per minute, plus the beamforming-feedback frames that make BFI sensing possible |
+//! | [`survey`] | any (scan: Linux, execs `iw`) | Channel survey on the management radio at open and close — where the access points are |
+//! | [`rawsock`] | Linux | The one `AF_PACKET` receive socket the two rows above share |
 //! | [`engine`], [`sinks`], [`notify`] | Linux | Session orchestration, the two sinks, `sd_notify` |
 //! | [`segment`] | any | Rotating a long capture into session-shaped segments that sync and prune while it runs |
 //! | [`thermal`] | Linux (Pi) | Die temperature and the firmware throttle word — what qualifies a node for a long run |
@@ -40,6 +43,7 @@
 
 pub mod ble;
 pub mod caps;
+pub mod census;
 pub mod commands;
 pub mod config;
 pub mod debugfs;
@@ -52,11 +56,13 @@ pub mod marker;
 pub mod nodestate;
 pub mod notify;
 pub mod radio;
+pub mod rawsock;
 pub mod segment;
 pub mod sidecar;
 pub mod sinks;
 pub mod source;
 pub mod status;
+pub mod survey;
 pub mod thermal;
 pub mod timesync;
 pub mod util;

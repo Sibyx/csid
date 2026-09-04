@@ -99,7 +99,36 @@ pub fn run_session(
     stop: Arc<AtomicBool>,
 ) -> Result<SessionOutcome> {
     cfg.validate().context("configuration is invalid")?;
-    let tuning = radio::resolve(&cfg.radio)?;
+
+    // -- STA mode: the link owns the channel and the width -----------------
+    // Read once, before anything else, so a node that is not associated fails
+    // here with the reason rather than opening a session that records nothing.
+    // The profile's radio block is then OVERWRITTEN with what was observed, so
+    // every downstream reader — sidecar, sealer, summary, export — sees one
+    // consistent tuning and the sidecar marks it `observed`.
+    let sta_link: Option<radio::ObservedLink> = if cfg.capture.mode == "sta" {
+        Some(observe_sta_link(cfg)?)
+    } else {
+        None
+    };
+    let observed_cfg: ExperimentConfig;
+    let cfg: &ExperimentConfig = match &sta_link {
+        Some(link) => {
+            let mut c = cfg.clone();
+            c.radio.band = Some(link.tuning.band);
+            c.radio.channel = crate::caps::freq_to_channel(link.tuning.freq)
+                .map(|(_, ch)| ch)
+                .unwrap_or(0);
+            c.radio.width = link.tuning.width;
+            observed_cfg = c;
+            &observed_cfg
+        }
+        None => cfg,
+    };
+    let tuning = match &sta_link {
+        Some(link) => link.tuning,
+        None => radio::resolve(&cfg.radio)?,
+    };
 
     // Before the radio, before the directory: can this session's output fit?
     refuse_if_spool_is_low(
@@ -126,13 +155,38 @@ pub fn run_session(
     tracing::info!(session_id, dir = %dir.display(), "session opening");
 
     // -- radio setup -------------------------------------------------------
-    radio::ensure_monitor(&cfg.radio.interface, &cfg.radio.monitor)?;
-    let achieved = radio::tune(&cfg.radio.monitor, &tuning)?;
+    // An associated capture creates no monitor interface and commands no
+    // tune: the readback is taken off the managed interface as it stands.
+    let achieved = match &sta_link {
+        Some(_) => radio::read_achieved(&cfg.radio.interface),
+        None => {
+            radio::ensure_monitor(&cfg.radio.interface, &cfg.radio.monitor)?;
+            radio::tune(&cfg.radio.monitor, &tuning)?
+        }
+    };
 
     let knobs = Knobs::for_interface(&cfg.radio.interface)?;
     knobs.set_interval(cfg.radio.interval_us)?;
     knobs.set_addresses(&cfg.radio.mac_filter)?;
     knobs.set_csi_enabled(true)?;
+
+    // -- channel survey, at open -------------------------------------------
+    // On the MANAGEMENT radio, so the capture radio is untouched. Taken before
+    // the sidecar is written so the open-time document already says where the
+    // access points were when this capture began. Never fails a session: a
+    // scan that could not run lands in the sidecar as an error.
+    let survey_open = cfg.survey.enabled.then(|| {
+        let s = crate::survey::take(&cfg.survey);
+        tracing::info!(
+            interface = %s.interface,
+            bss = s.bss_total,
+            link = ?s.link.bssid,
+            freq = ?s.link.freq_mhz,
+            error = ?s.error,
+            "channel survey at open"
+        );
+        s
+    });
 
     // Sidecar is written *before* capture so a crashed session still has
     // complete provenance on disk.
@@ -143,6 +197,8 @@ pub fn run_session(
         global,
         &tuning,
         Some(&achieved),
+        sta_link.as_ref(),
+        survey_open,
     )?;
 
     // The volatile counterpart of the sidecar (IP-132): what the capture is
@@ -236,6 +292,37 @@ pub fn run_session(
                     "time transfer failed to start; continuing WITHOUT inter-node skew data"
                 );
                 ts_error = Some(format!("{e:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // -- frame census --------------------------------------------------------
+    // A sibling of the time-transfer receiver on the same kind of socket: its
+    // own thread, its own file, sharing only the stop flag. It never fails a
+    // session — a census that could not start is recorded, and the capture
+    // it was meant to name goes on.
+    let census_counters = Arc::new(crate::census::CensusCounters::default());
+    let mut census_error: Option<String> = None;
+    let census = if cfg.census.enabled {
+        match crate::census::spawn(
+            &dir,
+            &cfg.radio.monitor,
+            &host,
+            &session_id,
+            &cfg.census,
+            stop.clone(),
+            census_counters.clone(),
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "frame census failed to start; continuing WITHOUT a transmitter census"
+                );
+                census_error = Some(format!("{e:#}"));
                 None
             }
         }
@@ -738,6 +825,9 @@ pub fn run_session(
     // 2026-08-17 and got all six OOM-killed mid-teardown — see
     // `timesync::for_each_batch`.
     let ts_log: Option<PathBuf> = timesync.map(|h| h.join());
+    // The census holds the other AF_PACKET socket; it is joined here, before
+    // the raw walk, for the same reason the time-transfer log is closed first.
+    let census_outcome = census.map(|h| h.join());
     let ts_macs: std::collections::HashSet<[u8; 6]> = ts_log
         .as_ref()
         .map(|p| {
@@ -808,6 +898,31 @@ pub fn run_session(
         ));
     }
 
+    if cfg.census.enabled {
+        summary.census = Some(finish_census(
+            census_outcome,
+            &census_counters,
+            census_error,
+        ));
+    }
+
+    // -- channel survey, at close --------------------------------------------
+    // The pair to the open-time survey: an access point that moved during the
+    // session shows as a different frequency here, and one that did not shows
+    // as the same. Without the pair neither reading can be made.
+    if cfg.survey.enabled {
+        let s = crate::survey::take(&cfg.survey);
+        tracing::info!(
+            interface = %s.interface,
+            bss = s.bss_total,
+            link = ?s.link.bssid,
+            freq = ?s.link.freq_mhz,
+            error = ?s.error,
+            "channel survey at close"
+        );
+        sidecar.set_survey_close(s);
+    }
+
     sidecar.close(status, Some(summary.clone()));
 
     // Optional CSIQ export. The sidecar is already closed above, so the
@@ -845,6 +960,96 @@ pub fn run_session(
         status,
         summary,
     })
+}
+
+/// Read the association a STA-mode session will capture on, and refuse the
+/// ones the profile said to refuse.
+fn observe_sta_link(cfg: &ExperimentConfig) -> Result<radio::ObservedLink> {
+    let iface = cfg.radio.interface.as_str();
+    // `require_assoc = false` waits for the supplicant rather than failing on
+    // the first look: a unit started beside the supplicant may reach here
+    // before the four-way handshake completes. The bound is a minute; past
+    // it a capture with nothing to hear is refused either way.
+    let deadline = Instant::now() + Duration::from_secs(if cfg.sta.require_assoc { 0 } else { 60 });
+    let link = loop {
+        match radio::read_link(iface)? {
+            Some(l) => break l,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_secs(2)),
+            None => anyhow::bail!(
+                "{iface} is not associated, so a STA-mode capture has nothing to hear; \
+                 an empty capture that looks like a quiet channel is exactly the failure \
+                 this refuses (sta.require_assoc = {})",
+                cfg.sta.require_assoc
+            ),
+        }
+    };
+    if !cfg.sta.ssid.is_empty() && link.ssid.as_deref() != Some(cfg.sta.ssid.as_str()) {
+        anyhow::bail!(
+            "{iface} is associated to SSID {:?}, and the profile requires {:?}",
+            link.ssid,
+            cfg.sta.ssid
+        );
+    }
+    if !cfg.sta.bssid.is_empty() && !link.bssid.eq_ignore_ascii_case(&cfg.sta.bssid) {
+        anyhow::bail!(
+            "{iface} is associated to {}, and the profile requires {}",
+            link.bssid,
+            cfg.sta.bssid
+        );
+    }
+    tracing::info!(
+        iface,
+        bssid = %link.bssid,
+        ssid = ?link.ssid,
+        freq = link.tuning.freq,
+        width_mhz = link.width_mhz,
+        center = ?link.tuning.center,
+        "STA-mode capture: channel and width observed off the association"
+    );
+    Ok(link)
+}
+
+/// Compose the census block of the summary from the thread's outcome and the
+/// live counters. Never fails: a census that did not run says so.
+fn finish_census(
+    outcome: Option<crate::census::CensusOutcome>,
+    counters: &crate::census::CensusCounters,
+    setup_error: Option<String>,
+) -> crate::sidecar::CensusSummary {
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+    let mut s = crate::sidecar::CensusSummary {
+        status: "failed".to_string(),
+        error: setup_error,
+        frames_seen: load(&counters.frames_seen),
+        own_transmissions: load(&counters.own_transmissions),
+        mgmt: load(&counters.mgmt),
+        ctrl: load(&counters.ctrl),
+        data: load(&counters.data),
+        ext: load(&counters.ext),
+        protected: load(&counters.protected),
+        vht_bfi: load(&counters.vht_bfi),
+        he_bfi: load(&counters.he_bfi),
+        ndpa: load(&counters.ndpa),
+        malformed: load(&counters.malformed),
+        rows_written: load(&counters.rows_written),
+        ..Default::default()
+    };
+    if let Some(o) = outcome {
+        s.distinct_transmitters = o.distinct_transmitters;
+        s.distinct_capped = o.distinct_capped;
+        s.top = o.top;
+        s.beacons = o.beacons;
+        s.status = match (&o.error, s.frames_seen) {
+            (Some(_), _) => "degraded",
+            (None, 0) => "degraded",
+            (None, _) => "ok",
+        }
+        .to_string();
+        if s.error.is_none() {
+            s.error = o.error;
+        }
+    }
+    s
 }
 
 /// Join the scan thread, export `ble_rssi.parquet`, and grade the channel.
@@ -1149,6 +1354,8 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
         // reader to serve. Left to the segments, which is where it answers a
         // question that could not otherwise be answered before teardown.
         transmitters: None,
+        // Filled by the caller once the census thread has been joined.
+        census: None,
         // Filled by the caller from the capture loop's own sampler; this
         // constructor has no clock and must not invent one.
         node_state: Vec::new(),

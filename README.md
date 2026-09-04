@@ -221,6 +221,11 @@ The format, configuration, export, and CLI layers are additionally covered by
 tests that run on every platform (Linux, macOS, Windows) plus a cross-language
 interop test in CI.
 
+Releases are recorded in [CHANGELOG.md](CHANGELOG.md). The workspace version is
+what every sidecar stamps as `environment.csid_version`, so a feature that ships
+without a bump is invisible in the archive — bump on every change to what a
+capture records.
+
 ## Related work
 
 `csid` consumes the CSI path established by the AX210 driver ports for Linux

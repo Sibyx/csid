@@ -239,6 +239,169 @@ pub struct ExperimentConfig {
     pub stream: StreamConfig,
     #[serde(default)]
     pub export: ExportConfig,
+    /// Frame census on the monitor interface. Off unless `enabled = true`.
+    #[serde(default)]
+    pub census: CensusConfig,
+    /// Channel survey on the management radio at open and close. Off unless
+    /// `enabled = true`.
+    #[serde(default)]
+    pub survey: SurveyConfig,
+    /// Only read when `capture.mode = "sta"`.
+    #[serde(default)]
+    pub sta: StaConfig,
+}
+
+/// Frame census — who is on the air, from the raw 802.11 header, for the
+/// whole session. See [`crate::census`] for why the CSI record's own source
+/// address cannot answer that after the first minutes of a session.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CensusConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Busiest transmitters and beaconing BSSIDs named in the sidecar.
+    #[serde(default = "default_census_top_n")]
+    pub top_n: usize,
+    /// Distinct transmitters tracked for the session total. Beyond this the
+    /// count is reported as capped rather than growing without bound on a
+    /// channel full of randomised addresses.
+    #[serde(default = "default_census_max_transmitters")]
+    pub max_transmitters: usize,
+}
+
+fn default_census_top_n() -> usize {
+    32
+}
+fn default_census_max_transmitters() -> usize {
+    4096
+}
+
+impl Default for CensusConfig {
+    fn default() -> Self {
+        CensusConfig {
+            enabled: false,
+            top_n: default_census_top_n(),
+            max_transmitters: default_census_max_transmitters(),
+        }
+    }
+}
+
+impl CensusConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.top_n == 0 || self.top_n > 1024 {
+            anyhow::bail!("census.top_n must be 1..=1024 (got {})", self.top_n);
+        }
+        if self.max_transmitters < self.top_n {
+            anyhow::bail!(
+                "census.max_transmitters ({}) must be >= census.top_n ({})",
+                self.max_transmitters,
+                self.top_n
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Channel survey on the **management** radio. See [`crate::survey`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurveyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The radio to scan with. The management radio, never the capture radio:
+    /// a scan retunes the interface it runs on.
+    #[serde(default = "default_survey_interface")]
+    pub interface: String,
+    /// Wall-clock bound on one `iw` call, seconds.
+    #[serde(default = "default_survey_timeout_s")]
+    pub timeout_s: u64,
+    /// BSS entries kept per survey, strongest first.
+    #[serde(default = "default_survey_max_bss")]
+    pub max_bss: usize,
+}
+
+fn default_survey_interface() -> String {
+    "wlan0".to_string()
+}
+fn default_survey_timeout_s() -> u64 {
+    20
+}
+fn default_survey_max_bss() -> usize {
+    64
+}
+
+impl Default for SurveyConfig {
+    fn default() -> Self {
+        SurveyConfig {
+            enabled: false,
+            interface: default_survey_interface(),
+            timeout_s: default_survey_timeout_s(),
+            max_bss: default_survey_max_bss(),
+        }
+    }
+}
+
+impl SurveyConfig {
+    pub fn validate(&self, capture_interface: &str, monitor: &str) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.interface.is_empty() {
+            anyhow::bail!("survey.interface must be set");
+        }
+        if self.interface == capture_interface || self.interface == monitor {
+            anyhow::bail!(
+                "survey.interface {:?} is the capture radio — a scan retunes the interface it \
+                 runs on and would destroy the capture. Point it at the management radio.",
+                self.interface
+            );
+        }
+        if self.timeout_s == 0 || self.timeout_s > 120 {
+            anyhow::bail!("survey.timeout_s must be 1..=120 (got {})", self.timeout_s);
+        }
+        Ok(())
+    }
+}
+
+/// Associated (STA-mode) capture: CSI from the frames an access point sends
+/// this node while it is a client of that access point (IP-139 C6).
+///
+/// The link owns the channel and the width, so `[radio].channel` and
+/// `[radio].width` are **not read** in this mode — both are observed off the
+/// association and recorded as observed in the sidecar. Nothing here
+/// associates: the supplicant is the operator's, and this block only says
+/// what the session refuses to run without.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaConfig {
+    /// Fail at setup when the interface is not associated. Default `true`:
+    /// an empty capture that looks like a quiet channel is the failure mode
+    /// this fleet already knows.
+    #[serde(default = "default_sta_require_assoc")]
+    pub require_assoc: bool,
+    /// Refuse a link to any other SSID. Empty accepts whatever is associated.
+    #[serde(default)]
+    pub ssid: String,
+    /// Refuse a link to any other BSSID. Empty accepts whatever is associated.
+    #[serde(default)]
+    pub bssid: String,
+}
+
+fn default_sta_require_assoc() -> bool {
+    true
+}
+
+impl Default for StaConfig {
+    fn default() -> Self {
+        StaConfig {
+            require_assoc: default_sta_require_assoc(),
+            ssid: String::new(),
+            bssid: String::new(),
+        }
+    }
 }
 
 /// Radio / monitor-interface configuration.
@@ -1026,7 +1189,29 @@ impl ExperimentConfig {
 
     /// Validate everything checkable without touching hardware.
     pub fn validate(&self) -> Result<()> {
-        caps::validate_radio(&self.radio)?;
+        // In STA mode the link owns the channel and the width, so the radio
+        // block's channel is not read and must not be validated as a tune.
+        if self.capture.mode == "sta" {
+            if self.radio.interface.is_empty() {
+                anyhow::bail!("radio.interface must be set");
+            }
+            if !self.sta.bssid.is_empty() && !is_mac(&self.sta.bssid) {
+                anyhow::bail!("sta.bssid {:?} is not a MAC address", self.sta.bssid);
+            }
+            // Every sibling that reads raw 802.11 frames needs the monitor
+            // interface, which an associated capture does not create.
+            if self.timesync.enabled {
+                anyhow::bail!("timesync.enabled is not available with capture.mode = \"sta\" (no monitor interface)");
+            }
+            if self.census.enabled {
+                anyhow::bail!("census.enabled is not available with capture.mode = \"sta\" (no monitor interface)");
+            }
+        } else {
+            caps::validate_radio(&self.radio)?;
+        }
+        self.census.validate()?;
+        self.survey
+            .validate(&self.radio.interface, &self.radio.monitor)?;
 
         // Segment rotation. A too-short segment turns a capture into a sealing
         // treadmill (every rotation costs an fsync plus a CSIQ export of the
@@ -1081,7 +1266,7 @@ impl ExperimentConfig {
         }
 
         match self.capture.mode.as_str() {
-            "passive" => {}
+            "passive" | "sta" => {}
             "inject" => {
                 let inj = &self.inject;
                 if inj.rate_hz == 0 || inj.rate_hz > 1000 {

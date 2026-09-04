@@ -80,6 +80,20 @@ enum Command {
         #[arg(long, default_value = "wlp1s0")]
         interface: String,
     },
+    /// Survey the channel plan from the MANAGEMENT radio: the association and
+    /// every access point heard, with frequency, width, signal and SSID.
+    ///
+    /// A read, on the radio that is not capturing. Every session with
+    /// `[survey].enabled` takes the same survey at open and close and records
+    /// it in the sidecar; this prints one on demand, before an arm is placed.
+    Survey {
+        /// The management radio. Never the capture radio — a scan retunes it.
+        #[arg(long, default_value = "wlan0")]
+        interface: String,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Convert a session's raw capture to a self-describing `.csiq`.
     Export {
         /// Session directory (containing capture.raw + metadata.json).
@@ -449,6 +463,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             let global = GlobalConfig::load(&cli.config)?;
             commands::doctor(&global, interface)
         }
+        Command::Survey { interface, json } => commands::survey_cmd(interface, *json),
         Command::Export { session, out } => commands::export_cmd(session, out.clone()),
         Command::Stream { socket, limit } => commands::stream_cmd(socket, *limit),
         Command::Thermal { prometheus, write } => commands::thermal_cmd(*prometheus, write.clone()),

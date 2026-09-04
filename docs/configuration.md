@@ -69,8 +69,28 @@ interval_us = 0               # 0 = unthrottled; otherwise a rate cap
 mac_filter  = []              # source-MAC allowlist; empty = all
 
 [capture]
-mode     = "passive"          # "passive" | "inject" (paced illumination, see [inject])
+mode     = "passive"          # "passive" | "inject" (paced illumination, see [inject]) | "sta" (associated, see [sta])
 duration = "30m"              # omit to run until stopped
+
+# Frame census — who is on the air, from the raw 802.11 header, per minute.
+# Off unless enabled. See the field reference for why src_mac cannot do this.
+# [census]
+# enabled          = true
+# top_n            = 32
+# max_transmitters = 4096
+
+# Channel survey on the MANAGEMENT radio at open and close. Off unless enabled.
+# [survey]
+# enabled   = true
+# interface = "wlan0"
+# timeout_s = 20
+# max_bss   = 64
+
+# Only read when capture.mode = "sta". Defaults shown.
+# [sta]
+# require_assoc = true
+# ssid          = ""
+# bssid         = ""
 
 # Only read when capture.mode = "inject". Defaults shown.
 # [inject]
@@ -252,6 +272,63 @@ are invisible from the air (`collectord` still sees them, as a real UDP peer).
 was refused and every receive stamp carries the scheduler's wake-up jitter —
 the same order as the skew being measured. Such a session must not be pooled
 with `kernel`-stamped ones.
+
+### `[census]` — frame census: who is on the air
+
+The CSI record's own source address (header offset 68) is written by the
+**firmware**, and on this hardware it reads as the fill `ef:be:ad:de:ad:de`
+for most of a session: csid 0.2.0 captures show the eduroam BSSIDs for the
+first ten to twelve minutes after open and never again, on every host checked,
+while the frame rate holds (2026-09-04). The driver holds the real `addr2` on
+a side channel and its author left the copy disabled because the CSI
+completion is not frame-aligned with the MPDU path. So a transmitter census
+must be read from the frame itself, in user space. This is that census.
+
+| Key | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Off by default. One `AF_PACKET` socket and one thread on the monitor interface, shared code with `[timesync]`. Not available with `capture.mode = "sta"`. |
+| `top_n` | int | Busiest transmitters and beaconing BSSIDs named in `summary.census`. Default 32. |
+| `max_transmitters` | int | Distinct transmitters tracked for the session total; beyond it `distinct_capped` is set rather than the table growing without bound on a channel full of randomised addresses. Default 4096. |
+
+Artefact: `frame_census.jsonl` (schema `frame-census/1`), one line per
+`(minute, transmitter, bssid, kind, subtype, sounding)` with `frames` and
+`protected` counts. Nothing per frame is kept and no payload is decoded.
+`summary.census` carries the totals and three counters that matter for
+beamforming-feedback sensing: `ndpa` (NDP announcements, the sounding
+trigger), `vht_bfi` and `he_bfi` (compressed beamforming reports, which the
+VHT and HE action categories send in the clear). `ndpa` without `*_bfi` means
+the access points sound and nobody answers unprotected.
+
+### `[survey]` — channel survey on the management radio
+
+| Key | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Off by default. At session open and again at close, run `iw dev <interface> link` and `iw dev <interface> scan` and record both in the sidecar under `survey.at_open` / `survey.at_close`. |
+| `interface` | string | The **management** radio (default `wlan0`). Validation refuses the capture interface or the monitor: a scan retunes the interface it runs on. |
+| `timeout_s` | int | Wall-clock bound on one `iw` call. Default 20. |
+| `max_bss` | int | BSS entries kept per survey, strongest first. `bss_total` says how many were heard. Default 64. |
+
+A survey never fails a session: a scan that could not run lands in the
+document as `error`, beside whatever was still readable. An access point that
+changed channel during the session shows as a different frequency at close.
+`csid survey --interface wlan0 [--json]` prints one on demand.
+
+### `[sta]` — associated capture (only read when `capture.mode = "sta"`)
+
+CSI from the frames an access point sends **this** node while it is a client
+of that access point (IP-139 C6). No monitor interface is created and no tune
+is commanded: the link owns the channel and the width, both are read off the
+association (`iw link`, `iw info`) and the sidecar marks
+`radio.observed = true` with the `bssid` and `ssid` that owned them.
+`[radio].channel` and `[radio].width` are required by the schema and **not
+read** in this mode. `[timesync]` and `[census]` are refused, because both
+need the monitor interface. The supplicant is not csid's.
+
+| Key | Type | Notes |
+|---|---|---|
+| `require_assoc` | bool | Default `true`: an interface that is not associated fails the session at setup. `false` waits up to a minute for the supplicant, then fails. An empty capture that looks like a quiet channel is the failure this refuses. |
+| `ssid` | string | Refuse a link to any other SSID. Empty accepts whatever is associated. |
+| `bssid` | string | Refuse a link to any other BSSID. Empty accepts whatever is associated. |
 
 ### `[stream]`
 

@@ -242,6 +242,28 @@ pub fn caps_cmd(json: bool) -> Result<()> {
 }
 
 /// `csid doctor` — is this node able to capture right now?
+/// `csid survey` — one channel survey from the management radio, now.
+pub fn survey_cmd(interface: &str, json: bool) -> Result<()> {
+    let cfg = crate::config::SurveyConfig {
+        enabled: true,
+        interface: interface.to_string(),
+        ..Default::default()
+    };
+    let s = crate::survey::take(&cfg);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&s)?);
+    } else {
+        print!("{}", crate::survey::render(&s));
+    }
+    // A survey that could not scan is still printed, and still an error for
+    // a caller that gates on it — an arm must not read "no APs" off a scan
+    // that never ran.
+    match s.error {
+        Some(e) => anyhow::bail!("survey incomplete: {e}"),
+        None => Ok(()),
+    }
+}
+
 pub fn doctor(global: &GlobalConfig, interface: &str) -> Result<()> {
     let mut failures = 0;
 

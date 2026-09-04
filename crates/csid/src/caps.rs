@@ -154,6 +154,52 @@ pub fn channel_to_freq(band: Band, channel: u32) -> Option<u32> {
     }
 }
 
+/// The inverse of [`channel_to_freq`]: band and channel for a control
+/// frequency the radio or a scan reported. `None` for a frequency no band
+/// this build knows carries.
+///
+/// 6 GHz starts at 5955 MHz (channel 1). 5945 MHz is not a channel centre on
+/// any band and reads as `None`, which is right: a survey line that says 5945
+/// is a parse error, not a channel.
+pub fn freq_to_channel(freq_mhz: u32) -> Option<(Band, u32)> {
+    match freq_mhz {
+        2484 => Some((Band::Ghz24, 14)),
+        2412..=2472 if (freq_mhz - 2407) % 5 == 0 => Some((Band::Ghz24, (freq_mhz - 2407) / 5)),
+        5180..=5885 if (freq_mhz - 5000) % 5 == 0 => {
+            let ch = (freq_mhz - 5000) / 5;
+            CH5.contains(&ch).then_some((Band::Ghz5, ch))
+        }
+        5955..=7115 if (freq_mhz - 5950) % 20 == 5 => Some((Band::Ghz6, (freq_mhz - 5950) / 5)),
+        _ => None,
+    }
+}
+
+impl WidthCfg {
+    /// The width an associated link reports, as a monitor-width token.
+    ///
+    /// `iw dev … info` prints `width: 40 MHz` without saying which side the
+    /// secondary sits on; the centre frequency does. Used by STA-mode capture,
+    /// where the width is observed off the link rather than commanded.
+    pub fn from_observed(
+        width_mhz: u32,
+        control_mhz: u32,
+        center_mhz: Option<u32>,
+    ) -> Option<Self> {
+        match width_mhz {
+            20 => Some(WidthCfg::Ht20),
+            40 => match center_mhz {
+                Some(c) if c < control_mhz => Some(WidthCfg::Ht40Minus),
+                Some(_) => Some(WidthCfg::Ht40Plus),
+                None => None,
+            },
+            80 => Some(WidthCfg::W80),
+            160 => Some(WidthCfg::W160),
+            320 => Some(WidthCfg::W320),
+            _ => None,
+        }
+    }
+}
+
 /// The centre frequency (MHz) a wide capture must be tuned to, or `None` for
 /// widths that do not need one.
 pub fn center_freq(band: Band, channel: u32, width: WidthCfg) -> Result<Option<u32>> {
@@ -280,6 +326,44 @@ impl Default for Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frequencies_round_trip_to_channels() {
+        assert_eq!(freq_to_channel(2437), Some((Band::Ghz24, 6)));
+        assert_eq!(freq_to_channel(2484), Some((Band::Ghz24, 14)));
+        assert_eq!(freq_to_channel(5220), Some((Band::Ghz5, 44)));
+        assert_eq!(freq_to_channel(5975), Some((Band::Ghz6, 5)));
+        assert_eq!(freq_to_channel(6375), Some((Band::Ghz6, 85)));
+        // Not a channel centre on any band.
+        assert_eq!(freq_to_channel(5945), None);
+        assert_eq!(freq_to_channel(5210), None);
+        for ch in CH5 {
+            let f = channel_to_freq(Band::Ghz5, *ch).unwrap();
+            assert_eq!(freq_to_channel(f), Some((Band::Ghz5, *ch)));
+        }
+    }
+
+    #[test]
+    fn observed_widths_map_to_tokens() {
+        assert_eq!(
+            WidthCfg::from_observed(20, 5220, None),
+            Some(WidthCfg::Ht20)
+        );
+        assert_eq!(
+            WidthCfg::from_observed(40, 5220, Some(5230)),
+            Some(WidthCfg::Ht40Plus)
+        );
+        assert_eq!(
+            WidthCfg::from_observed(40, 5240, Some(5230)),
+            Some(WidthCfg::Ht40Minus)
+        );
+        assert_eq!(WidthCfg::from_observed(40, 5220, None), None);
+        assert_eq!(
+            WidthCfg::from_observed(80, 5220, Some(5210)),
+            Some(WidthCfg::W80)
+        );
+        assert_eq!(WidthCfg::from_observed(30, 5220, None), None);
+    }
 
     #[test]
     fn five_ghz_centres() {

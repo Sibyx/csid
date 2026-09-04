@@ -64,6 +64,76 @@ pub struct RadioMeta {
     pub achieved_width_mhz: Option<u32>,
     #[serde(default)]
     pub achieved_center_freq_mhz: Option<u32>,
+    /// `true` on a `capture.mode = "sta"` session: `channel`, `band`,
+    /// `control_freq_mhz`, `center_freq_mhz` and `width` were read off the
+    /// association rather than commanded by the profile, and `bssid` names the
+    /// access point that owned them. Absent (false) on every other session.
+    #[serde(default)]
+    pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bssid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssid: Option<String>,
+}
+
+/// Frame-census configuration as applied. See [`crate::census`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CensusMeta {
+    pub artefact: String,
+    pub schema: String,
+    pub top_n: usize,
+    pub max_transmitters: usize,
+}
+
+/// Frame-census outcome: who was on the air, read from the raw 802.11 header.
+///
+/// `top` and `beacons` are what a reader should use to name transmitters.
+/// The CSI record's own `src_mac` reads as the firmware fill for most of a
+/// session on this hardware, so `summary.transmitters` under-names the room
+/// and this does not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CensusSummary {
+    /// `ok` · `degraded` (ran, but a write failed) · `failed` (never started).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub frames_seen: u64,
+    pub own_transmissions: u64,
+    pub mgmt: u64,
+    pub ctrl: u64,
+    pub data: u64,
+    pub ext: u64,
+    pub protected: u64,
+    /// VHT compressed beamforming reports heard in the clear.
+    pub vht_bfi: u64,
+    /// HE compressed beamforming / CQI reports heard in the clear.
+    pub he_bfi: u64,
+    /// NDP announcements — the sounding trigger. Non-zero with zero `*_bfi`
+    /// means the access points sound and nobody answers unprotected.
+    pub ndpa: u64,
+    pub malformed: u64,
+    pub rows_written: u64,
+    pub distinct_transmitters: u64,
+    /// `true` when the transmitter table hit `census.max_transmitters`, so
+    /// `distinct_transmitters` is a floor rather than a count.
+    pub distinct_capped: bool,
+    /// Busiest transmitters by `addr2`, descending.
+    pub top: Vec<TransmitterCount>,
+    /// Beacons per BSSID — the access points on this channel, by their own
+    /// announcement, for the whole session.
+    pub beacons: Vec<TransmitterCount>,
+}
+
+/// The channel survey taken on the management radio, at open and at close.
+///
+/// `at_close` is absent on a session that did not reach a clean close, and on
+/// every sidecar written before surveys existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurveyMeta {
+    pub interface: String,
+    pub at_open: crate::survey::Survey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_close: Option<crate::survey::Survey>,
 }
 
 /// What the radio was allowed to report (IP-139 Phase 3, C3).
@@ -272,6 +342,9 @@ pub struct SummaryMeta {
     /// the same mistake as reading a frame rate as a CSI rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transmitters: Option<TransmitterCensus>,
+    /// Frame census — present only when `[census].enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<CensusSummary>,
     /// Node and host state through the session (IP-139 Phase 6).
     ///
     /// Empty when sampling is disabled or the session was too short for a tick.
@@ -482,6 +555,13 @@ pub struct Sidecar {
     /// Present only when time transfer is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timesync: Option<TimesyncMeta>,
+    /// Present only when the frame census is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<CensusMeta>,
+    /// Present only when the channel survey is enabled. `at_open` is written
+    /// with the open-time sidecar; `at_close` lands with the close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub survey: Option<SurveyMeta>,
     /// What the radio was allowed to report.
     ///
     /// `serde(default)` for the same reason as `environment.build`: the whole
@@ -517,6 +597,7 @@ fn resolve_run_id(session_id: &str) -> (String, bool) {
 
 impl Sidecar {
     /// Build the open-time sidecar for a session.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         dir: &Path,
         session_id: String,
@@ -524,12 +605,20 @@ impl Sidecar {
         global: &GlobalConfig,
         tuning: &Tuning,
         achieved: Option<&crate::radio::Achieved>,
+        link: Option<&crate::radio::ObservedLink>,
+        survey_open: Option<crate::survey::Survey>,
     ) -> Result<Self> {
         let (run_id, run_id_generated) = resolve_run_id(&session_id);
 
         let radio = RadioMeta {
             interface: cfg.radio.interface.clone(),
-            monitor: cfg.radio.monitor.clone(),
+            // An associated capture has no monitor interface; an empty name
+            // says so rather than naming one that was never created.
+            monitor: if link.is_some() {
+                String::new()
+            } else {
+                cfg.radio.monitor.clone()
+            },
             band: band_label(tuning.band).to_string(),
             channel: cfg.radio.channel,
             control_freq_mhz: tuning.freq,
@@ -540,7 +629,23 @@ impl Sidecar {
             achieved_control_freq_mhz: achieved.and_then(|a| a.control_freq_mhz),
             achieved_width_mhz: achieved.and_then(|a| a.width_mhz),
             achieved_center_freq_mhz: achieved.and_then(|a| a.center_freq_mhz),
+            observed: link.is_some(),
+            bssid: link.map(|l| l.bssid.clone()),
+            ssid: link.and_then(|l| l.ssid.clone()),
         };
+
+        let census = cfg.census.enabled.then(|| CensusMeta {
+            artefact: crate::census::NDJSON_NAME.to_string(),
+            schema: crate::census::SCHEMA.to_string(),
+            top_n: cfg.census.top_n,
+            max_transmitters: cfg.census.max_transmitters,
+        });
+
+        let survey = survey_open.map(|at_open| SurveyMeta {
+            interface: cfg.survey.interface.clone(),
+            at_open,
+            at_close: None,
+        });
 
         let inject = (cfg.capture.mode == "inject").then(|| InjectMeta {
             rate_hz: cfg.inject.rate_hz,
@@ -594,6 +699,8 @@ impl Sidecar {
             inject,
             ble,
             timesync,
+            census,
+            survey,
             filter: FilterMeta::resolve(cfg),
             environment: capture_environment(global, &cfg.radio.interface),
             started_at: rfc3339_utc(util::now_unix()),
@@ -604,6 +711,15 @@ impl Sidecar {
         };
         sc.write()?;
         Ok(sc)
+    }
+
+    /// Attach the close-time survey. A no-op on a session that took none at
+    /// open — one survey without its pair would invite a comparison that was
+    /// never made.
+    pub fn set_survey_close(&mut self, at_close: crate::survey::Survey) {
+        if let Some(s) = self.survey.as_mut() {
+            s.at_close = Some(at_close);
+        }
     }
 
     /// Finalise the sidecar **in memory only** — no I/O.

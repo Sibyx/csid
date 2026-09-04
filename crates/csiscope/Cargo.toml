@@ -30,7 +30,7 @@ harness = false
 # `csid` rather than re-deriving the schema is deliberate: the console must
 # reject an impossible capture exactly the way `csid validate` does.
 csiq = { workspace = true }
-csid = { path = "../csid", version = "0.2.0" }
+csid = { path = "../csid", version = "0.3.0" }
 
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

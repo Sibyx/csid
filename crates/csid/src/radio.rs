@@ -263,6 +263,69 @@ pub fn tune(monitor: &str, t: &Tuning) -> Result<Achieved> {
     Ok(achieved)
 }
 
+/// What an associated (STA-mode) interface is tuned to, read off the link.
+///
+/// STA-mode capture commands nothing: the access point owns the channel and
+/// the width, so both are **observed** here and recorded as such. `None` when
+/// the interface is not associated — which `[sta].require_assoc` turns into a
+/// setup failure, because an empty capture that looks like a quiet channel is
+/// the failure mode this fleet already knows.
+#[derive(Debug, Clone)]
+pub struct ObservedLink {
+    pub bssid: String,
+    pub ssid: Option<String>,
+    pub tuning: Tuning,
+    pub width_mhz: u32,
+}
+
+/// Read the association of `iface`. Best effort on the link text, strict on
+/// the outcome: an associated interface whose channel this build cannot name
+/// is an error, not a guess.
+pub fn read_link(iface: &str) -> Result<Option<ObservedLink>> {
+    let link_text = crate::util::run_opt("iw", &["dev", iface, "link"]).unwrap_or_default();
+    let link = crate::survey::parse_link(&link_text);
+    if !link.connected {
+        return Ok(None);
+    }
+    let bssid = link
+        .bssid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{iface} reports a connection with no BSSID"))?;
+    let info = read_achieved(iface);
+    let freq = link.freq_mhz.or(info.control_freq_mhz).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{iface} is associated but neither `iw link` nor `iw info` names its frequency"
+        )
+    })?;
+    let (band, _channel) = caps::freq_to_channel(freq).ok_or_else(|| {
+        anyhow::anyhow!("{iface} is on {freq} MHz, which is not a channel this build knows")
+    })?;
+    // `iw info` on a managed interface prints the same channel line as on a
+    // monitor, so the width readback is shared. A link that names no width is
+    // read as 20 MHz, which is what a legacy association is.
+    let width_mhz = info.width_mhz.unwrap_or(20);
+    let width =
+        WidthCfg::from_observed(width_mhz, freq, info.center_freq_mhz).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{iface} reports a {width_mhz} MHz link this build has no width token for"
+            )
+        })?;
+    Ok(Some(ObservedLink {
+        bssid,
+        ssid: link.ssid,
+        tuning: Tuning {
+            band,
+            freq,
+            center: width
+                .needs_center()
+                .then_some(info.center_freq_mhz)
+                .flatten(),
+            width,
+        },
+        width_mhz,
+    }))
+}
+
 /// Current regulatory domain (best effort, for the sidecar).
 pub fn regdomain() -> Option<String> {
     let out = crate::util::run_opt("iw", &["reg", "get"])?;
