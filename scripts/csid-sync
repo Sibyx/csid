@@ -12,13 +12,13 @@
 #   CSID_HOSTNAME        node name used in the key     (default `hostname`)
 #   CSID_S3_ENDPOINT     S3 endpoint URL
 #   CSID_S3_BUCKET       bucket
-#   CSID_S3_PREFIX       key prefix                    (default datasets/ax210-csi-captures)
+#   CSID_S3_PREFIX       key prefix                    (default captures/v2)
 #   CSID_S3_ACCESS_KEY   / CSID_S3_SECRET_KEY
 set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
 HOST="${CSID_HOSTNAME:-$(hostname)}"
-PREFIX="${CSID_S3_PREFIX:-datasets/ax210-csi-captures}"
+PREFIX="${CSID_S3_PREFIX:-captures/v2}"
 BUCKET="${CSID_S3_BUCKET:?CSID_S3_BUCKET is required}"
 
 command -v rclone >/dev/null || { echo "csid-sync: rclone not installed" >&2; exit 1; }
@@ -31,8 +31,91 @@ export RCLONE_CONFIG_S3_ENDPOINT="${CSID_S3_ENDPOINT:?CSID_S3_ENDPOINT is requir
 export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${CSID_S3_ACCESS_KEY:?CSID_S3_ACCESS_KEY is required}"
 export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${CSID_S3_SECRET_KEY:?CSID_S3_SECRET_KEY is required}"
 
+# ── The v2 key (IP-156) ──────────────────────────────────────────────────────
+#
+# The old key was `${PREFIX}/${HOST}/${session}/`: two levels, then a 40-char
+# opaque directory. Nothing between, so every consumer listed the whole prefix
+# to find anything, and every measurement parameter lived in a free-text profile
+# slug (`hires-listen-44-160`, `illum-rate48-025`) that nothing parsed.
+#
+# v2 puts the facets in the path. All of them are already in the sidecar, which
+# is on disk before this script runs, so this needs no new plumbing:
+#
+#   captures/v2/dt=/band=/channel=/width=/role=/host=/run=/session=[/segment=]
+#
+# `dt` FIRST, and it is the SESSION's start date even on a segment sidecar
+# (csid writes the session's `started_at` into every segment's metadata.json).
+# That is deliberate: a run crossing midnight stays in one partition, and `dt`
+# first bounds the skew of `channel`, where two values carry 82% of the corpus.
+#
+# `session=` with `segment=` beneath it makes one session ONE prefix. In v1 a
+# segment directory was a SIBLING of its session, which is why a segment sidecar
+# reporting `<base>-segNNNN` as its own `session_id` was able to confuse readers.
+#
+# `role` comes from the PROFILE IN THIS SESSION'S OWN SIDECAR, and deliberately
+# not from the environment.
+#
+# An earlier cut read `CSID_ROLE` out of `/etc/csid/run.env`. That is wrong and
+# it is worth saying why, because it looks right: this script ships a BACKLOG.
+# It runs on a 15-minute timer, it retries what failed, and a node that was
+# offline catches up days later. The environment holds the arm running NOW, so
+# any session shipped after the next arm started would be stamped with the new
+# arm's role. The sidecar is the only per-session source there is.
+#
+# `inject_sent` is NOT used here and must not be: it counts frames handed to
+# the driver, and on ch6/ch11 37 of 73 ladder steps delivered nothing at any
+# receiver while it read full.
+#
+# The profile prefix is the same rule the historical corpus is labelled by, so
+# both eras carry one provenance class: an arm's declaration, never a counter.
+# It is an inference, and the proper fix is csid recording the role in the
+# sidecar (`csid-session/2`). Until then the index records `role_source` so a
+# reader can tell an inferred label from a recorded one.
+v2_key() {
+    local dir="$1" session="$2"
+    local meta="$dir/metadata.json"
+    local base seg dt band chan width role run profile
+
+    base="${session%-seg[0-9][0-9][0-9][0-9]}"
+    seg=""
+    [[ "$session" != "$base" ]] && seg="${session##*-seg}"
+
+    dt="$(jq -r '.started_at // empty' "$meta" | cut -dT -f1)"
+    band="$(jq -r '.radio.band // "unknown"' "$meta")"
+    chan="$(jq -r '.radio.channel // "unknown"' "$meta")"
+    width="$(jq -r '.radio.width // "unknown"' "$meta")"
+    run="$(jq -r '.run_id // empty' "$meta")"
+    profile="$(jq -r '.experiment // empty' "$meta")"
+
+    # A capture with no start date has nothing to partition on. Refuse rather
+    # than invent one: `dt=unknown` would collect every broken sidecar in one
+    # directory and hide the fault.
+    [[ -n "$dt" ]] || return 1
+
+    # July's captures predate the run tag. `unassigned` is honest and greppable;
+    # a generated id would look like a plan entry that never existed.
+    [[ -n "$run" ]] || run="unassigned"
+
+    # From THIS session's sidecar. Never from the environment — see above.
+    role="$(jq -r '.role // empty' "$meta")"
+    if [[ -z "$role" ]]; then
+        case "$profile" in
+            illum*) role="illuminator" ;;
+            *)      role="observer" ;;
+        esac
+    fi
+
+    printf '%s/dt=%s/band=%s/channel=%s/width=%s/role=%s/host=%s/run=%s/session=%s' \
+        "$PREFIX" "$dt" "$band" "$chan" "$width" "$role" "$HOST" "$run" "$base"
+    [[ -n "$seg" ]] && printf '/segment=%s' "$seg"
+    printf '/'
+}
+
+command -v jq >/dev/null || { echo "csid-sync: jq not installed (needed for the v2 key)" >&2; exit 1; }
+
 shipped=0
 failed=0
+skipped=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
     session="$(basename "$dir")"
@@ -45,7 +128,14 @@ for dir in "$SPOOL"/*/; do
     # Already shipped.
     [[ -f "$dir/.synced" ]] && continue
 
-    dest="s3:${BUCKET}/${PREFIX}/${HOST}/${session}/"
+    if ! key="$(v2_key "$dir" "$session")"; then
+        # Unshippable, and NOT a failure: retrying cannot fix a sidecar with no
+        # start date, so counting it as failed would make the timer red forever.
+        echo "csid-sync: SKIP $session (no started_at in metadata.json)" >&2
+        skipped=$((skipped + 1))
+        continue
+    fi
+    dest="s3:${BUCKET}/${key}"
     echo "csid-sync: shipping $session -> $dest"
     if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
         date -Is > "$dir/.synced"
@@ -57,5 +147,5 @@ for dir in "$SPOOL"/*/; do
     fi
 done
 
-echo "csid-sync: $shipped shipped, $failed failed"
+echo "csid-sync: $shipped shipped, $failed failed, $skipped skipped"
 [[ $failed -eq 0 ]]
