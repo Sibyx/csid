@@ -671,13 +671,13 @@ pub fn detrend_into(unwrapped: &[f32], spacing_hz: f64, out: &mut Vec<f32>) -> D
         return Detrend::default();
     }
     let nf = n as f64;
-    let mean_x = (nf - 1.0) / 2.0;
+    let mean_x = (0..n).map(|i| crate::tones::tone_index(i, n)).sum::<f64>() / nf;
     let mean_y = unwrapped.iter().map(|&v| v as f64).sum::<f64>() / nf;
 
     let mut sxy = 0.0f64;
     let mut sxx = 0.0f64;
     for (i, &y) in unwrapped.iter().enumerate() {
-        let dx = i as f64 - mean_x;
+        let dx = crate::tones::tone_index(i, n) - mean_x;
         sxy += dx * (y as f64 - mean_y);
         sxx += dx * dx;
     }
@@ -686,7 +686,7 @@ pub fn detrend_into(unwrapped: &[f32], spacing_hz: f64, out: &mut Vec<f32>) -> D
 
     out.resize(n, 0.0);
     for (i, (o, &y)) in out.iter_mut().zip(unwrapped).enumerate() {
-        *o = y - (slope * i as f64 + intercept) as f32;
+        *o = y - (slope * crate::tones::tone_index(i, n) + intercept) as f32;
     }
 
     // φ(k) = −2π·τ·k·Δf  ⇒  τ = −slope / (2π·Δf).
@@ -829,7 +829,7 @@ pub fn cir_into(
     out.rms_delay_ns = 0.0;
 
     let n = h.len();
-    if n < 4 || nfft < n || spacing_hz <= 0.0 {
+    if n < 4 || spacing_hz <= 0.0 || (nfft as f64) < crate::tones::occupied_span_hz(n, 1.0) {
         return;
     }
 
@@ -840,7 +840,15 @@ pub fn cir_into(
     // [−BW/2, +BW/2] but the FFT expects DC first.
     let half = n / 2;
     for (i, (&c, &w)) in h.iter().zip(window.iter()).enumerate() {
-        let k = (i + nfft - half) % nfft;
+        // Used tones omit DC and, on wider PHYs, adjacent nulls. Place
+        // each on its physical FFT bin; concatenating the two runs shifts
+        // the positive half of the band and biases a planted delay.
+        let signed = if crate::tones::grid(n) == crate::tones::Grid::Dot11 {
+            crate::tones::tone_index(i, n) as isize
+        } else {
+            i as isize - half as isize
+        };
+        let k = signed.rem_euclid(nfft as isize) as usize;
         buf[k] = c * w;
     }
 
@@ -880,7 +888,7 @@ pub fn cir_into(
     // Resolution is set by the OCCUPIED BANDWIDTH, which is what the delivered
     // tones span — never by `nfft`, which only decides how finely the same
     // information is interpolated.
-    out.resolution_ns = (1e9 / (n as f64 * spacing_hz)) as f32;
+    out.resolution_ns = (1e9 / crate::tones::occupied_span_hz(n, spacing_hz)) as f32;
     out.axis_start_ns = -(lead as f64 * bin_s * 1e9) as f32;
     out.peak_index = lead;
     out.peak_bin = peak_bin;
@@ -1866,8 +1874,8 @@ pub fn metronome_into(
     let commanded = 1e6 / slot_us;
     let deficit = (1.0 - out.delivered_hz as f64 / commanded).clamp(0.0, 1.0) as f32;
     let declared = out.slot_source == "declared";
-    let credible = declared
-        || (out.verdict() != "irregular" && deficit <= INFERRED_DEFICIT_CEILING);
+    let credible =
+        declared || (out.verdict() != "irregular" && deficit <= INFERRED_DEFICIT_CEILING);
     if credible {
         out.commanded_hz = Some(commanded as f32);
         out.deficit = Some(deficit);
@@ -2051,7 +2059,10 @@ mod spacing_tests {
     /// override — a labelled HE record is 78.125 kHz whatever its width.
     #[test]
     fn a_phy_label_still_wins() {
-        assert_eq!(spacing_hz(&bare(242, he(2), Some(Bandwidth::W80))), 78_125.0);
+        assert_eq!(
+            spacing_hz(&bare(242, he(2), Some(Bandwidth::W80))),
+            78_125.0
+        );
     }
 
     /// The ambiguity the old fallback got wrong. 242 tones is HE20 *or* VHT80,
@@ -2076,12 +2087,16 @@ mod spacing_tests {
     #[test]
     fn the_common_geometries_resolve_correctly() {
         for (ntone, bw, want) in [
-            (52u16, Bandwidth::W20, 312_500.0),  // legacy / HT20
-            (996, Bandwidth::W80, 78_125.0),     // HE80
-            (484, Bandwidth::W160, 312_500.0),   // VHT160
-            (1992, Bandwidth::W160, 78_125.0),   // HE160
+            (52u16, Bandwidth::W20, 312_500.0), // legacy / HT20
+            (996, Bandwidth::W80, 78_125.0),    // HE80
+            (484, Bandwidth::W160, 312_500.0),  // VHT160
+            (1992, Bandwidth::W160, 78_125.0),  // HE160
         ] {
-            assert_eq!(spacing_hz(&bare(ntone, None, Some(bw))), want, "{ntone} @ {bw}");
+            assert_eq!(
+                spacing_hz(&bare(ntone, None, Some(bw))),
+                want,
+                "{ntone} @ {bw}"
+            );
         }
     }
 
@@ -2261,7 +2276,10 @@ mod tests {
         let spacing = 312_500.0f64;
         let tau = 40e-9f64;
         let raw: Vec<f32> = (0..56)
-            .map(|k| (-2.0 * std::f64::consts::PI * tau * k as f64 * spacing) as f32)
+            .map(|i| {
+                (-2.0 * std::f64::consts::PI * tau * crate::tones::tone_index(i, 56) * spacing)
+                    as f32
+            })
             .collect();
         let (residual, d) = detrend(&raw, spacing);
         assert!(
@@ -2282,7 +2300,7 @@ mod tests {
         let h: Vec<Complex32> = (0..n)
             .map(|i| {
                 // Frequency offset from band centre.
-                let k = i as f64 - n as f64 / 2.0;
+                let k = crate::tones::tone_index(i, n);
                 let ph = -2.0 * std::f64::consts::PI * tau * k * spacing;
                 Complex32::new(ph.cos() as f32, ph.sin() as f32)
             })
@@ -2305,12 +2323,39 @@ mod tests {
             "a peak-aligned axis starts before the peak"
         );
         // Resolution is 1/B and has nothing to do with `nfft`.
-        let expected_res = 1e9 / (h.len() as f64 * spacing);
+        let expected_res = 1e9 / crate::tones::occupied_span_hz(h.len(), spacing);
         assert!((c.resolution_ns as f64 - expected_res).abs() < 1e-6);
         assert!(
             c.resolution_ns > c.bin_ns * 8.0,
             "zero-padding interpolates; it must not be reported as resolution"
         );
+    }
+
+    #[test]
+    fn physical_tone_grids_recover_signed_delays_without_filling_dc_with_signal() {
+        // Explicit standard used-tone runs, independent of the mapping under
+        // test. Plant a delay exactly on an FFT bin for each geometry.
+        for (lo, hi) in [(1, 26), (1, 28), (2, 58), (2, 122), (3, 244), (3, 500)] {
+            for sign in [-1.0, 1.0] {
+                let spacing = 312_500.0;
+                let nfft = 2048;
+                let tau = sign * 80.0 / (nfft as f64 * spacing);
+                let ks: Vec<i32> = (-hi..=-lo).chain(lo..=hi).collect();
+                let phase: Vec<f32> = ks
+                    .iter()
+                    .map(|&k| (-2.0 * std::f64::consts::PI * tau * k as f64 * spacing) as f32)
+                    .collect();
+                let h: Vec<Complex32> = phase
+                    .iter()
+                    .map(|&p| Complex32::from_polar(1.0, p))
+                    .collect();
+                let c = cir(&h, spacing, nfft, 128);
+                assert_eq!(c.peak_bin, if sign > 0.0 { 80 } else { nfft - 80 });
+                let (residual, fit) = detrend(&phase, spacing);
+                assert!((fit.tau_ns as f64 - tau * 1e9).abs() < 0.001);
+                assert!(residual.iter().all(|v| v.abs() < 0.0001));
+            }
+        }
     }
 
     #[test]
@@ -2650,7 +2695,11 @@ mod tests {
         assert!(deficit < 0.01, "deficit {deficit}");
         assert!(m.quantised);
         assert_eq!(m.verdict(), "on grid");
-        assert!(m.multiples[0] > 0.99, "all mass at 1x: {:?}", &m.multiples[..4]);
+        assert!(
+            m.multiples[0] > 0.99,
+            "all mass at 1x: {:?}",
+            &m.multiples[..4]
+        );
         assert_eq!(m.longest_run, 0);
     }
 
@@ -2942,7 +2991,12 @@ mod tests {
 
         // Two "packets" differing only by a common offset give the same ratio.
         for t in 0..ntone {
-            assert!((p1[t] - p2[t]).abs() < 0.05, "tone {t}: {} vs {}", p1[t], p2[t]);
+            assert!(
+                (p1[t] - p2[t]).abs() < 0.05,
+                "tone {t}: {} vs {}",
+                p1[t],
+                p2[t]
+            );
             assert!((a1[t] - a2[t]).abs() < 0.5, "tone {t}");
         }
         // |H_a/H_b| = 600/300 = 2, i.e. +6 dB.
@@ -2997,12 +3051,22 @@ mod tests {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut out = ToneStats::default();
         tone_stats_into(
-            &columns, ntone, &mut med, &mut spread, &mut nulls, &mut scratch, &mut out,
+            &columns,
+            ntone,
+            &mut med,
+            &mut spread,
+            &mut nulls,
+            &mut scratch,
+            &mut out,
         );
 
         assert_eq!(out.n, cols);
         assert_eq!(out.max_spread_tone, 3);
-        assert!((out.max_spread_db - 6.0).abs() < 0.1, "{}", out.max_spread_db);
+        assert!(
+            (out.max_spread_db - 6.0).abs() < 0.1,
+            "{}",
+            out.max_spread_db
+        );
         assert_eq!(out.null_tones, 1);
         assert_eq!(nulls[7], 1.0);
         assert!(nulls[3] == 0.0);

@@ -304,6 +304,11 @@ export class Heatmap {
     if (name === this.rampName) return;
     this.rampName = name;
     this.lut = ramp(name);
+    if (this.values) {
+      for (let slot = 0; slot < this.depth; slot++) {
+        if (this.valid[slot]) this.paintLine(this.values.subarray(slot * this.bins, (slot + 1) * this.bins), slot);
+      }
+    }
   }
 
   /** (Re)allocate the offscreen buffer when the data width changes. */
@@ -312,6 +317,8 @@ export class Heatmap {
     this.bins = bins;
     this.cursor = 0;
     this.filled = 0;
+    this.values = new Uint8Array(bins * this.depth);
+    this.valid = new Uint8Array(this.depth);
     this.buf = document.createElement('canvas');
     if (this.axis === 'row') { this.buf.width = bins; this.buf.height = this.depth; }
     else { this.buf.width = this.depth; this.buf.height = bins; }
@@ -327,19 +334,25 @@ export class Heatmap {
   push(bytes, rows, bins) {
     if (!bins || !rows) return;
     this.resize(bins);
-    const d = this.line.data;
     for (let r = 0; r < rows; r++) {
       const off = r * bins;
-      for (let i = 0; i < bins; i++) {
-        const v = bytes[off + i] * 3;
-        const p = i * 4;
-        d[p] = this.lut[v]; d[p + 1] = this.lut[v + 1]; d[p + 2] = this.lut[v + 2]; d[p + 3] = 255;
-      }
-      if (this.axis === 'row') this.bctx.putImageData(this.line, 0, this.cursor);
-      else this.bctx.putImageData(this.line, this.cursor, 0);
+      const line = bytes.subarray(off, off + bins);
+      this.values.set(line, this.cursor * bins);
+      this.valid[this.cursor] = 1;
+      this.paintLine(line, this.cursor);
       this.cursor = (this.cursor + 1) % this.depth;
       this.filled = Math.min(this.filled + 1, this.depth);
     }
+  }
+
+  paintLine(bytes, slot) {
+    const d = this.line.data;
+    for (let i = 0; i < this.bins; i++) {
+      const v = bytes[i] * 3, p = i * 4;
+      d[p] = this.lut[v]; d[p + 1] = this.lut[v + 1]; d[p + 2] = this.lut[v + 2]; d[p + 3] = 255;
+    }
+    if (this.axis === 'row') this.bctx.putImageData(this.line, 0, slot);
+    else this.bctx.putImageData(this.line, slot, 0);
   }
 
   /** Blit the buffer so the newest line sits at the leading edge. */
@@ -364,12 +377,17 @@ export class Heatmap {
     const W = this.c.width, H = this.c.height;
     const tail = this.depth - this.cursor;
     if (this.axis === 'row') {
-      // Newest at the top: draw [cursor..depth) then [0..cursor).
+      // The circular buffer is chronological, oldest first. Flip that order
+      // vertically so the most recent row really is at the top.
+      ctx.save();
+      ctx.translate(0, H);
+      ctx.scale(1, -1);
       const th = Math.round((tail / this.depth) * H);
       ctx.drawImage(this.buf, 0, this.cursor, this.bins, tail, 0, 0, W, th);
       if (this.cursor > 0) {
         ctx.drawImage(this.buf, 0, 0, this.bins, this.cursor, 0, th, W, H - th);
       }
+      ctx.restore();
     } else {
       // Newest at the right.
       const tw = Math.round((tail / this.depth) * W);
@@ -386,6 +404,20 @@ export class Heatmap {
     this.bctx.fillRect(0, 0, this.buf.width, this.buf.height);
     this.cursor = 0;
     this.filled = 0;
+    this.valid.fill(0);
+  }
+
+  /** A missing interval is a blank seam, never an invented measurement. */
+  gap() {
+    if (!this.bctx) return;
+    this.bctx.fillStyle = '#05070a';
+    for (let i = 0; i < 2; i++) {
+      this.valid[this.cursor] = 0;
+      if (this.axis === 'row') this.bctx.fillRect(0, this.cursor, this.bins, 1);
+      else this.bctx.fillRect(this.cursor, 0, 1, this.bins);
+      this.cursor = (this.cursor + 1) % this.depth;
+    }
+    this.filled = Math.min(this.depth, this.filled + 2);
   }
 }
 

@@ -15,7 +15,7 @@
 // from a packet rate that moved — each of those was a number rendered where a
 // sentence belonged.
 
-import { Panel, Heatmap, drawRampLegend, ramp, rampColor, CATEGORICAL, THEME } from '/plot.js';
+import { Panel, Heatmap, drawRampLegend, ramp, rampColor, CATEGORICAL, THEME } from './plot.js';
 
 const $ = (id) => document.getElementById(id);
 const el = (sel, root = document) => root.querySelector(sel);
@@ -23,7 +23,7 @@ const el = (sel, root = document) => root.querySelector(sel);
 /** Set a readout's short text and keep the long version in its tooltip. */
 function readout(id, html, tip) {
   const n = $(id);
-  n.innerHTML = html;
+  if (n.innerHTML !== html) n.innerHTML = html;
   n.title = tip || n.textContent;
 }
 
@@ -111,7 +111,7 @@ function kv(node, pairs) {
 }
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const r = await fetch(new URL(path.replace(/^\//, ''), location.href), opts);
   const body = await r.json().catch(() => ({ error: `${r.status} ${r.statusText}` }));
   if (!r.ok) throw new Error(body.error || `${r.status}`);
   return body;
@@ -155,6 +155,11 @@ const S = {
   scaledFor: null,        // geometry the waterfall colour window was fitted to
   manualScale: false,     // the operator moved a dB slider; stop refitting
   renderErrorShown: false,
+  public: document.body.dataset.public === 'true',
+  scopeKey: null,
+  historyFrame: null,
+  dopplerRecord: null,
+  reconnects: 0,
 };
 
 // ------------------------------------------------------------------- panels
@@ -202,7 +207,7 @@ function pctSignal(arr, q) {
 
 // -- waterfall ----------------------------------------------------------------
 
-function renderWaterfall(f) {
+function renderWaterfall(f, append = true) {
   const { h, b } = f;
   const n = h.waterfall.bins;
   const all = h.waterfall.scope === 'all';
@@ -210,14 +215,14 @@ function renderWaterfall(f) {
   // of a fixed width, so it has to start over rather than tear.
   if (S.wfWidth !== n) { S.wfWidth = n; heat.waterfall.clear(); }
   heat.waterfall.setRamp(S.ramp);
-  heat.waterfall.push(b.waterfall, h.wf_rows, n);
+  if (append) heat.waterfall.push(b.waterfall, h.wf_rows, n);
   heat.waterfall.render();
 
   drawRampLegend(el('canvas.legend', $('p-waterfall')), S.ramp,
     S.settings.db_min, S.settings.db_max, 'dB');
   el('.sub', $('p-waterfall')).textContent = all
-    ? '|H| in dB · frequency across the channel (x) × time (y, newest at top) · all classes'
-    : '|H| in dB · subcarrier (x) × time (y, newest at top)';
+    ? '|H| dB · frequency (x) × displayed records (y, newest top; uneven time) · all classes'
+    : '|H| dB · subcarrier (x) × displayed records (y, newest top; uneven time)';
 
   // The waterfall cannot show 600 lines a second at 20 frames a second; saying
   // how much it skipped is the difference between a display and a claim.
@@ -338,7 +343,8 @@ function renderPhase(f) {
                'removes the constant (CFO) and linear-in-subcarrier (SFO/STO) ' +
                'terms. Any genuinely linear part of the channel goes with it.',
   }[S.phaseMode];
-  readout('r-phase', `τ ${fmt(h.phase_fit.tau_ns, 1)} ns · ${S.phaseMode}`, explain);
+  readout('r-phase', `slope ${fmt(h.phase_fit.slope_rad_per_tone, 3)} rad/tone · ${S.phaseMode}`, explain +
+    ` Equivalent fitted delay ${fmt(h.phase_fit.tau_ns, 1)} ns includes receiver offsets; it is not time of flight.`);
 }
 
 // -- impulse response ---------------------------------------------------------
@@ -383,10 +389,11 @@ function renderCir(f) {
   p.seriesY(y, CATEGORICAL[0], 1.3, xs);
   p.rule('y', -20, THEME.AXIS, '−20 dB');
   p.note('delay from the strongest tap, ns →', 'bl');
-  p.note('power, dB below the strongest tap', 'tl');
+  p.note('power, dB below peak', 'tl');
   // Top-right, not bottom-right: the x-axis label already owns the bottom of
   // this panel and the two collided.
-  if (resNs > 0) p.note(`shaded = 1/B = ${fmt(resNs)} ns, one resolution cell`, 'tr');
+  // The 1/B label lives in the readout and tooltip, where it cannot collide
+  // with the power label on a narrow screen.
   p.end();
 
   // The spread is only a measurement while it exceeds what the bandwidth can
@@ -483,11 +490,12 @@ function renderTones(f) {
   if (!flat || !len || !tones.length) return;
 
   const lo = pctSignal(flat, 0.01) - 2, hi = pctSignal(flat, 0.99) + 2;
-  p.begin({ x0: 0, x1: len - 1, y0: lo, y1: hi, yfmt: (v) => v.toFixed(0) });
+  const time = a.series_time_s;
+  p.begin({ x0: time[0], x1: 0, y0: lo, y1: hi, yfmt: (v) => v.toFixed(0) });
   tones.forEach((_, i) => {
-    p.seriesY(flat.subarray(i * len, (i + 1) * len), CATEGORICAL[i % CATEGORICAL.length], 1.2);
+    p.seriesY(flat.subarray(i * len, (i + 1) * len), CATEGORICAL[i % CATEGORICAL.length], 1.2, time);
   });
-  p.note('← older    records    newer →', 'bl');
+  p.note('FTM seconds before newest record →', 'bl');
   p.note('|H| dB', 'tl');
   p.end();
 
@@ -512,11 +520,12 @@ function renderRssi(f) {
   // across a 2 dB window.
   const lo = Math.min(pct(flat, 0.02) - 3, -40);
   const hi = Math.max(pct(flat, 0.98) + 3, -30);
-  p.begin({ x0: 0, x1: len - 1, y0: lo, y1: hi, yfmt: (v) => v.toFixed(0) });
+  const time = a.series_time_s;
+  p.begin({ x0: time[0], x1: 0, y0: lo, y1: hi, yfmt: (v) => v.toFixed(0) });
   for (let c = 0; c < nc; c++) {
-    p.seriesY(flat.subarray(c * len, (c + 1) * len), CATEGORICAL[c % CATEGORICAL.length], 1.2);
+    p.seriesY(flat.subarray(c * len, (c + 1) * len), CATEGORICAL[c % CATEGORICAL.length], 1.2, time);
   }
-  p.note('← older    records    newer →', 'bl');
+  p.note('FTM seconds before newest record →', 'bl');
   p.note('dBm', 'tl');
   p.end();
 
@@ -531,7 +540,7 @@ function renderRssi(f) {
 
 const DOPPLER_FLOOR = -45;
 
-function renderDoppler(f) {
+function renderDoppler(f, append = true) {
   const { h, a } = f;
   const d = h.doppler;
   const y = a.doppler_db;
@@ -540,6 +549,7 @@ function renderDoppler(f) {
   // image rather than by drawing an empty axis.
   if (h.nulls && h.nulls.no_measurement) {
     heat.doppler.clear();
+    heat.doppler.render();
     S.dopplerAxis = null;
     readout('r-doppler', '<span class="bad">no measurement</span>',
       `Every one of the ${h.nulls.considered} records in this window arrived with ` +
@@ -559,6 +569,7 @@ function renderDoppler(f) {
   // 0.07 Hz wide sat beside bins 1.0 Hz wide under a single axis label.
   if (S.dopplerAxis !== d.fs_hz) {
     heat.doppler.clear();
+    S.dopplerRecord = null;
     S.dopplerAxis = d.fs_hz;
   }
 
@@ -571,8 +582,29 @@ function renderDoppler(f) {
     col[i] = Math.max(0, Math.min(255, Math.round(((v - DOPPLER_FLOOR) / -DOPPLER_FLOOR) * 255)));
   }
   heat.doppler.setRamp(S.ramp);
-  heat.doppler.push(col, 1, y.length);
+  // A shared analysis may be sent more than once. Repainting or an idle
+  // refresh is not another observation of the channel.
+  const record = `${h.stream.session_changes}:${h.record.ftm_ticks}`;
+  if (append && record !== S.dopplerRecord) {
+    heat.doppler.push(col, 1, y.length);
+    S.dopplerRecord = record;
+  }
   heat.doppler.render();
+  const ctx = heat.doppler.ctx;
+  const dpr = window.devicePixelRatio || 1;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textBaseline = 'middle';
+  const height = heat.doppler.c.height / dpr;
+  for (const [hz, at] of [[d.max_hz, 10], [0, height / 2], [-d.max_hz, height - 10]]) {
+    const label = `${hz > 0 ? '+' : ''}${fmt(hz, 1)} Hz`;
+    ctx.fillStyle = 'rgba(5,7,10,.85)';
+    ctx.fillRect(2, at - 7, ctx.measureText(label).width + 6, 14);
+    ctx.fillStyle = THEME.INK;
+    ctx.fillText(label, 5, at);
+  }
+  ctx.restore();
 
   drawRampLegend(el('canvas.legend', $('p-doppler')), S.ramp,
     DOPPLER_FLOOR, 0, 'dB rel. peak');
@@ -600,9 +632,9 @@ function renderDoppler(f) {
   // tooltip and the panel leads with the reason instead.
   // A speed is a frequency times a shift. When nobody agrees on the frequency
   // there is no speed to quote, whatever the sampling did.
-  const quantitative = trust === 'ok' && h.radio.freq_trusted;
+  const quantitative = trust === 'ok' && h.radio.freq_trusted && d.conjugate_pair;
   const speed = quantitative
-    ? `±${fmt(d.max_speed_ms, 2)} m/s`
+    ? `±${fmt(d.max_hz, 1)} Hz`
     : '<span class="dim">speed not quantitative</span>';
 
   const flags = [];
@@ -617,9 +649,9 @@ function renderDoppler(f) {
     `±${fmt(d.max_hz, 0)} Hz · ${speed} · ` +
     `<span class="${trust}">CV ${fmt(d.arrival_cv, 2)}</span>` +
     (flags.length ? ' · ' + flags.join(' ') : ''),
-    `Unambiguous range ±${fmt(d.max_hz, 0)} Hz, i.e. radial speeds up to ` +
+    `Sampling range ±${fmt(d.max_hz, 0)} Hz. Under a monostatic reflection model only, this corresponds to ` +
     `±${fmt(d.max_speed_ms, 2)} m/s at ${fmt(h.radio.freq_mhz, 0)} MHz ` +
-    `(v = λ·f_D/2). ` +
+    `(v = λ·f_D/2). A Wi-Fi link is bistatic: this is not a measured walking speed; geometry is required. ` +
     `The axis is pinned at ${fmt(d.fs_hz, 0)} Hz and held across columns, so the ` +
     'left of the image can be compared with the right; this window actually ' +
     `delivered ${fmt(d.fs_window_hz, 0)} Hz. Each column is a ` +
@@ -1406,6 +1438,15 @@ function renderStrip(f) {
 // -- the render loop ----------------------------------------------------------
 
 let dirty = false;
+const visiblePanels = new Set();
+const panelObserver = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (entry.isIntersecting) visiblePanels.add(entry.target.id);
+    else visiblePanels.delete(entry.target.id);
+  }
+  scheduleRender();
+}, { root: document.querySelector('main'), rootMargin: '100px' });
+document.querySelectorAll('.panel').forEach((p) => panelObserver.observe(p));
 
 function scheduleRender() {
   if (dirty) return;
@@ -1413,25 +1454,22 @@ function scheduleRender() {
   requestAnimationFrame(() => {
     dirty = false;
     const f = S.frame;
-    if (!f) return;
+    if (!f || document.hidden || !$('tab-scope').classList.contains('on')) return;
     try {
+      const append = S.historyFrame !== f;
+      S.historyFrame = f;
       renderStrip(f);
       renderCapture(f);
-      renderMetronome(f);
-      renderWaterfall(f);
-      renderSpectrum(f);
-      renderPhase(f);
-      renderCir(f);
-      renderDoppler(f);
-      renderConstellation(f);
-      renderChains(f);
-      renderTones(f);
-      renderRssi(f);
-      renderJitter(f);
-      renderClocks(f);
-      renderBandplan(f);
-      renderRatio(f);
-      renderToneStats(f);
+      // Keep history bounded and advancing even when a heatmap is offscreen.
+      renderWaterfall(f, append);
+      renderDoppler(f, append);
+      for (const [id, draw] of [
+        ['metronome', renderMetronome], ['spectrum', renderSpectrum],
+        ['phase', renderPhase], ['cir', renderCir], ['constellation', renderConstellation],
+        ['chains', renderChains], ['tones', renderTones], ['rssi', renderRssi],
+        ['jitter', renderJitter], ['clocks', renderClocks], ['bandplan', renderBandplan],
+        ['ratio', renderRatio], ['tonestats', renderToneStats],
+      ]) if (visiblePanels.has(`p-${id}`)) draw(f);
       renderTables(f);
     } catch (e) {
       // A render bug otherwise shows up as a frozen panel and nothing else —
@@ -1450,15 +1488,19 @@ function scheduleRender() {
 // -------------------------------------------------------------- live socket
 
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const url = new URL('ws', location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   S.ws = ws;
 
-  ws.onopen = () => setConn('live');
+  ws.onopen = () => setConn('waiting');
   ws.onclose = () => {
     setConn('offline');
-    setTimeout(connect, 1500);
+    // Keep the image and settings. A reconnect is a transport gap, not a
+    // new experiment. Mark the seam instead of silently starting from zero.
+    heat.waterfall.gap(); heat.doppler.gap();
+    setTimeout(connect, Math.min(15000, 1000 * 2 ** Math.min(S.reconnects++, 4)));
   };
   ws.onerror = () => setConn('offline');
 
@@ -1466,7 +1508,19 @@ function connect() {
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
       if (m.t === 'hello') {
-        S.settings = m.settings;
+        S.public = !!m.public;
+        const previous = S.settings;
+        S.settings = previous || m.settings;
+        S.awaitingSettings = !!previous;
+        if (previous) ws.send(JSON.stringify(previous));
+        S.reconnects = 0;
+        document.body.classList.toggle('public-view', S.public);
+        if (S.public) {
+          document.querySelectorAll('#rail input, #rail select, #btn-autoscale').forEach((n) => {
+            n.disabled = !['c-ramp', 'c-phase'].includes(n.id);
+            if (n.disabled) n.title = 'Shared public view: analysis settings are fixed to bound work on the recorder.';
+          });
+        }
         $('s-source').textContent = m.source;
         $('s-version').textContent = `csiscope ${m.csiscope_version} · csid ${m.csid_version}`;
         // Stated once, and always true: the console serves no route that
@@ -1475,13 +1529,25 @@ function connect() {
         syncControls();
       } else if (m.t === 'settings') {
         S.settings = m.settings;
+        S.awaitingSettings = false;
         syncControls();
       } else if (m.t === 'error') {
         toast(m.error, true);
       }
       return;
     }
+    // A server can emit its default view before acknowledging our restored
+    // selection. That transient frame must not reset the previous link history.
+    if (S.awaitingSettings) return;
     S.frame = decodeFrame(ev.data);
+    const h = S.frame.h;
+    const scope = `${h.stream.session_changes}:${h.class.key}:${h.transmitter.selected}:${h.geometry.chain}`;
+    if (S.scopeKey !== null && S.scopeKey !== scope) {
+      heat.waterfall.clear(); heat.doppler.clear();
+      S.dopplerRecord = null;
+      toast('Link or capture changed · history now describes the new scope');
+    }
+    S.scopeKey = scope;
     S.lastFrameAt = performance.now();
     setConn('live');
     fillClassSelect(S.frame.h.class);
@@ -1502,7 +1568,7 @@ function connect() {
  * The operator's own choice always wins: touching a dB slider disables this.
  */
 function autoScaleOnce(f) {
-  if (S.manualScale) return;
+  if (S.manualScale || S.public) return;
   const key = `${f.h.class.key}:${f.h.transmitter.selected}:${f.h.geometry.chain}`;
   if (key === S.scaledFor) return;
   const amp = f.a.amp_db;
@@ -1517,7 +1583,7 @@ function autoScaleOnce(f) {
 function setConn(state) {
   const c = $('conn');
   c.className = 'conn ' + (state === 'live' ? 'live' : state === 'stale' ? 'stale' : '');
-  c.textContent = state;
+  c.textContent = S.settings?.paused && S.ws?.readyState === 1 ? 'paused' : state;
 }
 
 // A live socket with no records looks exactly like a healthy one until you
@@ -1530,9 +1596,10 @@ setInterval(() => {
 }, 1000);
 
 function push(patch) {
-  if (!S.settings || !S.ws || S.ws.readyState !== 1) return;
+  if (!S.settings) return;
   S.settings = Object.assign({}, S.settings, patch);
-  S.ws.send(JSON.stringify(S.settings));
+  syncControls();
+  if (S.ws?.readyState === 1) S.ws.send(JSON.stringify(S.settings));
 }
 
 // -------------------------------------------------------------- rail controls
@@ -1679,13 +1746,17 @@ function wireRail() {
     const hi = Math.ceil(pctSignal(a, 0.995)) + 2;
     heat.waterfall.clear();
     S.manualScale = false;
-    S.scaledFor = `${S.frame.h.class.key}:${S.frame.h.geometry.chain}`;
+    S.scaledFor = `${S.frame.h.class.key}:${S.frame.h.transmitter.selected}:${S.frame.h.geometry.chain}`;
     push({ db_min: lo, db_max: hi });
     toast(`waterfall scaled to ${lo} … ${hi} dB`);
   };
 
-  $('btn-pause').onclick = () => push({ paused: !S.settings.paused });
+  $('btn-pause').onclick = () => { if (S.settings) push({ paused: !S.settings.paused }); };
   $('btn-present').onclick = togglePresent;
+  $('btn-settings').onclick = () => {
+    const open = document.body.classList.toggle('controls-open');
+    $('btn-settings').setAttribute('aria-expanded', String(open));
+  };
 }
 
 function togglePresent() {
@@ -1696,7 +1767,7 @@ function togglePresent() {
 
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-  if (e.key === ' ') { e.preventDefault(); push({ paused: !S.settings.paused }); }
+  if (e.key === ' ' && S.settings) { e.preventDefault(); push({ paused: !S.settings.paused }); }
   else if (e.key === 'p' || e.key === 'P') togglePresent();
   else if (e.key === 'a' || e.key === 'A') $('btn-autoscale').click();
   else if (e.key === 'Escape') document.body.classList.remove('present');
@@ -1836,9 +1907,46 @@ function wireNode() {
 
 // -------------------------------------------------------------------- boot
 
+// Contextual help is focusable, touchable and available without leaving a plot.
+function setupHelp() {
+  document.querySelectorAll('.panel').forEach((p) => {
+    const caption = p.querySelector('figcaption');
+    const text = p.dataset.help || p.querySelector('.sub')?.textContent;
+    if (!caption || !text) return;
+    const button = document.createElement('button');
+    button.className = 'help-tip';
+    button.type = 'button';
+    button.textContent = '?';
+    button.setAttribute('aria-label', `About ${p.querySelector('.title').textContent}`);
+    const tip = document.createElement('span');
+    tip.className = 'tip-content';
+    tip.id = `help-${p.id}`;
+    tip.role = 'tooltip';
+    tip.textContent = text;
+    button.setAttribute('aria-describedby', tip.id);
+    button.appendChild(tip);
+    button.onkeydown = (e) => { if (e.key === 'Escape') button.blur(); };
+    p.querySelector('.title').appendChild(button);
+  });
+  document.querySelectorAll('#rail .hint').forEach((hint) => {
+    const group = hint.closest('.rail-group');
+    group.querySelectorAll('input, select').forEach((control) => {
+      control.title = hint.textContent.trim();
+    });
+    hint.hidden = true;
+  });
+}
+
+setupHelp();
 setupPanels();
 wireRail();
 wireTabs();
 wireNode();
 connect();
 new ResizeObserver(() => scheduleRender()).observe(document.body);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    heat.waterfall.gap(); heat.doppler.gap();
+    scheduleRender();
+  }
+});

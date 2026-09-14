@@ -77,6 +77,7 @@ struct Scratch {
 
     tones: Vec<usize>,
     tone_series: Vec<f32>,
+    series_time_s: Vec<f32>,
     rssi_series: Vec<f32>,
     host_us: Vec<f32>,
     fw_us: Vec<f32>,
@@ -149,7 +150,6 @@ impl Analysis {
             doppler_fs: 0.0,
         }
     }
-
 
     /// Compute one tick's shared analysis. `None` when nothing has arrived.
     pub fn compute(&mut self, hub: &Hub, s: &ViewSettings) -> Option<SharedFrame> {
@@ -478,6 +478,16 @@ impl Analysis {
             }
         }
         sc.section.push("tone_series", &sc.tone_series);
+        // Relative FTM time is meaningful for bursty arrivals; array position
+        // is not a time axis. Zero is the newest measurement, never boot time.
+        let end_ticks = sc.window.last().map_or(0, |smp| smp.ftm_ticks);
+        sc.series_time_s.clear();
+        sc.series_time_s.extend(
+            sc.window
+                .iter()
+                .map(|smp| -csiq::ftm_to_seconds(end_ticks.saturating_sub(smp.ftm_ticks)) as f32),
+        );
+        sc.section.push("series_time_s", &sc.series_time_s);
 
         // -- RSSI, the only absolute amplitude anchor ------------------------
         let rssi_chains = rec.rssi.len().max(1);
@@ -486,7 +496,7 @@ impl Analysis {
         for c in 0..rssi_chains {
             for smp in &sc.window {
                 sc.rssi_series
-                    .push(smp.rec.rssi.get(c).copied().unwrap_or(0) as f32);
+                    .push(smp.rec.rssi.get(c).map_or(f32::NAN, |v| *v as f32));
             }
         }
         sc.section.push("rssi_series", &sc.rssi_series);
@@ -528,7 +538,8 @@ impl Analysis {
             &mut sc.metro_scratch,
             &mut sc.metronome,
         );
-        sc.section.push("metronome_multiples", &sc.metronome.multiples);
+        sc.section
+            .push("metronome_multiples", &sc.metronome.multiples);
 
         // -- per-tone behaviour ----------------------------------------------
         //
@@ -613,7 +624,10 @@ impl Analysis {
                 .fold(0.0f64, f64::max);
             (s.wf_bins, span.max(1.0))
         } else {
-            (geom.ntone, crate::tones::occupied_span_hz(geom.ntone, spacing))
+            (
+                geom.ntone,
+                crate::tones::occupied_span_hz(geom.ntone, spacing),
+            )
         };
 
         // -- mixes and the talker table ---------------------------------------
@@ -1390,7 +1404,6 @@ mod tests {
         serde_json::from_slice(&buf[4..4 + hlen]).unwrap()
     }
 
-
     /// The single null policy, measured end to end.
     ///
     /// One record in six is empty, exactly as the fleet delivers them. Every
@@ -1437,14 +1450,20 @@ mod tests {
         );
         assert!(!h["nulls"]["no_measurement"].as_bool().unwrap());
         let frac = h["nulls"]["frac"].as_f64().unwrap();
-        assert!((0.15..0.35).contains(&frac), "frac was {frac}, expected ~0.25");
+        assert!(
+            (0.15..0.35).contains(&frac),
+            "frac was {frac}, expected ~0.25"
+        );
 
         // The defect this policy exists to remove: a p05 pinned to a null.
         let arrays = |name: &str| {
             let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
             let (off, len) = {
                 let m = &h["f32"][name];
-                (m[0].as_u64().unwrap() as usize, m[1].as_u64().unwrap() as usize)
+                (
+                    m[0].as_u64().unwrap() as usize,
+                    m[1].as_u64().unwrap() as usize,
+                )
             };
             let base = 4 + hlen + off * 4;
             (0..len)
@@ -1502,7 +1521,10 @@ mod tests {
         }
         assert_eq!(seen.len(), 1, "the axis must not move on a wobble");
         let axis = f64::from_bits(*seen.iter().next().unwrap());
-        assert!(axis >= 21.3, "and it must never sit below the delivered rate");
+        assert!(
+            axis >= 21.3,
+            "and it must never sit below the delivered rate"
+        );
 
         // A genuine step up is followed at once: an axis below the delivered
         // Nyquist aliases, which is worse than a wide one.

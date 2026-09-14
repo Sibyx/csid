@@ -62,6 +62,26 @@ body {
   border-right: 1px solid var(--line);
 }
 .brand b { color: var(--accent); font-weight: 600; }
+.brand { text-decoration: none; }
+[hidden] { display: none !important; }
+.public-view [data-tab="node"], .public-view #tab-node { display: none !important; }
+.public-view #p-capture { display: none; }
+.help-tip {
+  margin-left: 6px; padding: 0 5px; font: 11px var(--mono);
+  border: 1px solid var(--line-2); background: transparent; color: var(--ink-dim);
+  cursor: help;
+}
+.help-tip:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.tip-content {
+  display: none; position: fixed; z-index: 100;
+  bottom: 42px; right: 18px; max-width: min(470px, calc(100vw - 36px));
+  padding: 14px 16px; border: 1px solid var(--accent-2);
+  background: var(--panel-2); color: var(--ink); white-space: normal;
+  font: 13px/1.55 var(--sans); text-align: left; letter-spacing: normal;
+}
+.help-tip:hover .tip-content, .help-tip:focus .tip-content { display: block; }
+input:disabled, select:disabled { opacity: .65; }
+#btn-settings { display: none; }
 
 .tabs { display: flex; border-right: 1px solid var(--line); }
 .tabs button {
@@ -134,7 +154,7 @@ main { flex: 1; min-width: 0; overflow: auto; }
   height: 216px;
 }
 .panel.span2 { grid-column: span 2; }
-.panel.tall  { grid-row: span 2; height: auto; min-height: 442px; }
+.panel.tall  { grid-row: span 2; height: 442px; }
 
 /* Two rows, never more: title + live readout, then the standing caption.
    Everything truncates rather than wrapping, so a panel's plot area never
@@ -149,13 +169,13 @@ main { flex: 1; min-width: 0; overflow: auto; }
   background: var(--panel-2);
 }
 .panel .title   { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
-.panel .readout { grid-column: 2; justify-self: end;
+.panel .readout { grid-column: 2; grid-row: 1; justify-self: end;
                   font: 10.5px var(--mono); color: var(--accent-2);
                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-.panel .sub     { grid-column: 1 / -1; font-size: 10px; color: var(--muted);
+.panel .sub     { grid-column: 1 / -1; grid-row: 2; font-size: 10px; color: var(--muted);
                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.panel canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+.panel canvas { flex: 1 1 0; width: 100%; height: 0; min-height: 0; display: block; }
 .panel canvas.legend { flex: none; height: 22px; padding: 0 8px 4px; }
 .panel .scroll { flex: 1; overflow: auto; min-height: 0; }
 
@@ -294,55 +314,23 @@ body.present .tile .v { font-size: 16px; }
 body.present .tile { min-width: 104px; }
 body.present #topbar { min-height: 54px; }
 
-/* -- the Help tab ---------------------------------------------------------
- *
- * Prose, so it obeys prose rules: a measure of about 70 characters, room
- * between paragraphs, and headings that are hierarchy rather than decoration.
- * The rest of this console is an instrument panel and is laid out as one; this
- * page is the only thing here anybody reads a sentence of.
- */
-.prose {
-  max-width: 72ch;
-  margin: 0;
-  padding: 4px 0 60px;
-  font-size: 13px;
-  line-height: 1.62;
-  color: var(--ink);
+/* A phone keeps the plots full-width; controls open as a separate drawer. */
+@media (max-width: 700px) {
+  #topbar { flex-wrap: wrap; }
+  .strip { display: none; }
+  .brand { padding: 10px; }
+  .actions { flex: 1; justify-content: flex-end; padding: 6px; gap: 6px; }
+  #btn-present { display: none; }
+  #btn-settings { display: inline-block; }
+  .tabs { order: 3; width: 100%; height: 32px; }
+  #shell { position: relative; }
+  #rail { display: none; }
+  .controls-open #rail { display: block; position: absolute; inset: 0 auto 0 0;
+    width: min(300px, 90vw); z-index: 20; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .panel.span2 { grid-column: auto; }
+  .panel.tall { grid-row: auto; height: 320px; }
+  .panel .title { font-size: 12px; }
+  #statusbar { overflow: hidden; white-space: nowrap; }
+  #statusbar #s-session, #statusbar #s-skip, #statusbar #s-version { display: none; }
 }
-.prose h2 {
-  margin: 34px 0 10px;
-  font-size: 15px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--accent);
-}
-.prose h2:first-child { margin-top: 0; }
-.prose h3 {
-  margin: 22px 0 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ink);
-}
-.prose p { margin: 0 0 12px; }
-.prose b { color: var(--ink); font-weight: 600; }
-.prose code {
-  font-family: var(--mono);
-  font-size: 0.92em;
-  color: var(--muted);
-}
-
-/* A definition list is the right shape for "panel -> what it shows", and it
- * keeps the panel name scannable while the explanation stays prose. */
-.glossary { margin: 0; }
-.glossary dt {
-  margin: 16px 0 3px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--accent);
-}
-.glossary dd {
-  margin: 0 0 0 18px;
-  color: var(--ink-dim);
-}
-.glossary dd p { margin: 8px 0 0; }
-.glossary dd b { color: var(--ink); }

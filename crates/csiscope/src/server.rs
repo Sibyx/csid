@@ -66,6 +66,12 @@ pub fn router(app: Shared) -> Router {
         .route("/plot.js", get(asset_plot))
         .route("/style.css", get(asset_css))
         .route("/ws", get(ws_upgrade))
+        // nginx exposes only these assets and this privacy-filtered socket.
+        .route("/public/", get(public_index))
+        .route("/public/app.js", get(asset_js))
+        .route("/public/plot.js", get(asset_plot))
+        .route("/public/style.css", get(asset_css))
+        .route("/public/ws", get(public_ws_upgrade))
         .route("/api/overview", get(overview))
         .route("/api/journal", get(journal))
         .route("/api/doctor", get(doctor))
@@ -140,7 +146,7 @@ const APP_JS: &str = include_str!("../ui/app.js");
 const PLOT_JS: &str = include_str!("../ui/plot.js");
 const STYLE_CSS: &str = include_str!("../ui/style.css");
 
-fn asset(content_type: &'static str, body: &'static str) -> Response {
+fn asset(content_type: &'static str, body: impl IntoResponse) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
@@ -156,6 +162,15 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 async fn index() -> Response {
     asset("text/html; charset=utf-8", INDEX_HTML)
 }
+async fn public_index() -> Response {
+    asset(
+        "text/html; charset=utf-8",
+        INDEX_HTML.replace(
+            "<body>",
+            "<body class=\"public-view\" data-public=\"true\">",
+        ),
+    )
+}
 async fn asset_js() -> Response {
     asset("text/javascript; charset=utf-8", APP_JS)
 }
@@ -170,7 +185,87 @@ async fn asset_css() -> Response {
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<Shared>) -> Response {
     ws.max_message_size(1 << 20)
-        .on_upgrade(move |socket| live(socket, app))
+        .on_upgrade(move |socket| live(socket, app, false))
+}
+
+// A public audience must not create unbounded work on a capturing Pi.
+static PUBLIC_CLIENTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
+async fn public_ws_upgrade(ws: WebSocketUpgrade, State(app): State<Shared>) -> Response {
+    let Ok(permit) = PUBLIC_CLIENTS.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Viewer capacity reached; retry shortly",
+        )
+            .into_response();
+    };
+    ws.max_message_size(4096)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            live(socket, app, true).await;
+        })
+}
+
+/// One bounded, shared analysis for public viewers. Pause affects delivery
+/// only; no browser can select an expensive new analysis or touch the radio.
+fn public_settings(paused: bool) -> ViewSettings {
+    ViewSettings {
+        fps: 5.0,
+        paused,
+        ..ViewSettings::default()
+    }
+}
+
+/// Project the wire header before any byte reaches a public socket. Keep the
+/// numerical payload unchanged and re-pad JSON for the Float32Array alignment.
+fn public_frame(bytes: &[u8]) -> Vec<u8> {
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    static ALIASES: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    let aliases = ALIASES.get_or_init(std::collections::hash_map::RandomState::new);
+    let n = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let mut h: serde_json::Value = serde_json::from_slice(&bytes[4..4 + n]).unwrap();
+    // These fields originate outside the typed numerical analysis. Never
+    // publish a config label, path, run identifier or arbitrary status string.
+    for key in [
+        "session_id",
+        "run_id",
+        "experiment",
+        "state",
+        "band",
+        "yield_note",
+    ] {
+        h["capture"][key] = json!("");
+    }
+    h["stream"]["source"] = json!("live CSI");
+    fn alias(v: &mut serde_json::Value, salt: &impl BuildHasher) {
+        if let Some(s) = v.as_str() {
+            *v = json!(format!("tx-{:016x}", salt.hash_one(s)));
+        }
+    }
+    alias(&mut h["record"]["src_mac"], aliases);
+    alias(&mut h["transmitter"]["selected"], aliases);
+    for key in ["talkers", "transmitter"] {
+        let rows = if key == "transmitter" {
+            &mut h[key]["available"]
+        } else {
+            &mut h[key]
+        };
+        if let Some(rows) = rows.as_array_mut() {
+            for row in rows {
+                alias(&mut row["mac"], aliases);
+            }
+        }
+    }
+    let mut header = serde_json::to_vec(&h).unwrap();
+    while (header.len() + 4) % 4 != 0 {
+        header.push(b' ');
+    }
+    let mut out = Vec::with_capacity(4 + header.len() + bytes.len() - 4 - n);
+    out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&bytes[4 + n..]);
+    out
 }
 
 /// One client's live session.
@@ -181,18 +276,24 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<Shared>) -> Response
 /// the waterfall — which follows each client's own cursor through the ring —
 /// is drawn per connection. Changing a knob moves this client onto a different
 /// shared analysis, starting one if it is the first to ask for that view.
-async fn live(mut socket: WebSocket, app: Shared) {
-    let mut settings = ViewSettings::default();
+async fn live(mut socket: WebSocket, app: Shared, public: bool) {
+    let mut settings = if public {
+        public_settings(false)
+    } else {
+        ViewSettings::default()
+    };
     settings.sanitise();
     let mut client = ClientView::at_live_edge(&app.hub);
     let mut subscription = app.pipeline.subscribe(&settings);
     let mut ticker = tokio::time::interval(settings.interval());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
 
     // Tell the client what it is looking at before the first frame arrives.
     let hello = json!({
         "t": "hello",
-        "source": app.hub.source,
+        "source": if public { "live CSI" } else { &app.hub.source },
+        "public": public,
         "csid_version": csid::VERSION,
         "csiscope_version": env!("CARGO_PKG_VERSION"),
         "settings": settings,
@@ -207,12 +308,20 @@ async fn live(mut socket: WebSocket, app: Shared) {
 
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                // Proxies otherwise close an idle or paused WebSocket after
+                // their read timeout, discarding its analysis state.
+                if !tokio::time::timeout(std::time::Duration::from_secs(5),
+                    socket.send(Message::Ping(Vec::new().into()))).await
+                    .is_ok_and(|r| r.is_ok()) { return; }
+            }
             // A settings update: apply, acknowledge, retime.
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ViewSettings>(&text) {
                             Ok(mut next) => {
+                                if public { next = public_settings(next.paused); }
                                 next.sanitise();
                                 let refps = (next.fps - settings.fps).abs() > f32::EPSILON;
                                 // Anything that changes the numbers moves this
@@ -236,7 +345,7 @@ async fn live(mut socket: WebSocket, app: Shared) {
                                 }
                             }
                             Err(e) => {
-                                let err = json!({"t": "error", "error": e.to_string()});
+                                let err = json!({"t": "error", "error": if public { "Invalid view settings".into() } else { e.to_string() }});
                                 let _ = socket.send(Message::Text(err.to_string().into())).await;
                             }
                         }
@@ -256,8 +365,10 @@ async fn live(mut socket: WebSocket, app: Shared) {
                 let Some(shared) = subscription.latest() else {
                     continue;
                 };
-                let bytes = Vec::from(client.render(&app.hub, &shared));
-                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                let bytes = client.render(&app.hub, &shared);
+                let bytes = if public { public_frame(bytes) } else { Vec::from(bytes) };
+                if !tokio::time::timeout(std::time::Duration::from_secs(5),
+                    socket.send(Message::Binary(bytes.into()))).await.is_ok_and(|r| r.is_ok()) {
                     return;
                 }
             }
@@ -359,6 +470,51 @@ async fn caps() -> ApiResult {
 mod tests {
     use super::{APP_JS, INDEX_HTML};
 
+    #[test]
+    fn public_projection_removes_identifiers_and_preserves_aligned_samples() {
+        use serde_json::json;
+        let mut h = serde_json::to_vec(&json!({
+            "capture": {"session_id": "private-session", "run_id": "private-run",
+                "experiment": "private-profile", "state": "private-state", "band": "5",
+                "yield_note": "private-note", "records": 42},
+            "stream": {"source": "/private/socket", "total": 42},
+            "record": {"src_mac": "de:ad:be:ef:00:01"},
+            "transmitter": {"selected": "de:ad:be:ef:00:01",
+                "available": [{"mac": "de:ad:be:ef:00:01"}]},
+            "talkers": [{"mac": "de:ad:be:ef:00:02"}], "n_f32": 2
+        }))
+        .unwrap();
+        while (h.len() + 4) % 4 != 0 {
+            h.push(b' ');
+        }
+        let mut bytes = (h.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&h);
+        let samples = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
+        bytes.extend_from_slice(&samples);
+        let projected = super::public_frame(&bytes);
+        assert_eq!(projected, super::public_frame(&bytes));
+        let n = u32::from_le_bytes(projected[..4].try_into().unwrap()) as usize;
+        assert_eq!((n + 4) % 4, 0);
+        assert_eq!(&projected[n + 4..], samples);
+        let text = std::str::from_utf8(&projected[4..n + 4]).unwrap();
+        assert!(!text.contains("de:ad:be:ef"));
+        assert!(!text.contains("private"));
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["record"]["src_mac"], v["transmitter"]["selected"]);
+        assert_ne!(v["record"]["src_mac"], v["talkers"][0]["mac"]);
+        assert_eq!(v["capture"]["records"], 42);
+    }
+
+    #[test]
+    fn public_pause_cannot_fork_the_shared_analysis() {
+        assert_eq!(
+            super::public_settings(false).view_key(),
+            super::public_settings(true).view_key()
+        );
+        assert_eq!(super::public_settings(false).fps, 5.0);
+        assert!(!INDEX_HTML.contains("tab-help"));
+    }
+
     /// Every element the console reaches for must exist in the page it serves.
     ///
     /// This is the one class of break that neither the compiler nor the Rust
@@ -387,7 +543,10 @@ mod tests {
                 missing.push(id);
             }
         }
-        assert!(missing.is_empty(), "app.js addresses missing ids: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "app.js addresses missing ids: {missing:?}"
+        );
     }
 
     /// The panels the render loop draws into must have a canvas to draw on.

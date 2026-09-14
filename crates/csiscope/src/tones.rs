@@ -21,20 +21,10 @@
 //! This is invariant 7 of the `csi-visualization` skill, and the Python service
 //! fixed the same bug on 2026-08-17. The two instruments now agree.
 //!
-//! ## What is deliberately still wrong
-//!
-//! Two transforms keep treating the tones as contiguous, for the same reason
-//! the Python service left them alone — fixing them would move numbers that
-//! have been quoted, and that needs its own measurement rather than a quiet
-//! correction:
-//!
-//! - [`crate::dsp::cir`] IFFTs the used tones without zero-padding the DC hole
-//!   onto its true FFT bin.
-//! - [`crate::dsp::detrend`] fits over array index rather than subcarrier `k`,
-//!   so a 52-tone `tau_ns` is about 2% off.
-//!
-//! Both are bounded, neither changes a shape, and both are stated in the
-//! panels' own readouts. Do not quote either as an absolute delay.
+//! The CIR now places these tones on their true FFT bins, with zeros at DC
+//! and adjacent nulls. Phase detrending fits on this same subcarrier index.
+//! Planted-delay tests cover both. Neither corrects commodity packet-detection
+//! timing, so neither is an absolute range measurement.
 
 /// How a source's tone axis relates to frequency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +229,10 @@ mod tests {
         assert!((f - 8_125_000.0).abs() < 1.0, "got {f} Hz");
 
         let old: f64 = (51.0 - 52.0 / 2.0 + 0.5) * 312_500.0;
-        assert!((old - 7_968_750.0).abs() < 1.0, "the old formula, for the record");
+        assert!(
+            (old - 7_968_750.0).abs() < 1.0,
+            "the old formula, for the record"
+        );
     }
 
     /// Reproduces the vault's own derivation (`diary/2026-08-17`): ch13 is
