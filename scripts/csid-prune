@@ -199,10 +199,32 @@ verified_remote() {
 # Reports each file, because the journal is the only record that a specific byte
 # range is now S3-only.
 strip_dir() {
-    local dir="$1" file size
+    local dir="$1" file size payload
+
+    # NOTHING TO RECLAIM, NOTHING TO ASK (2026-09-14). A session stripped on an
+    # earlier pass keeps only metadata.json and .synced, and pass 1 walks every
+    # marked directory, not just the ones holding payload. Verifying first meant
+    # one bucket round trip per already-stripped session: on monad05 that is
+    # ~1300 of ~1400 directories, every fifteen minutes, on every node.
+    #
+    # It was invisible until the confirmation path was fixed. While prune asked
+    # about `captures/v2/<host>/<session>/` every request 404'd instantly and
+    # cost nothing. Against the real prefix each one is a live listing, and
+    # fourteen hundred of them in a burst draw throttling — which this function
+    # then reports as "the bucket did not confirm it", because a refused request
+    # and an absent object are the same non-zero exit to it.
+    #
+    # So: decide locally first. An empty payload is not a skip and not a prune.
+    payload="$(payload_of "$dir")"
+    [[ -n "$payload" ]] || return 0
+
     if ! verified_remote "$dir"; then
         skipped=$(( skipped + 1 ))
-        echo "csid-prune: SKIP $(basename "$dir") — the bucket did not confirm it; keeping every local byte" >&2
+        # Deliberately worded as "could not verify", not "is not in the bucket".
+        # rclone's output is discarded here, so this function cannot tell a
+        # missing object from a throttled or timed-out request, and a message
+        # that claimed the former would send the reader to the wrong place.
+        echo "csid-prune: SKIP $(basename "$dir") — could not verify against the bucket; keeping every local byte" >&2
         return 0
     fi
     while IFS= read -r file; do
@@ -212,7 +234,7 @@ strip_dir() {
         freed=$(( freed + size ))
         pruned=$(( pruned + 1 ))
         echo "csid-prune: removed $(basename "$dir")/$(basename "$file")"
-    done < <(payload_of "$dir")
+    done <<< "$payload"
 }
 
 # Synced session directories that still hold payload, oldest marker first. The

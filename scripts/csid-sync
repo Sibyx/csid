@@ -165,6 +165,19 @@ for dir in "$SPOOL"/*/; do
     # session whose payload is verifiably at `$key` already gets its marker
     # rewritten, and that check moves no bytes.
     if [[ -f "$dir/.synced" ]]; then
+        # ONLY WHERE THERE IS STILL PAYLOAD TO RECLAIM. The key exists so that
+        # csid-prune can confirm a session before deleting its bytes. A session
+        # whose bytes are already gone has nothing left to confirm, so its key
+        # is never read and computing one is pure cost.
+        #
+        # Measured on monad05, 2026-09-14: 1336 marked sessions, 50 still
+        # holding payload. Without this guard every run spends 1286 bucket
+        # round trips proving a key nobody will ever ask for — and for the
+        # pre-v2 majority the check fails every time, so it repeats forever.
+        if [[ -z "$(find "$dir" -maxdepth 1 -type f \
+                        ! -name metadata.json ! -name .synced -print -quit 2>/dev/null)" ]]; then
+            continue
+        fi
         if rclone check "$dir" "$dest" --one-way --size-only --exclude '.synced' \
                --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
                >/dev/null 2>&1; then

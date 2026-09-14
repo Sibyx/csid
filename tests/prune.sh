@@ -216,6 +216,36 @@ else
     pass "CSID_S3_PREFIX is never glued to the flat host/session shape"
 fi
 
+echo "test 12: an already-stripped session costs no bucket call"
+#
+# Pass 1 walks every marked directory, including the ~95% that earlier passes
+# already emptied. Verifying those first meant one live listing each, fourteen
+# hundred per run on monad05, every fifteen minutes — enough of a burst to draw
+# throttling, which this script then misreported as an unconfirmed session.
+# Nothing to reclaim must mean nothing to ask.
+S="$TMP/i"; rm -rf "$S"; mkdir -p "$S/stripped-seg0001"
+printf '{"status": "complete"}\n' > "$S/stripped-seg0001/metadata.json"
+printf 'synced_at=2026-09-14T00:00:00+00:00\nkey=captures/v2/session=stripped-seg0001/\n' \
+    > "$S/stripped-seg0001/.synced"
+touch_ago "$S/stripped-seg0001/.synced" 4320
+: > "$TMP/rclone2.log"
+
+env PATH="$STUB:$PATH" RCLONE_LOG="$TMP/rclone2.log" \
+    CSID_SPOOL="$S" CSID_HOSTNAME=monadXX \
+    CSID_PRUNE_GRACE_DAYS=1 CSID_PRUNE_MIN_FREE_GB=0 CSID_PRUNE_VERIFY=1 \
+    CSID_S3_BUCKET=monad-knowledge \
+    CSID_S3_ENDPOINT=https://example.invalid \
+    CSID_S3_ACCESS_KEY=k CSID_S3_SECRET_KEY=s \
+    bash "$PRUNE" >/dev/null 2>&1
+
+if [[ ! -s "$TMP/rclone2.log" ]]; then
+    pass "no payload: the bucket is never contacted"
+else
+    fail "no payload: bucket contacted anyway ($(tr '\n' ' ' < "$TMP/rclone2.log"))"
+fi
+check_exists "$S/stripped-seg0001/metadata.json" "no payload: index still kept"
+check_exists "$S/stripped-seg0001/.synced"       "no payload: marker still kept"
+
 echo
 if [[ $fails -eq 0 ]]; then
     echo "csid-prune: all invariants hold"
