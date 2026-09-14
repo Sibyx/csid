@@ -113,9 +113,19 @@ v2_key() {
 
 command -v jq >/dev/null || { echo "csid-sync: jq not installed (needed for the v2 key)" >&2; exit 1; }
 
+# The `.synced` marker. Two lines, both greppable, because this file plus
+# metadata.json is the on-node index of what has left the spool — and `key=` is
+# now the ONLY statement of where a session went. csid-prune reads it back
+# rather than re-deriving it, so the path grammar has one definition.
+write_marker() {
+    local dir="$1" key="$2"
+    printf 'synced_at=%s\nkey=%s\n' "$(date -Is)" "${key%/}/" > "${dir%/}/.synced"
+}
+
 shipped=0
 failed=0
 skipped=0
+upgraded=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
     session="$(basename "$dir")"
@@ -125,8 +135,18 @@ for dir in "$SPOOL"/*/; do
     if ! grep -q '"status": *"\(complete\|stopped\|failed\)"' "$dir/metadata.json"; then
         continue
     fi
-    # Already shipped.
-    [[ -f "$dir/.synced" ]] && continue
+    # Already shipped AND the marker records where. Nothing to do.
+    #
+    # THE MARKER CARRIES THE KEY (2026-09-14). It used to hold a bare timestamp,
+    # which left `csid-prune` to re-derive the destination from a prefix and a
+    # naming rule of its own. The two agreed by accident until the IP-156
+    # faceted layout landed here and not there; prune then checked a path that
+    # had never existed, confirmed nothing, and eight nodes filled to 89-93%.
+    # Recording the destination in the writer removes the second definition
+    # instead of adding a third.
+    if [[ -f "$dir/.synced" ]] && grep -q '^key=' "$dir/.synced"; then
+        continue
+    fi
 
     if ! key="$(v2_key "$dir" "$session")"; then
         # Unshippable, and NOT a failure: retrying cannot fix a sidecar with no
@@ -136,9 +156,28 @@ for dir in "$SPOOL"/*/; do
         continue
     fi
     dest="s3:${BUCKET}/${key}"
+
+    # A keyless marker means this session was shipped before the line above
+    # existed. UPGRADE IT, NEVER RE-SHIP IT. A session shipped under the old
+    # flat layout is not at `$key` at all, and copying it there would duplicate
+    # tens of gigabytes to a second location for nothing — prune's frozen
+    # legacy fallback already confirms those where they actually are. Only a
+    # session whose payload is verifiably at `$key` already gets its marker
+    # rewritten, and that check moves no bytes.
+    if [[ -f "$dir/.synced" ]]; then
+        if rclone check "$dir" "$dest" --one-way --size-only --exclude '.synced' \
+               --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
+               >/dev/null 2>&1; then
+            write_marker "$dir" "$key"
+            echo "csid-sync: marker upgraded $session -> $key"
+            upgraded=$((upgraded + 1))
+        fi
+        continue
+    fi
+
     echo "csid-sync: shipping $session -> $dest"
     if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
-        date -Is > "$dir/.synced"
+        write_marker "$dir" "$key"
         shipped=$((shipped + 1))
     else
         # Leave it unmarked; the timer retries on the next pass.
@@ -147,5 +186,5 @@ for dir in "$SPOOL"/*/; do
     fi
 done
 
-echo "csid-sync: $shipped shipped, $failed failed, $skipped skipped"
+echo "csid-sync: $shipped shipped, $failed failed, $skipped skipped, $upgraded marker(s) upgraded"
 [[ $failed -eq 0 ]]

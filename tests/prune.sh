@@ -156,6 +156,66 @@ set -e
 if [[ $rc -eq 2 ]]; then pass "bad grace rejected with exit 2"; else fail "bad grace should exit 2 (got $rc)"; fi
 check_exists "$S/old-seg0001/capture.raw" "bad knob: nothing deleted"
 
+echo "test 11: the bucket path comes from the marker, and falls back to the frozen legacy layout"
+#
+# THE REGRESSION THIS PINS. Until 2026-09-14 this script re-derived the remote
+# as `${CSID_S3_PREFIX}/<host>/<session>/`. csid-sync moved to a faceted key
+# under the same prefix and nothing moved here, so prune checked a path that
+# had never existed, confirmed nothing, and held every byte on eight nodes.
+#
+# A stub rclone records the remote it is asked to check, so the assertion is on
+# the path itself rather than on a deletion — no bucket, no credentials, no
+# network.
+S="$TMP/h"; rm -rf "$S"; mkdir -p "$S"
+for d in keyed-seg0001 legacy-seg0001; do
+    mkdir -p "$S/$d"
+    echo payload > "$S/$d/capture.raw"
+    printf '{"status": "complete"}\n' > "$S/$d/metadata.json"
+done
+printf 'synced_at=2026-09-14T00:00:00+00:00\nkey=captures/v2/dt=2026-09-12/host=monadXX/session=keyed-seg0001/\n' \
+    > "$S/keyed-seg0001/.synced"
+printf '2026-08-28T00:00:00+00:00\n' > "$S/legacy-seg0001/.synced"
+touch_ago "$S/keyed-seg0001/.synced" 4320
+touch_ago "$S/legacy-seg0001/.synced" 4320
+
+STUB="$TMP/stub"; mkdir -p "$STUB"
+cat > "$STUB/rclone" <<'STUBEOF'
+#!/usr/bin/env bash
+# `rclone check <local> <remote> ...` — record the remote, then succeed.
+if [[ "${1:-}" == "check" ]]; then printf '%s\n' "${3:-}" >> "$RCLONE_LOG"; fi
+exit 0
+STUBEOF
+chmod +x "$STUB/rclone"
+: > "$TMP/rclone.log"
+
+env PATH="$STUB:$PATH" RCLONE_LOG="$TMP/rclone.log" \
+    CSID_SPOOL="$S" CSID_HOSTNAME=monadXX \
+    CSID_PRUNE_GRACE_DAYS=1 CSID_PRUNE_MIN_FREE_GB=0 CSID_PRUNE_VERIFY=1 \
+    CSID_S3_BUCKET=monad-knowledge \
+    CSID_S3_ENDPOINT=https://example.invalid \
+    CSID_S3_ACCESS_KEY=k CSID_S3_SECRET_KEY=s \
+    CSID_S3_PREFIX=captures/v2 \
+    bash "$PRUNE" >/dev/null 2>&1
+
+want_keyed='s3:monad-knowledge/captures/v2/dt=2026-09-12/host=monadXX/session=keyed-seg0001/'
+want_legacy='s3:monad-knowledge/datasets/ax210-csi-captures/monadXX/legacy-seg0001/'
+if grep -qxF "$want_keyed" "$TMP/rclone.log"; then
+    pass "marker key= is used verbatim as the remote"
+else
+    fail "marker key= ignored (log: $(tr '\n' ' ' < "$TMP/rclone.log"))"
+fi
+if grep -qxF "$want_legacy" "$TMP/rclone.log"; then
+    pass "keyless marker falls back to the frozen pre-v2 flat path"
+else
+    fail "legacy fallback wrong (log: $(tr '\n' ' ' < "$TMP/rclone.log"))"
+fi
+# The bug in one assertion: CSID_S3_PREFIX must never be glued to <host>/<session>/.
+if grep -q 'captures/v2/monadXX/' "$TMP/rclone.log"; then
+    fail "regression: CSID_S3_PREFIX re-glued to the flat host/session shape"
+else
+    pass "CSID_S3_PREFIX is never glued to the flat host/session shape"
+fi
+
 echo
 if [[ $fails -eq 0 ]]; then
     echo "csid-prune: all invariants hold"

@@ -70,7 +70,31 @@ set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
 HOST="${CSID_HOSTNAME:-$(hostname)}"
-PREFIX="${CSID_S3_PREFIX:-datasets/ax210-csi-captures}"
+# ── Where a shipped session lives in the bucket ─────────────────────────────
+#
+# DO NOT reintroduce a `PREFIX="${CSID_S3_PREFIX:-...}"` here. That is what
+# broke on 2026-09-10 and was found on 2026-09-14.
+#
+# Until the IP-156 migration this script and `csid-sync` agreed by accident:
+# both built `<prefix>/<host>/<session>/` and both defaulted the prefix to
+# `datasets/ax210-csi-captures`. The migration set CSID_S3_PREFIX=captures/v2
+# and taught csid-sync a FACETED key —
+#   captures/v2/dt=…/band=…/channel=…/width=…/role=…/host=…/run=…/session=…/
+# — but nothing taught this script. It kept appending the old flat shape to the
+# new root and checked `captures/v2/<host>/<session>/`, a path that has never
+# existed. Every session read as unconfirmed, prune correctly refused to delete
+# anything, and the spools climbed from the 77-79% design band to 89-93% across
+# eight nodes with 40 GB held on monad05 alone.
+#
+# The fix is to stop deriving the key at all. csid-sync knows the destination it
+# wrote, so it records it in `.synced` and this script reads it back. One
+# definition of the grammar, in the writer, and no way for the two to drift.
+#
+# The fallback is for markers written before that change: those sessions really
+# are at the pre-v2 flat path, verified against the bucket on 2026-09-14. The
+# constant below is FROZEN — it describes where old data sits, not where new
+# data goes, so it must never be wired to CSID_S3_PREFIX again.
+LEGACY_PREFIX="${CSID_PRUNE_LEGACY_PREFIX:-datasets/ax210-csi-captures}"
 GRACE_DAYS="${CSID_PRUNE_GRACE_DAYS:-1}"
 MIN_FREE_GB="${CSID_PRUNE_MIN_FREE_GB:-10}"
 
@@ -142,15 +166,30 @@ payload_of() {
 # remote; extra remote objects are fine. `.synced` is excluded because it is
 # deliberately never uploaded (csid-sync excludes it), and without the exclude
 # every check would fail on it.
-verified_remote() {
-    local dir="$1" session
-    [[ "$VERIFY" == "1" ]] || return 0
+# The remote this session was shipped to, read from the marker csid-sync wrote.
+# A marker with a `key=` line is authoritative: it is the exact destination the
+# uploader used. A marker without one predates that change, and those sessions
+# are at the frozen pre-v2 flat path.
+remote_for() {
+    local dir="$1" key session
+    key="$(sed -n 's/^key=//p' "${dir%/}/.synced" 2>/dev/null | head -1)"
+    if [[ -n "$key" ]]; then
+        printf 's3:%s/%s/' "$CSID_S3_BUCKET" "${key%/}"
+        return 0
+    fi
     session="$(basename "$dir")"
+    printf 's3:%s/%s/%s/%s/' "$CSID_S3_BUCKET" "$LEGACY_PREFIX" "$HOST" "$session"
+}
+
+verified_remote() {
+    local dir="$1" remote
+    [[ "$VERIFY" == "1" ]] || return 0
+    remote="$(remote_for "$dir")"
     # Bounded hard. rclone's defaults retry a dead endpoint for minutes, and this
     # runs on a timer beside a capture: a verification that hangs is a prune that
     # never completes, which on a filling disk is the failure we are fixing. One
     # attempt, short timeouts, and a non-zero exit means "keep the bytes".
-    rclone check "$dir" "s3:${CSID_S3_BUCKET}/${PREFIX}/${HOST}/${session}/" \
+    rclone check "$dir" "$remote" \
         --one-way --size-only --exclude '.synced' \
         --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
         >/dev/null 2>&1
