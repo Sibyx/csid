@@ -42,6 +42,7 @@
 //! [`csiscope`]: https://github.com/Sibyx/csid/tree/master/crates/csiscope
 
 pub mod ble;
+pub mod ble_continuous;
 pub mod caps;
 pub mod census;
 pub mod commands;
@@ -58,6 +59,7 @@ pub mod notify;
 pub mod radio;
 pub mod rawsock;
 pub mod segment;
+pub mod session_quality;
 pub mod sidecar;
 pub mod sinks;
 pub mod source;

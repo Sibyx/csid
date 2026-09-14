@@ -393,6 +393,8 @@ pub struct InjectMeta {
 /// the analysis side has to understand to interpret `device_hash`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BleMeta {
+    #[serde(default)]
+    pub external_scan: bool,
     pub adapter: String,
     /// Always `"passive"` — see [`crate::hci`] for why there is no other option.
     pub scan_type: String,
@@ -656,6 +658,7 @@ impl Sidecar {
         });
 
         let ble = cfg.ble.enabled.then(|| BleMeta {
+            external_scan: cfg.ble.external_scan,
             adapter: cfg.ble.adapter.clone(),
             scan_type: "passive".to_string(),
             scan_interval_ms: cfg.ble.scan_interval_ms,

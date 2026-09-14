@@ -764,6 +764,10 @@ pub fn validate_monitor_tx_rate(word: u32) -> Result<()> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BleConfig {
+    /// Receive HCI reports from the continuous scanner without issuing scan
+    /// commands. Requires that scanner's adapter ownership lock to be held.
+    #[serde(default)]
+    pub external_scan: bool,
     /// Run the scanner alongside the CSI capture.
     #[serde(default)]
     pub enabled: bool,
@@ -840,6 +844,7 @@ fn default_ble_flush_every() -> usize {
 impl Default for BleConfig {
     fn default() -> Self {
         BleConfig {
+            external_scan: false,
             enabled: false,
             adapter: default_ble_adapter(),
             required: false,

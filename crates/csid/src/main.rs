@@ -48,6 +48,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Read nonempty CSI window coverage from one exact run/profile session.
+    SessionQuality {
+        #[arg(long)]
+        spool: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        #[arg(long)]
+        locate_only: bool,
+    },
+    /// Scan BLE continuously, independently of Wi-Fi; seal rotating BLE logs.
+    BleContinuous {
+        experiment: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value = "30m", value_parser = parse_duration)]
+        segment: Duration,
+    },
     /// Run a capture session (the systemd ExecStart).
     Run {
         /// Experiment name (resolved under --experiments) or a config path.
@@ -429,6 +450,33 @@ fn main() {
 
 fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
+        Command::SessionQuality {
+            spool,
+            run_id,
+            profile,
+            seconds,
+            locate_only,
+        } => {
+            println!(
+                "{}",
+                csid::session_quality::report(spool, run_id, profile, *seconds, *locate_only)?
+            );
+            Ok(())
+        }
+        Command::BleContinuous {
+            experiment,
+            root,
+            segment,
+        } => {
+            let cfg = csid::config::ExperimentConfig::resolve(experiment, &cli.experiments)?;
+            cfg.ble.validate()?;
+            anyhow::ensure!(!cfg.ble.external_scan, "continuous scanner must own HCI");
+            anyhow::ensure!(
+                segment.as_secs() >= 60,
+                "BLE segments must be at least 60 seconds"
+            );
+            csid::hci::continuous(root, &cfg.ble, *segment, stop_flag())
+        }
         Command::Run {
             experiment,
             duration,

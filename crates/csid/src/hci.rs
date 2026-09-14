@@ -27,10 +27,10 @@
 //! unmanaged. `csid doctor` reports what it can see.
 
 #[cfg(target_os = "linux")]
-pub use linux::{probe, spawn};
+pub use linux::{continuous, probe, spawn};
 
 #[cfg(not(target_os = "linux"))]
-pub use portable::{probe, spawn};
+pub use portable::{continuous, probe, spawn};
 
 /// What a BLE readiness probe found. Shown by `csid doctor`.
 #[derive(Debug, Clone)]
@@ -54,6 +54,15 @@ mod portable {
     use super::BleProbe;
     use crate::ble::{BleCounters, BleHandle};
     use crate::config::BleConfig;
+
+    pub fn continuous(
+        _root: &Path,
+        _cfg: &BleConfig,
+        _segment: std::time::Duration,
+        _stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        anyhow::bail!("continuous BLE scanning requires Linux")
+    }
 
     pub fn spawn(
         _dir: &Path,
@@ -80,6 +89,7 @@ mod portable {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
+    use std::os::fd::AsRawFd;
     use std::os::unix::io::RawFd;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -153,6 +163,8 @@ mod linux {
         fd: RawFd,
         buf: Vec<u8>,
         adapter: String,
+        manages_scan: bool,
+        _ownership: std::fs::File,
     }
 
     fn sys_path(adapter: &str) -> String {
@@ -175,9 +187,9 @@ mod linux {
                  Check `rfkill list bluetooth`, then that the unit grants \
                  CAP_NET_ADMIN; `sudo hciconfig {adapter} up` by hand will say which"
             ),
-            Some(libc::ERFKILL) => format!(
-                "{e} — {adapter} is rfkill-blocked; `sudo rfkill unblock bluetooth`"
-            ),
+            Some(libc::ERFKILL) => {
+                format!("{e} — {adapter} is rfkill-blocked; `sudo rfkill unblock bluetooth`")
+            }
             Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT) => format!(
                 "{e} — this kernel has no Bluetooth stack (CONFIG_BT); BLE co-capture \
                  cannot run on this node"
@@ -240,6 +252,38 @@ mod linux {
         fn open(cfg: &BleConfig) -> Result<Self> {
             let adapter = cfg.adapter.clone();
             let index = cfg.adapter_index()?;
+            // All csid HCI command paths, including doctor, use this lock.
+            // Listeners only test ownership; they never send HCI commands.
+            let ownership = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(format!("/run/csid/ble-{index}.lock"))?;
+            let acquired =
+                unsafe { libc::flock(ownership.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+            if cfg.external_scan {
+                anyhow::ensure!(
+                    !acquired,
+                    "external BLE scanner is not running on {adapter}"
+                );
+                anyhow::ensure!(
+                    std::io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock,
+                    "cannot check BLE scanner ownership"
+                );
+                let owner: BleConfig = serde_json::from_reader(&ownership)
+                    .context("continuous BLE owner has not published its scan parameters")?;
+                anyhow::ensure!(
+                    owner.scan_interval_ms == cfg.scan_interval_ms
+                        && owner.scan_window_ms == cfg.scan_window_ms,
+                    "BLE listener parameters differ from the continuous owner"
+                );
+            } else {
+                anyhow::ensure!(
+                    acquired,
+                    "BLE adapter {adapter} already has a scanner owner"
+                );
+            }
 
             // Cheapest, clearest failure first: is there an adapter at all?
             if !Path::new(&sys_path(&adapter)).exists() {
@@ -264,16 +308,20 @@ mod linux {
                     explain(&e, &adapter)
                 );
             }
-            let sc = Scanner {
+            let mut sc = Scanner {
                 fd,
                 buf: vec![0u8; RECV_BUF],
                 adapter: adapter.clone(),
+                manages_scan: false,
+                _ownership: ownership,
             };
 
             // Before anything is sent: the controller has to be powered. The
             // ioctl takes the raw socket while it is still unbound, which is
             // exactly how `hciconfig` issues it.
-            bring_up(sc.fd, index, &adapter)?;
+            if !cfg.external_scan {
+                bring_up(sc.fd, index, &adapter)?;
+            }
 
             // Events only; every event code, so Command Complete for our own
             // commands arrives alongside the advertising reports.
@@ -332,7 +380,13 @@ mod linux {
                 );
             }
 
-            sc.start_scan(cfg)?;
+            if !cfg.external_scan {
+                sc.manages_scan = true;
+                sc.start_scan(cfg)?;
+                sc._ownership.set_len(0)?;
+                serde_json::to_writer(&sc._ownership, cfg)?;
+                sc._ownership.sync_data()?;
+            }
             Ok(sc)
         }
 
@@ -438,7 +492,9 @@ mod linux {
             // is about to close.
             let pkt = scan_enable_command(false);
             unsafe {
-                libc::send(self.fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0);
+                if self.manages_scan {
+                    libc::send(self.fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0);
+                }
                 libc::close(self.fd);
             }
         }
@@ -584,7 +640,7 @@ mod linux {
                     }
                 }
 
-                if last_obs.elapsed() >= silence_budget {
+                if !cfg.external_scan && last_obs.elapsed() >= silence_budget {
                     tracing::warn!(
                         adapter = %cfg.adapter,
                         silent_s = last_obs.elapsed().as_secs(),
@@ -630,6 +686,44 @@ mod linux {
             adapter_errors = counters.adapter_errors.load(Ordering::Relaxed),
             "BLE scanner stopped"
         );
+    }
+
+    /// One HCI owner, with log rotation that never disables scanning. A quiet
+    /// room is valid: only a socket error restarts this service, not silence.
+    pub fn continuous(
+        root: &Path,
+        cfg: &BleConfig,
+        segment: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        cfg.validate()?;
+        anyhow::ensure!(!cfg.external_scan, "continuous scanner must own HCI");
+        let mut scanner = Scanner::open(cfg)?;
+        let matcher = cfg.lab_matcher()?;
+        let host = std::fs::read_to_string("/etc/hostname")?.trim().to_string();
+        let mut log = crate::ble_continuous::ContinuousLog::open(root, cfg, segment, &host)?;
+        let mut last_report = Instant::now();
+        let mut observations = 0u64;
+        let outcome = (|| -> Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                log.rotate_if_due()?;
+                if let Some(n) = scanner.recv()? {
+                    let ts = now_unix_ns();
+                    let parsed = parse_hci_event(&scanner.buf[..n]);
+                    for adv in &parsed.advs {
+                        log.observe(adv, ts, matcher.as_ref())?;
+                        observations += 1;
+                    }
+                }
+                if last_report.elapsed() >= Duration::from_secs(10) {
+                    tracing::info!(observations, adapter = %cfg.adapter, "continuous BLE scanning");
+                    last_report = Instant::now();
+                }
+            }
+            Ok(())
+        })();
+        log.finish()?;
+        outcome
     }
 
     /// Sleep in short slices so a stop signal is not held up by the backoff.
