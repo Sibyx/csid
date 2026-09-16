@@ -761,10 +761,25 @@ impl Sidecar {
     }
 
     /// Serialise to disk (pretty-printed — it is meant to be read by humans).
+    ///
+    /// ATOMIC: written to a sibling temp file and renamed into place. The
+    /// sidecar has four readers on the node — `csid-sync` (grep for `status`),
+    /// `csid-prune`, `csid session-quality` and the fleet's `metadata.json`
+    /// slurp in the arm playbooks — and none of them can tell a half-written
+    /// file from a finished one. `fs::write` truncates first and writes second,
+    /// so a crash or ENOSPC between the two leaves a zero-byte document: that
+    /// is exactly what monad05 carried from 2026-08-18 (a console session
+    /// opened on a full disk) until it was found on 2026-09-16, and it failed
+    /// every `session-quality --locate-only` on that node for a month. With a
+    /// rename, a failed write leaves `metadata.json.tmp` — which no reader
+    /// looks at — and the previous document, if any, intact.
     pub fn write(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&self.path, json + "\n")
-            .with_context(|| format!("writing sidecar {}", self.path.display()))
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&tmp, json + "\n")
+            .with_context(|| format!("writing sidecar {}", tmp.display()))?;
+        fs::rename(&tmp, &self.path)
+            .with_context(|| format!("moving sidecar into place at {}", self.path.display()))
     }
 
     /// Re-target this sidecar at another file.

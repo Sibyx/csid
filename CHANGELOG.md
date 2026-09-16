@@ -14,6 +14,38 @@ a field whose meaning changes, or a schema identifier that bumps, is **major**.
 The Python reader (`python/`, `csiq` on PyPI) carries its own version and its
 own changelog in `python/README.md`.
 
+## [0.3.1] - 2026-09-16
+
+Three defects found while reading why the fleet's matrix arms reported
+failure on 2026-09-15 and 2026-09-16 with every node capturing.
+
+### Fixed
+
+- **`session-quality --locate-only` no longer fails on a foreign sidecar.**
+  It parsed every `metadata.json` in the spool and propagated the first parse
+  error. monad05 held a zero-byte sidecar from a session opened on a full disk
+  on 2026-08-18, so from 2026-09-15 20:12 UTC every matrix arm whose
+  comparison transmitter was monad05 died at its locate step after both
+  cohorts had started (entries 2026-09-15-07, -08 and 2026-09-16-02). The
+  locate now opens only directories named `_<profile>_`, skips segment
+  directories (`-segNNNN`, which repeat the root's run id and would have
+  become a second match at the first rotation), and logs an unreadable
+  sidecar by path instead of failing.
+- **The sidecar is written atomically** (temp file plus rename). `fs::write`
+  truncates and then writes, so ENOSPC or a crash between the two left an
+  empty `metadata.json` that `csid-sync`, `csid-prune` and `session-quality`
+  each misread in a different way.
+
+### Changed
+
+- **The journal heartbeat ticks every 60 s and names its run.** The cadence
+  was `WATCHDOG_USEC / 3`, so raising `WatchdogSec` to 900 s on 2026-09-06
+  silently moved the `capturing` line to every 300 s; the
+  `monad_csi:capture_active` recording rule and the arm playbooks' verify
+  step were both sized for the old value. The line now carries `run_id` and
+  `session_id` as fields (`F_RUN_ID`, `F_SESSION_ID` in the journal), so a
+  Loki reader can count liveness per planned run rather than per unit.
+
 ## [0.3.0] - 2026-09-04
 
 Three instruments added after the transmitter identity in the CSI header was

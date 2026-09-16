@@ -640,7 +640,28 @@ pub fn run_session(
         ble_live.then_some((0, 0.0)),
     ));
     let deadline = cfg.capture.duration.map(|d| Instant::now() + d);
-    let watchdog_every = crate::notify::watchdog_interval().unwrap_or(Duration::from_secs(10));
+    // The journal heartbeat and the systemd StatusText refresh on ONE clock,
+    // and it is no longer the watchdog's.
+    //
+    // Until 0.3.1 the cadence was `WATCHDOG_USEC / 3`, so when the fleet raised
+    // `WatchdogSec` from 300 to 900 s on 2026-09-06 the heartbeat went from
+    // 100 s to 300 s as a side effect. Two things downstream were sized for the
+    // old value and nobody was told: the `monad_csi:capture_active:2m` recording
+    // rule read zero for three of every five minutes on a healthy node, and the
+    // arm playbooks' verify step waited the full 300 s for the first non-zero
+    // StatusText. A liveness signal that ticks every five minutes cannot
+    // answer "is this node capturing right now". Sixty seconds is one line a
+    // minute per session — ten a minute fleet-wide — and the watchdog ping
+    // itself is still sent every loop iteration below, so nothing here changes
+    // what systemd sees.
+    const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
+    let heartbeat_every = crate::notify::watchdog_interval()
+        .map_or(HEARTBEAT_EVERY, |w| w.min(HEARTBEAT_EVERY))
+        .max(Duration::from_secs(10));
+    // Carried on every heartbeat so a Loki reader can group liveness by the
+    // run the plan named, not only by unit. `unit` says which PROFILE is up;
+    // only `run_id` says whether it is the session the dispatcher armed.
+    let heartbeat_run_id = sidecar.run_id.clone();
     let started = Instant::now();
     let mut last_log = Instant::now();
     let mut last_records: u64 = 0;
@@ -733,7 +754,7 @@ pub fn run_session(
             }
         }
 
-        if last_log.elapsed() >= watchdog_every.max(Duration::from_secs(10)) {
+        if last_log.elapsed() >= heartbeat_every {
             let (records, bytes, sent, dropped) = counters.snapshot();
             // Rate over the interval just elapsed, not since session start: a
             // capture that flowed for an hour and then stalled must not be
@@ -762,6 +783,8 @@ pub fn run_session(
                 live_dropped = dropped,
                 ble_observations = ble_now.map(|(o, _)| o),
                 ble_rate_hz = ble_now.map(|(_, h)| h),
+                run_id = %heartbeat_run_id,
+                session_id = %session_id,
                 "capturing"
             );
             crate::notify::status(&capture_status(&session_id, records, rate_hz, ble_now));
