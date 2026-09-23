@@ -99,7 +99,7 @@ impl ContinuousLog {
             let stats = ble::export_parquet(&path, &dir.join(ble::PARQUET_NAME), &ctx)?;
             std::fs::File::open(dir.join(ble::PARQUET_NAME))?.sync_all()?;
             let seal = serde_json::json!({
-                "schema": "ble-continuous/1", "observations_schema": "ble-rssi/2",
+                "schema": "ble-continuous/1", "observations_schema": ble::PARQUET_SCHEMA,
                 "session_id": ctx.session_id, "host": ctx.host, "adapter": ctx.adapter,
                 "started_utc": rfc3339_utc(started_ns / 1_000_000_000),
                 "ended_utc": rfc3339_utc(ended_ns / 1_000_000_000),

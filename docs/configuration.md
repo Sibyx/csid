@@ -186,7 +186,8 @@ Two artefacts land in the session directory and ship with it:
 | `ble_rssi.parquet` | The contract artefact the analysis side reads. Written at session close from the log. |
 
 `ble_rssi.parquet` columns, in order — **this is a schema contract**
-(`ble-rssi/1`; a rename is a version bump):
+(`ble-rssi/3`; a rename is a version bump. `/2` added the three `lab_*`
+columns, `/3` added `company_id`):
 
 | Column | Parquet type | Notes |
 |---|---|---|
@@ -198,6 +199,10 @@ Two artefacts land in the session directory and ship with it:
 | `addr_kind` | STRING, required | `public` · `random_static` · `rpa_resolvable` · `rpa_non_resolvable` · `random_reserved` · `public_identity` · `random_identity` · `unknown`. |
 | `pdu_type` | STRING, required | `adv_ind` · `adv_direct_ind` · `adv_scan_ind` · `adv_nonconn_ind` · `scan_rsp` · `unknown`. |
 | `rssi_dbm` | INT32, **optional** | Null encodes the controller's "RSSI unavailable" sentinel rather than writing 127 dBm. |
+| `lab_uuid` | STRING, optional | Canonical UUID of a matched lab identity frame; null for every bystander. |
+| `lab_participant_key` | INT32, optional | Bytes 12–13 of the lab UUID. |
+| `lab_session_key` | INT32, optional | Bytes 14–15 of the lab UUID. |
+| `company_id` | INT32, optional | Bluetooth SIG company identifier opening the first Manufacturer Specific Data structure (AD 0xFF), e.g. 76 = Apple, 6 = Microsoft. Null when there is none. The manufacturer payload after it is not read. |
 
 The advertising **channel index** (37/38/39) is not a column: the HCI
 Advertising Report does not carry it on any Bluetooth version.

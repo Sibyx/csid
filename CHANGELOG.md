@@ -27,9 +27,18 @@ own changelog in `python/README.md`.
   `rate_hz`. The monitoring stack's `monad_ble:*` recording rules read these;
   before this, the continuous owner logged only a cumulative `observations`.
 - **`BLE segment sealed`** is logged once per continuous segment after its
-  `session.json` is durable, with `rows` and `devices_total`.
-
-Journal fields only: no sidecar, parquet or CSIQ field changes.
+  `session.json` is durable, with `rows` and `devices_total`. These two
+  entries are journal fields only.
+- **`ble_rssi.parquet` gains `company_id` (schema `ble-rssi/3`).** The 16-bit
+  Bluetooth SIG company identifier that opens the first Manufacturer Specific
+  Data structure of an advertisement (Apple 0x004C, Microsoft 0x0006, …), or
+  null. It gives a vendor breakdown of the population and no identity: every
+  device of a manufacturer shares it, and the manufacturer payload after it is
+  still not read. The durable log carries it as an optional field, so older
+  logs keep parsing. The footer adds `csid.company_id_source`. The continuous
+  segment sidecar now takes its `observations_schema` from the same constant,
+  where it was a literal. A schema identifier bump is a **major** change under
+  the policy above.
 
 ## [0.3.1] - 2026-09-16
 

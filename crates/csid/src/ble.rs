@@ -62,10 +62,21 @@
 //! - **A matching frame is ours by construction** — the namespace is
 //!   lab-chosen, so storing its identity bytes identifies a consented session,
 //!   not a person, and the session sidecar on the phone side holds the mapping.
-//! - **A non-matching payload is dropped unparsed.** No service UUID, local
-//!   name, or manufacturer data of a bystander device is ever stored, so the
-//!   count-without-identify posture is unchanged: bystanders remain salted
-//!   pseudonyms exactly as in `ble-rssi/1`.
+//! - **A non-matching payload is dropped.** No service UUID, local name or
+//!   manufacturer payload of a bystander device is ever stored; the one
+//!   exception is the two-byte company identifier below. Bystanders remain
+//!   salted pseudonyms exactly as in `ble-rssi/1`.
+//!
+//! ## Manufacturer company identifier (`ble-rssi/3`)
+//!
+//! Every row carries `company_id`: the 16-bit Bluetooth SIG company identifier
+//! that opens the first Manufacturer Specific Data structure (AD type 0xFF) of
+//! the advertisement, or null when there is none. It says who made the stack
+//! (Apple 0x004C, Microsoft 0x0006, Samsung 0x0075, Google 0x00E0), which is
+//! the only vendor signal a phone on a random address carries. The identifier
+//! is shared by every device of that manufacturer, so it adds a population
+//! breakdown and no identity. The bytes after it — the part that can carry a
+//! beacon id or a Continuity payload — are not read.
 //!
 //! Byte order, stated once because it is the classic bug: AD structures carry
 //! 128-bit UUIDs **little-endian**, so the matcher reverses each 16-byte chunk
@@ -109,7 +120,8 @@ pub const PARQUET_NAME: &str = "ble_rssi.parquet";
 /// Schema identifier, mirrored into the sidecar and the parquet footer. Bump on
 /// any column change. `/2` adds the nullable lab-identity columns (`lab_uuid`,
 /// `lab_participant_key`, `lab_session_key`) and the self-describing footer.
-pub const PARQUET_SCHEMA: &str = "ble-rssi/2";
+/// `/3` adds the nullable `company_id` column.
+pub const PARQUET_SCHEMA: &str = "ble-rssi/3";
 /// How the last four bytes of a matched lab UUID are laid out. Written into the
 /// parquet footer so the file explains its own join keys.
 pub const LAB_UUID_LAYOUT: &str =
@@ -273,6 +285,11 @@ pub struct Observation {
     pub lab_participant_key: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lab_session_key: Option<u16>,
+    /// Bluetooth SIG company identifier of the first Manufacturer Specific
+    /// Data structure (`ble-rssi/3`), see [`company_id`]. `None` when the
+    /// advertisement carries none, and on every row of an older log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_id: Option<u16>,
 }
 
 // -- hashing ------------------------------------------------------------------
@@ -362,8 +379,31 @@ impl DeviceHasher {
             lab_uuid: lab.as_ref().map(|f| f.uuid.clone()),
             lab_participant_key: lab.as_ref().map(|f| f.participant_key),
             lab_session_key: lab.map(|f| f.session_key),
+            company_id: company_id(&adv.data),
         }
     }
+}
+
+// -- manufacturer company identifier ------------------------------------------
+
+/// The company identifier opening the first Manufacturer Specific Data
+/// structure (AD type 0xFF), little-endian on air (Core spec Supplement,
+/// part A §1.4). Only these two bytes are read; the manufacturer payload after
+/// them is not. Malformed structures end the walk without panicking, as in
+/// [`LabMatcher::extract`].
+pub fn company_id(data: &[u8]) -> Option<u16> {
+    let mut i = 0usize;
+    while i < data.len() {
+        let ad_len = data[i] as usize; // length of type byte + payload
+        if ad_len == 0 || i + 1 + ad_len > data.len() {
+            return None;
+        }
+        if data[i + 1] == 0xFF && ad_len >= 3 {
+            return Some(u16::from_le_bytes([data[i + 2], data[i + 3]]));
+        }
+        i += 1 + ad_len;
+    }
+    None
 }
 
 // -- lab identity matching (portable, so it is testable off-Linux) ------------
@@ -932,6 +972,12 @@ fn parquet_schema() -> Result<Type> {
                 .with_repetition(Repetition::OPTIONAL)
                 .build()?,
         ),
+        // ble-rssi/3 — manufacturer company identifier, null when absent.
+        Arc::new(
+            Type::primitive_type_builder("company_id", PhysicalType::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()?,
+        ),
     ];
     Ok(Type::group_type_builder("ble_rssi")
         .with_fields(fields)
@@ -975,6 +1021,12 @@ fn footer_metadata(ctx: &ParquetContext) -> Vec<parquet::file::metadata::KeyValu
         kv(
             "rssi_null_means",
             "controller reported the RSSI-unavailable sentinel (127)".to_string(),
+        ),
+        kv(
+            "company_id_source",
+            "Bluetooth SIG company identifier opening the first AD type 0xFF structure, \
+             little-endian; the manufacturer payload after it is not read; null = none"
+                .to_string(),
         ),
         kv("writer", format!("csid {}", env!("CARGO_PKG_VERSION"))),
         kv("created_unix_ns", format!("{}", crate::util::now_unix_ns())),
@@ -1126,11 +1178,14 @@ fn write_row_group<W: std::io::Write + Send>(
         .write_batch(&vals, Some(&def), None)?;
     col.close()?;
 
+    // The two lab keys and (ble-rssi/3) the company identifier: all Option<u16>
+    // written as OPTIONAL INT32.
     for key in [
         |o: &Observation| o.lab_participant_key,
         |o: &Observation| o.lab_session_key,
+        |o: &Observation| o.company_id,
     ] {
-        let mut col = rg.next_column()?.context("lab key column missing")?;
+        let mut col = rg.next_column()?.context("u16 column missing")?;
         let def: Vec<i16> = batch
             .iter()
             .map(|o| if key(o).is_some() { 1 } else { 0 })
@@ -1568,6 +1623,46 @@ mod tests {
     }
 
     #[test]
+    fn company_id_reads_only_the_first_manufacturer_identifier() {
+        // Flags, then an iBeacon: 0x004C (Apple) little-endian, payload after.
+        let ibeacon = [0x02, 0x01, 0x06, 0x06, 0xFF, 0x4C, 0x00, 0x02, 0x15, 0x01];
+        assert_eq!(company_id(&ibeacon), Some(0x004C));
+        // Two manufacturer structures: the first one wins.
+        let two = [0x03, 0xFF, 0x06, 0x00, 0x03, 0xFF, 0x75, 0x00];
+        assert_eq!(company_id(&two), Some(0x0006));
+        // None, too short to hold an identifier, zero length, past the buffer.
+        assert_eq!(company_id(&[0x02, 0x01, 0x06]), None);
+        assert_eq!(company_id(&[0x02, 0xFF, 0x4C]), None);
+        assert_eq!(company_id(&[0x00, 0xFF]), None);
+        assert_eq!(company_id(&[0x05, 0xFF, 0x4C]), None);
+        assert_eq!(company_id(&[]), None);
+    }
+
+    #[test]
+    fn observe_carries_the_company_id_and_nothing_after_it() {
+        let h = DeviceHasher::with_salt([0u8; 32], 8);
+        let adv = RawAdv {
+            event_type: 0x03,
+            addr_type: 0x01,
+            addr: [1, 2, 3, 4, 5, 0x40],
+            rssi: -55,
+            data: vec![0x07, 0xFF, 0x75, 0x00, 0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let obs = h.observe(&adv, 42, None);
+        assert_eq!(obs.company_id, Some(0x0075));
+        // The manufacturer payload never reaches the row: the logged fields are
+        // exactly the pre-existing ones plus the identifier.
+        let v: serde_json::Value = serde_json::to_value(&obs).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["addr_kind", "company_id", "device_hash", "pdu_type", "rssi_dbm", "unix_ts_ns"]
+        );
+        assert_eq!(v["company_id"], 117);
+    }
+
+    #[test]
     fn v1_log_lines_still_parse() {
         // A line written by ble-rssi/1, verbatim shape: no lab fields at all.
         let line = "{\"unix_ts_ns\":1786959444439374442,\"device_hash\":\"a1b2c3d4e5f60708\",\
@@ -1577,6 +1672,7 @@ mod tests {
         assert_eq!(obs.lab_uuid, None);
         assert_eq!(obs.lab_participant_key, None);
         assert_eq!(obs.lab_session_key, None);
+        assert_eq!(obs.company_id, None);
     }
 
     #[test]
@@ -1595,8 +1691,11 @@ mod tests {
                 addr: [1, 2, 3, 4, 5, 0x40 | (i as u8 & 1)],
                 rssi: if i == 3 { 127 } else { -60 - i as i8 },
                 // Rows 0 and 2 are the lab handset; the rest are ambient.
+                // Row 4 carries manufacturer data (Microsoft 0x0006).
                 data: if i % 2 == 0 && i < 4 {
                     lab_adv_data(0x0007, 0x0009, 0x07)
+                } else if i == 4 {
+                    vec![0x04, 0xFF, 0x06, 0x00, 0x01]
                 } else {
                     vec![0x02, 0x01, 0x06]
                 },
@@ -1623,9 +1722,24 @@ mod tests {
         let file_meta = reader.metadata().file_metadata().clone();
         assert_eq!(
             file_meta.schema_descr().num_columns(),
-            11,
-            "ble-rssi/2 is eleven columns"
+            12,
+            "ble-rssi/3 is twelve columns"
         );
+        let cols: Vec<&str> = file_meta
+            .schema_descr()
+            .columns()
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(cols.last(), Some(&"company_id"));
+        // The value survives the round trip: exactly one row has it, and it is 6.
+        use parquet::record::RowAccessor;
+        let ids: Vec<Option<i32>> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|r| r.unwrap().get_int(11).ok())
+            .collect();
+        assert_eq!(ids.iter().flatten().collect::<Vec<_>>(), vec![&6]);
         let kvs = file_meta.key_value_metadata().expect("footer metadata");
         let get = |key: &str| {
             kvs.iter()
