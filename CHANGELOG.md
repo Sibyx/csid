@@ -14,6 +14,23 @@ a field whose meaning changes, or a schema identifier that bumps, is **major**.
 The Python reader (`python/`, `csiq` on PyPI) carries its own version and its
 own changelog in `python/README.md`.
 
+## [Unreleased]
+
+### Added
+
+- **BLE heartbeats carry the interval statistics blescand used to log.** The
+  in-session `ble scanning` line and the continuous `continuous BLE scanning`
+  line now both carry `devices` (distinct pseudonyms in the 10 s interval),
+  `devices_total` (distinct pseudonyms since the salt was drawn: the session
+  for `csid@`, the 30-minute segment for `csid-ble`) and `rssi_median` (omitted
+  when no report in the interval had an RSSI). The continuous line also gains
+  `rate_hz`. The monitoring stack's `monad_ble:*` recording rules read these;
+  before this, the continuous owner logged only a cumulative `observations`.
+- **`BLE segment sealed`** is logged once per continuous segment after its
+  `session.json` is durable, with `rows` and `devices_total`.
+
+Journal fields only: no sidecar, parquet or CSIQ field changes.
+
 ## [0.3.1] - 2026-09-16
 
 Three defects found while reading why the fleet's matrix arms reported

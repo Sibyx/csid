@@ -102,8 +102,8 @@ mod linux {
     use super::BleProbe;
     use crate::ble::{
         command_status, parse_hci_event, scan_enable_command, scan_parameters_command, BleCounters,
-        BleHandle, DeviceHasher, ObservationLog, HCI_EVENT_PKT, OP_LE_SET_SCAN_ENABLE,
-        OP_LE_SET_SCAN_PARAMETERS,
+        BleHandle, DeviceHasher, IntervalStats, ObservationLog, HCI_EVENT_PKT,
+        OP_LE_SET_SCAN_ENABLE, OP_LE_SET_SCAN_PARAMETERS,
     };
     use crate::config::BleConfig;
     use crate::util::now_unix_ns;
@@ -573,6 +573,9 @@ mod linux {
         // off exponentially so a genuinely empty room does not churn the
         // adapter all night, while a wedged one still recovers quickly.
         let mut silent_restarts: u32 = 0;
+        // Outlives scanner restarts: the salt, and so every pseudonym, belongs
+        // to the session, not to one socket.
+        let mut stats = IntervalStats::default();
 
         'session: while !stop.load(Ordering::Relaxed) {
             let mut sc = match pending.take() {
@@ -620,6 +623,7 @@ mod linux {
                                 counters.lab_frames.fetch_add(1, Ordering::Relaxed);
                             }
                             counters.note_observation(unix_ts_ns, cfg.gap_alert_s);
+                            stats.note(&obs);
                             if let Err(e) = log.append(&obs) {
                                 tracing::error!(
                                     error = %e,
@@ -653,10 +657,14 @@ mod linux {
                     let (obs, mean_hz) = counters.snapshot();
                     let window = last_log.elapsed().as_secs_f64();
                     let rate = (obs - last_count) as f64 / window;
+                    let snap = stats.take();
                     tracing::info!(
                         observations = obs,
                         rate_hz = rate,
                         mean_rate_hz = mean_hz,
+                        devices = snap.devices,
+                        devices_total = snap.devices_total,
+                        rssi_median = snap.rssi_median,
                         restarts = counters.scan_restarts.load(Ordering::Relaxed),
                         max_gap_ms = counters.max_gap_ms.load(Ordering::Relaxed),
                         "ble scanning"
@@ -704,6 +712,7 @@ mod linux {
         let mut log = crate::ble_continuous::ContinuousLog::open(root, cfg, segment, &host)?;
         let mut last_report = Instant::now();
         let mut observations = 0u64;
+        let mut reported = 0u64;
         let outcome = (|| -> Result<()> {
             while !stop.load(Ordering::Relaxed) {
                 log.rotate_if_due()?;
@@ -716,7 +725,22 @@ mod linux {
                     }
                 }
                 if last_report.elapsed() >= Duration::from_secs(10) {
-                    tracing::info!(observations, adapter = %cfg.adapter, "continuous BLE scanning");
+                    // Same fields as the in-session `ble scanning` line, so one
+                    // set of recording rules reads both. `observations` counts
+                    // from service start; `devices_total` from the segment's salt.
+                    let rate_hz =
+                        (observations - reported) as f64 / last_report.elapsed().as_secs_f64();
+                    let snap = log.take_interval();
+                    tracing::info!(
+                        observations,
+                        rate_hz,
+                        devices = snap.devices,
+                        devices_total = snap.devices_total,
+                        rssi_median = snap.rssi_median,
+                        adapter = %cfg.adapter,
+                        "continuous BLE scanning"
+                    );
+                    reported = observations;
                     last_report = Instant::now();
                 }
             }

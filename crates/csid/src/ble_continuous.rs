@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ble::{self, DeviceHasher, LabMatcher, ObservationLog, ParquetContext, RawAdv};
+use crate::ble::{
+    self, DeviceHasher, IntervalSnapshot, IntervalStats, LabMatcher, ObservationLog,
+    ParquetContext, RawAdv,
+};
 use crate::config::BleConfig;
 use crate::util::{now_unix_ns, rfc3339_utc};
 use anyhow::{Context, Result};
@@ -19,6 +22,11 @@ pub struct ContinuousLog {
     started_ns: u64,
     log: Option<ObservationLog>,
     hasher: DeviceHasher,
+    /// Heartbeat statistics. Owned by the segment because the salt is: a
+    /// rotation replaces the whole log, so the cumulative label count restarts
+    /// with the pseudonyms it counts. The heartbeat that straddles a rotation
+    /// reports only the part after it.
+    stats: IntervalStats,
     context: ParquetContext,
     exporting: Option<JoinHandle<Result<()>>>,
 }
@@ -45,17 +53,25 @@ impl ContinuousLog {
             started_ns,
             log: Some(ObservationLog::create(&dir, cfg.flush_every)?),
             hasher: DeviceHasher::new_random(cfg.hash_bytes)?,
+            stats: IntervalStats::default(),
             context,
             exporting: None,
         })
     }
 
     pub fn observe(&mut self, adv: &RawAdv, ts: u64, matcher: Option<&LabMatcher>) -> Result<()> {
+        let obs = self.hasher.observe(adv, ts, matcher);
+        self.stats.note(&obs);
         self.log
             .as_mut()
             .context("BLE log already closed")?
-            .append(&self.hasher.observe(adv, ts, matcher))?;
+            .append(&obs)?;
         Ok(())
+    }
+
+    /// The heartbeat's view of the interval just elapsed.
+    pub fn take_interval(&mut self) -> IntervalSnapshot {
+        self.stats.take()
     }
 
     pub fn rotate_if_due(&mut self) -> Result<()> {
@@ -98,6 +114,14 @@ impl ContinuousLog {
             std::fs::write(&tmp, serde_json::to_vec_pretty(&seal)?)?;
             std::fs::File::open(&tmp)?.sync_all()?;
             std::fs::rename(tmp, dir.join("session.json"))?;
+            // The handoff to blescan-sync; `monad_ble:sessions_sealed:rate1h`
+            // counts this line.
+            tracing::info!(
+                session_id = %ctx.session_id,
+                rows = stats.rows,
+                devices_total = stats.distinct_device_hashes,
+                "BLE segment sealed"
+            );
             Ok(())
         }).context("starting BLE export")
     }

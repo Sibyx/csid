@@ -733,6 +733,72 @@ impl BleCounters {
     }
 }
 
+/// What the scan heartbeat reports about one interval: the same quantities
+/// blescand put on its `scanning` line, so the `monad_ble:*` recording rules
+/// read every BLE source with one shape.
+///
+/// `devices` counts distinct pseudonyms in the interval and `devices_total`
+/// distinct pseudonyms since the salt was drawn. Both count ADDRESS labels,
+/// never devices: private addresses rotate, so the total inflates without
+/// bound and only the interval count has a defensible meaning.
+#[derive(Debug, Default)]
+pub struct IntervalStats {
+    interval: std::collections::HashSet<String>,
+    total: std::collections::HashSet<String>,
+    rssi: Vec<i8>,
+}
+
+/// One heartbeat's worth of [`IntervalStats`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IntervalSnapshot {
+    pub devices: u64,
+    pub devices_total: u64,
+    /// `None` when no advertisement in the interval carried an RSSI; the
+    /// heartbeat then omits the field rather than logging a fake zero.
+    pub rssi_median: Option<f64>,
+}
+
+impl IntervalStats {
+    pub fn note(&mut self, obs: &Observation) {
+        if !self.interval.contains(&obs.device_hash) {
+            self.interval.insert(obs.device_hash.clone());
+        }
+        if !self.total.contains(&obs.device_hash) {
+            self.total.insert(obs.device_hash.clone());
+        }
+        if let Some(r) = obs.rssi_dbm {
+            self.rssi.push(r);
+        }
+    }
+
+    /// Report the interval and start the next one. The cumulative set is kept.
+    pub fn take(&mut self) -> IntervalSnapshot {
+        self.rssi.sort_unstable();
+        let n = self.rssi.len();
+        let rssi_median = match n {
+            0 => None,
+            _ if n % 2 == 1 => Some(f64::from(self.rssi[n / 2])),
+            _ => Some((f64::from(self.rssi[n / 2 - 1]) + f64::from(self.rssi[n / 2])) / 2.0),
+        };
+        let snap = IntervalSnapshot {
+            devices: self.interval.len() as u64,
+            devices_total: self.total.len() as u64,
+            rssi_median,
+        };
+        self.interval.clear();
+        self.rssi.clear();
+        snap
+    }
+
+    /// Forget the cumulative set too. Called when the salt changes, because a
+    /// pseudonym from the old salt can never recur.
+    pub fn reset(&mut self) {
+        self.interval.clear();
+        self.total.clear();
+        self.rssi.clear();
+    }
+}
+
 // -- durable log --------------------------------------------------------------
 
 /// Append-only NDJSON writer for the scan thread.
@@ -1141,6 +1207,61 @@ mod tests {
         let mut pkt = vec![0x04u8, 0x3E, params.len() as u8];
         pkt.extend_from_slice(&params);
         pkt
+    }
+
+    #[test]
+    fn interval_stats_count_labels_per_interval_and_since_the_salt() {
+        let hasher = DeviceHasher::with_salt([7u8; 32], 8);
+        let adv = |last: u8, rssi: i8| RawAdv {
+            event_type: 0,
+            addr_type: 1,
+            addr: [1, 2, 3, 4, 5, last],
+            rssi,
+            data: vec![],
+        };
+        let mut stats = IntervalStats::default();
+        for (last, rssi) in [(1, -60), (1, -70), (2, -80)] {
+            stats.note(&hasher.observe(&adv(last, rssi), 0, None));
+        }
+        assert_eq!(
+            stats.take(),
+            IntervalSnapshot {
+                devices: 2,
+                devices_total: 2,
+                rssi_median: Some(-70.0)
+            }
+        );
+        // The next interval hears one old and one new address, and an RSSI of
+        // "unavailable" contributes a label but no reading.
+        stats.note(&hasher.observe(&adv(2, -50), 0, None));
+        stats.note(&hasher.observe(&adv(3, RSSI_UNAVAILABLE), 0, None));
+        assert_eq!(
+            stats.take(),
+            IntervalSnapshot {
+                devices: 2,
+                devices_total: 3,
+                rssi_median: Some(-50.0)
+            }
+        );
+        assert_eq!(
+            stats.take(),
+            IntervalSnapshot {
+                devices: 0,
+                devices_total: 3,
+                rssi_median: None
+            }
+        );
+        stats.reset();
+        stats.note(&hasher.observe(&adv(1, -61), 0, None));
+        stats.note(&hasher.observe(&adv(2, -65), 0, None));
+        assert_eq!(
+            stats.take(),
+            IntervalSnapshot {
+                devices: 2,
+                devices_total: 2,
+                rssi_median: Some(-63.0)
+            }
+        );
     }
 
     #[test]
