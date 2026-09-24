@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "README.md"
+readme = "../../README.md"
 keywords = ["csi", "wifi", "sensing", "802-11", "channel-state-information"]
 categories = ["encoding", "science"]
 
