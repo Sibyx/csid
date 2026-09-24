@@ -465,5 +465,4 @@ on_close = true
         assert!(!c.valid);
         assert!(c.error.unwrap().contains("160MHz"));
     }
-
 }

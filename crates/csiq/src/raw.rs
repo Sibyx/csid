@@ -136,9 +136,7 @@ pub fn decode_bw_antsel(rnf: u32) -> Option<BwAntsel> {
         return None;
     }
     Some(BwAntsel {
-        bandwidth: Bandwidth::from_code(
-            ((rnf >> rnf::CHAN_WIDTH_POS) & rnf::CHAN_WIDTH_MSK) as u8,
-        ),
+        bandwidth: Bandwidth::from_code(((rnf >> rnf::CHAN_WIDTH_POS) & rnf::CHAN_WIDTH_MSK) as u8),
         antenna_sel: ((rnf >> rnf::ANT_POS) & rnf::ANT_MSK) as u8,
     })
 }
@@ -349,7 +347,12 @@ impl<R: Read> RawReader<R> {
             ));
         }
         let csi = &body[csi_start..csi_end];
-        Ok(Some(parse_record_opts(hdr, csi, self.width, self.keep_vendor_hdr)?))
+        Ok(Some(parse_record_opts(
+            hdr,
+            csi,
+            self.width,
+            self.keep_vendor_hdr,
+        )?))
     }
 }
 

@@ -153,8 +153,7 @@ pub fn disputed(
                  function of the channel, so nothing is drawn until those agree. \
                  Check that the tune took effect before trusting this capture."
             ),
-            None => "No band plan: the capture's channel could not be established."
-                .to_string(),
+            None => "No band plan: the capture's channel could not be established.".to_string(),
         },
         ..Default::default()
     }
@@ -208,22 +207,14 @@ pub fn compute(channel: u32, ntone: usize, spacing_hz: f64) -> Bandplan {
             artefact_distance: tones::artefact_distance(i, ntone),
         });
     }
-    plan.advertising_inside = plan
-        .inside
-        .iter()
-        .filter_map(|l| l.advertising)
-        .collect();
+    plan.advertising_inside = plan.inside.iter().filter_map(|l| l.advertising).collect();
 
     plan.verdict = verdict(&plan);
     plan
 }
 
 fn verdict(plan: &Bandplan) -> String {
-    let Some(adv) = plan
-        .inside
-        .iter()
-        .find(|l| l.advertising.is_some())
-    else {
+    let Some(adv) = plan.inside.iter().find(|l| l.advertising.is_some()) else {
         return format!(
             "No BLE advertising channel is inside this passband — only data \
              channels can ever appear ({} of 37 in band). An exclusion arm here \
@@ -264,16 +255,32 @@ mod tests {
     #[test]
     fn ch13_is_refused_and_ch3_is_recommended() {
         let bad = compute(13, 52, LEGACY);
-        let adv = bad.inside.iter().find(|l| l.advertising == Some(39)).unwrap();
+        let adv = bad
+            .inside
+            .iter()
+            .find(|l| l.advertising == Some(39))
+            .unwrap();
         assert!((adv.array_index - 50.6).abs() < 0.05, "{}", adv.array_index);
         assert!((adv.artefact_distance - 0.4).abs() < 0.05);
-        assert!(bad.verdict.contains("cannot be falsified"), "{}", bad.verdict);
+        assert!(
+            bad.verdict.contains("cannot be falsified"),
+            "{}",
+            bad.verdict
+        );
 
         let good = compute(3, 52, LEGACY);
-        let adv = good.inside.iter().find(|l| l.advertising == Some(38)).unwrap();
+        let adv = good
+            .inside
+            .iter()
+            .find(|l| l.advertising == Some(38))
+            .unwrap();
         assert!((adv.array_index - 37.8).abs() < 0.05, "{}", adv.array_index);
         assert!((adv.artefact_distance - 12.3).abs() < 0.05);
-        assert!(good.verdict.contains("usable inclusion arm"), "{}", good.verdict);
+        assert!(
+            good.verdict.contains("usable inclusion arm"),
+            "{}",
+            good.verdict
+        );
     }
 
     /// The card's central claim about the exclusion arm: ch11 is not a
@@ -284,7 +291,11 @@ mod tests {
         assert!(plan.applicable);
         assert!(plan.advertising_inside.is_empty());
         assert!(!plan.inside.is_empty(), "data channels are still in band");
-        assert!(plan.verdict.contains("ZERO-advertising"), "{}", plan.verdict);
+        assert!(
+            plan.verdict.contains("ZERO-advertising"),
+            "{}",
+            plan.verdict
+        );
     }
 
     /// The ch6 capture measured on 2026-08-17: eight BLE channels in band and
@@ -301,7 +312,11 @@ mod tests {
         let plan = compute(36, 52, LEGACY);
         assert!(!plan.applicable);
         assert!(plan.inside.is_empty());
-        assert!(plan.verdict.contains("negative control"), "{}", plan.verdict);
+        assert!(
+            plan.verdict.contains("negative control"),
+            "{}",
+            plan.verdict
+        );
     }
 
     /// Advertising channel 37 is unreachable on every legal European channel:

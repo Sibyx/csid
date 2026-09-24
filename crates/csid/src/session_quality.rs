@@ -83,10 +83,16 @@ fn is_segment_dir(name: &str) -> bool {
 ///   (30 min into a matrix arm) the old scan would have found two matches and
 ///   refused. The root is what the caller wants: its directory is where the
 ///   protocol evidence lives.
-fn locate(spool: &Path, run_id: &str, profile: &str) -> Result<(std::path::PathBuf, serde_json::Value)> {
+fn locate(
+    spool: &Path,
+    run_id: &str,
+    profile: &str,
+) -> Result<(std::path::PathBuf, serde_json::Value)> {
     let needle = format!("_{profile}_");
     let mut matches = Vec::new();
-    for entry in std::fs::read_dir(spool).with_context(|| format!("reading spool {}", spool.display()))? {
+    for entry in
+        std::fs::read_dir(spool).with_context(|| format!("reading spool {}", spool.display()))?
+    {
         let dir = entry?.path();
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -221,8 +227,12 @@ mod tests {
 
     #[test]
     fn segment_suffix_is_recognised_exactly() {
-        assert!(is_segment_dir("monad05_explore-lib-matrix-wide-3h-tx_20260916-052142-seg0003"));
-        assert!(!is_segment_dir("monad05_explore-lib-matrix-wide-3h-tx_20260916-052142"));
+        assert!(is_segment_dir(
+            "monad05_explore-lib-matrix-wide-3h-tx_20260916-052142-seg0003"
+        ));
+        assert!(!is_segment_dir(
+            "monad05_explore-lib-matrix-wide-3h-tx_20260916-052142"
+        ));
         assert!(!is_segment_dir("monad05_seg-profile_20260916-052142"));
         assert!(!is_segment_dir("monad05_x_20260916-seg12"));
     }
@@ -260,10 +270,23 @@ mod tests {
     #[test]
     fn a_sealed_segment_is_not_a_second_session() {
         let spool = scratch("segment");
-        let body = r#"{"run_id":"r1","experiment":"explore-lib-matrix-wide-3h","status":"capturing"}"#;
-        session(&spool, "monad03_explore-lib-matrix-wide-3h_20260916-051548", body);
-        session(&spool, "monad03_explore-lib-matrix-wide-3h_20260916-051548-seg0000", body);
-        session(&spool, "monad03_explore-lib-matrix-wide-3h_20260916-051548-seg0001", body);
+        let body =
+            r#"{"run_id":"r1","experiment":"explore-lib-matrix-wide-3h","status":"capturing"}"#;
+        session(
+            &spool,
+            "monad03_explore-lib-matrix-wide-3h_20260916-051548",
+            body,
+        );
+        session(
+            &spool,
+            "monad03_explore-lib-matrix-wide-3h_20260916-051548-seg0000",
+            body,
+        );
+        session(
+            &spool,
+            "monad03_explore-lib-matrix-wide-3h_20260916-051548-seg0001",
+            body,
+        );
         // Same run id, a different profile on the same node: not a match either.
         session(
             &spool,

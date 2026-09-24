@@ -886,7 +886,7 @@ const FS_RELEASE: f64 = 0.005;
 /// trade: a too-wide Doppler axis wastes bins, a too-narrow one invents
 /// velocities.
 fn track_doppler_fs(held: &mut f64, fs_window: f64) -> f64 {
-    if !(fs_window > 0.0) {
+    if fs_window.is_nan() || fs_window <= 0.0 {
         return dsp::snap_rate_hz(*held);
     }
     if fs_window > *held {

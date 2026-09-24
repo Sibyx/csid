@@ -133,7 +133,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install reference reader
-        run: pip install numpy ./python
+        # `csid export` writes `capture.csiq.zst`, and Python 3.12 has no stdlib
+        # zstd, so the reader needs its `zstd` extra to open it.
+        run: pip install numpy './python[zstd]'
       - name: Build csid
         run: cargo build --release -p csid
       - name: Synthesise a raw capture, export, and read it from Python

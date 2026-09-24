@@ -136,9 +136,7 @@ fn run(cli: Cli) -> Result<()> {
     ingest::spawn(source, hub.clone())?;
 
     if cli.read_only {
-        tracing::info!(
-            "--read-only is accepted and ignored: the console has no write surface"
-        );
+        tracing::info!("--read-only is accepted and ignored: the console has no write surface");
     }
 
     if !cli.bind.ip().is_loopback() {

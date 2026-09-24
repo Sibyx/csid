@@ -158,7 +158,11 @@ pub fn encode_payload(r: &CsiRecord) -> Vec<u8> {
         put_tlv(&mut out, T_PHY, &[mod_code, p.mcs, p.nss]);
     }
     if let Some(b) = r.bw_antsel {
-        put_tlv(&mut out, T_BW_ANTSEL, &[b.bandwidth.to_code(), b.antenna_sel]);
+        put_tlv(
+            &mut out,
+            T_BW_ANTSEL,
+            &[b.bandwidth.to_code(), b.antenna_sel],
+        );
     }
     if let Some(m) = r.mono_us {
         put_tlv(&mut out, T_MONO_US, &m.to_le_bytes());

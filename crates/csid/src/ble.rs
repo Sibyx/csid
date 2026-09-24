@@ -685,6 +685,9 @@ fn write_key_file(path: &Path, day: u64, key: &FleetKey) -> Result<()> {
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("replacing the BLE fleet key {}", path.display()))?;
+    // A directory fsync is how POSIX makes a rename durable. Windows cannot
+    // open a directory as a file, and NTFS journals the rename itself.
+    #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -2291,7 +2294,14 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["addr_kind", "company_id", "device_hash", "pdu_type", "rssi_dbm", "unix_ts_ns"]
+            [
+                "addr_kind",
+                "company_id",
+                "device_hash",
+                "pdu_type",
+                "rssi_dbm",
+                "unix_ts_ns"
+            ]
         );
         assert_eq!(v["company_id"], 117);
     }

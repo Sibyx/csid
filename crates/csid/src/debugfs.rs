@@ -186,6 +186,10 @@ mod tests {
 
     /// A device directory with no readable `nic_temp` must not stop the scan:
     /// on a host with a second iwlwifi device the answer is the one that reads.
+    ///
+    /// Unix only: the fixture keeps debugfs's real PCI-address names, and
+    /// Windows forbids the `:` in them.
+    #[cfg(unix)]
     #[test]
     fn the_scan_skips_a_device_that_does_not_answer() {
         let root = std::env::temp_dir().join(format!("csid-dbgfs-{}", std::process::id()));

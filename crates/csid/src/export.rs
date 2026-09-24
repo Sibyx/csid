@@ -40,7 +40,8 @@ const ZSTD_LEVEL: i32 = 3;
 /// Keyed on the extension rather than a flag, so the file's own name is the
 /// single statement of how it is stored and a directory listing cannot lie.
 pub fn is_compressed(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zst"))
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("zst"))
 }
 
 /// Convert a raw capture into a `.csiq`, embedding `session` as the session
@@ -85,13 +86,14 @@ pub fn raw_to_csiq_lossless(
 /// `capture.csiq.zst`. Both hold the same CSIQ v1 byte stream.
 pub fn open_csiq(path: &Path) -> Result<csiq::Reader<Box<dyn std::io::Read>>> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let inner: Box<dyn std::io::Read> = if is_compressed(path) {
-        Box::new(zstd::Decoder::new(BufReader::new(f)).with_context(|| {
-            format!("{} is named .zst but is not a zstd frame", path.display())
-        })?)
-    } else {
-        Box::new(BufReader::new(f))
-    };
+    let inner: Box<dyn std::io::Read> =
+        if is_compressed(path) {
+            Box::new(zstd::Decoder::new(BufReader::new(f)).with_context(|| {
+                format!("{} is named .zst but is not a zstd frame", path.display())
+            })?)
+        } else {
+            Box::new(BufReader::new(f))
+        };
     csiq::Reader::new(inner).with_context(|| format!("reading {}", path.display()))
 }
 
@@ -149,7 +151,8 @@ fn convert(
         return Ok(n);
     }
 
-    let writer = csiq::Writer::new(BufWriter::new(output), session).context("writing CSIQ header")?;
+    let writer =
+        csiq::Writer::new(BufWriter::new(output), session).context("writing CSIQ header")?;
     let (n, _) = drain(&mut reader, writer)?;
     Ok(n)
 }
@@ -164,7 +167,6 @@ fn drain<R: std::io::Read, W: std::io::Write>(
     reader: &mut csiq::raw::RawReader<R>,
     mut writer: csiq::Writer<W>,
 ) -> Result<(u64, W)> {
-
     let mut n = 0u64;
     let mut skipped = 0u64;
     loop {

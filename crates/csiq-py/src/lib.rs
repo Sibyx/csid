@@ -292,6 +292,9 @@ fn csiq_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FastRecords>()?;
     m.add_function(wrap_pyfunction!(read_csiq, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;
-    m.add("__doc__", "PyO3 accelerator for the CSIQ reader (csiq[fast]).")?;
+    m.add(
+        "__doc__",
+        "PyO3 accelerator for the CSIQ reader (csiq[fast]).",
+    )?;
     Ok(())
 }

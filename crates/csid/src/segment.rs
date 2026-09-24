@@ -380,7 +380,8 @@ impl BleCursor {
                         first_seen = obs.unix_ts_ns;
                     }
                     if prev_ns != 0 {
-                        max_gap_ms = max_gap_ms.max(obs.unix_ts_ns.saturating_sub(prev_ns) / 1_000_000);
+                        max_gap_ms =
+                            max_gap_ms.max(obs.unix_ts_ns.saturating_sub(prev_ns) / 1_000_000);
                     }
                     prev_ns = obs.unix_ts_ns;
                     last_seen = obs.unix_ts_ns;
@@ -677,7 +678,10 @@ mod tests {
     fn write_raw(path: &Path, records: usize) {
         let mut buf = Vec::new();
         for i in 0..records {
-            buf.extend_from_slice(&raw_record(52, 1_700_000_000_000_000_000 + i as u64 * 10_000_000));
+            buf.extend_from_slice(&raw_record(
+                52,
+                1_700_000_000_000_000_000 + i as u64 * 10_000_000,
+            ));
         }
         std::fs::write(path, buf).unwrap();
     }
@@ -829,14 +833,9 @@ on_close = true
         );
         let value = serde_json::to_value(&finalised).unwrap();
 
-        let out = scratch.join("capture.csiq");  // plain, this test drives convert() directly
-        crate::export::raw_to_csiq_with_session(
-            &raw,
-            &out,
-            csiq::Width::Ht20,
-            Some(&value),
-        )
-        .unwrap();
+        let out = scratch.join("capture.csiq"); // plain, this test drives convert() directly
+        crate::export::raw_to_csiq_with_session(&raw, &out, csiq::Width::Ht20, Some(&value))
+            .unwrap();
 
         assert_eq!(session_block(&out)["status"], "complete");
         let on_disk: serde_json::Value =
@@ -895,7 +894,11 @@ on_close = true
         seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
 
         let out = csiq_path(&scratch);
-        assert!(out.is_file(), "the sealer must write {}", crate::export::CSIQ_NAME);
+        assert!(
+            out.is_file(),
+            "the sealer must write {}",
+            crate::export::CSIQ_NAME
+        );
         assert!(
             !scratch.join("capture.csiq").exists(),
             "the plain name must not also be written — one file, one envelope"

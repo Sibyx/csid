@@ -453,7 +453,11 @@ mod tests {
         // The MPDU starts one byte earlier than in the radiotap-rate case.
         assert_eq!(&f[8..10], &[0x08, 0x00], "802.11 data frame at offset 8");
         assert_eq!(&f[12..18], &[0xff; 6], "addr1 broadcast");
-        assert_eq!(&f[18..24], &parse_mac("ef:be:ad:de:ad:de"), "addr2 sentinel");
+        assert_eq!(
+            &f[18..24],
+            &parse_mac("ef:be:ad:de:ad:de"),
+            "addr2 sentinel"
+        );
         assert_eq!(&f[32..36], b"CSID", "payload magic");
         assert_eq!(f.len(), 8 + cfg().frame_bytes);
     }

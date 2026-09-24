@@ -6,7 +6,7 @@ the specification alone. That is only credible if it is tested across
 implementations, so this drives the real `csid` binary:
 
   1. synthesise a driver-native `capture.raw` (framing per docs Appendix A)
-  2. run `csid export` to produce `capture.csiq`
+  2. run `csid export` to produce `capture.csiq.zst`
   3. read the container with the Python reference reader
   4. assert every field survives, and that raw and CSIQ agree
 
@@ -66,8 +66,8 @@ def synthesise_raw(path: Path) -> None:
     vals = []
     for c in range(chains):
         for t in range(NTONE):
-            vals.append(-(c * 100 + t))   # imag
-            vals.append(c * 100 + t)      # real
+            vals.append(-(c * 100 + t))  # imag
+            vals.append(c * 100 + t)  # real
     csi = b"".join(struct.pack("<h", v) for v in vals)
 
     body = struct.pack(">I", len(hdr)) + bytes(hdr) + struct.pack(">I", len(csi)) + csi
@@ -80,7 +80,9 @@ def csid_binary() -> Path:
         candidate = ROOT / "target" / profile / "csid"
         if candidate.is_file():
             return candidate
-    raise SystemExit("csid binary not found — run `cargo build --release -p csid` first")
+    raise SystemExit(
+        "csid binary not found — run `cargo build --release -p csid` first"
+    )
 
 
 def main() -> int:
@@ -105,7 +107,9 @@ def main() -> int:
             capture_output=True,
         )
 
-        meta, records = read_csiq(session / "capture.csiq")
+        # The export's own name for its output (`export::CSIQ_NAME`): the
+        # compressed envelope, which the reader opens by extension.
+        meta, records = read_csiq(session / "capture.csiq.zst")
         recs = list(records)
 
         # -- the embedded session block survived the round trip

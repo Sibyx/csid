@@ -203,7 +203,12 @@ impl ContinuousLog {
         std::thread::Builder::new().name("ble-export".into()).spawn(move || {
             let dir = path.parent().context("BLE log parent")?;
             let stats = ble::export_parquet(&path, &dir.join(ble::PARQUET_NAME), &ctx)?;
-            std::fs::File::open(dir.join(ble::PARQUET_NAME))?.sync_all()?;
+            // Opened for writing because Windows refuses to flush a read-only
+            // handle; on Linux the fsync is the same either way.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(ble::PARQUET_NAME))?
+                .sync_all()?;
             let nominal_start_s = index * segment_s;
             let (hash_scope, salt) = match &ctx.salt_scope {
                 SaltScope::FleetSegment { key_day, key_id, .. } => (
@@ -242,7 +247,10 @@ impl ContinuousLog {
             });
             let tmp = dir.join("session.json.tmp");
             std::fs::write(&tmp, serde_json::to_vec_pretty(&seal)?)?;
-            std::fs::File::open(&tmp)?.sync_all()?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()?;
             std::fs::rename(tmp, dir.join("session.json"))?;
             // The handoff to blescan-sync; `monad_ble:sessions_sealed:rate1h`
             // counts this line.

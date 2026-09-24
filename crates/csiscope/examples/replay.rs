@@ -73,7 +73,13 @@ struct Cli {
 /// Every field is read out of the session's own `metadata.json`; nothing is
 /// invented. `records` and `uptime_s` advance as the replay does, because those
 /// are the two the console watches move.
-fn publish_status(path: &PathBuf, meta: &serde_json::Value, records: u64, empty: u64, uptime_s: u64) {
+fn publish_status(
+    path: &PathBuf,
+    meta: &serde_json::Value,
+    records: u64,
+    empty: u64,
+    uptime_s: u64,
+) {
     let radio = &meta["radio"];
     let summary = &meta["summary"];
     let doc = serde_json::json!({

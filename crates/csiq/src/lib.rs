@@ -181,7 +181,10 @@ mod tests {
     #[test]
     fn bw_antsel_round_trips_through_the_container() {
         let rec = sample_record(242, 2, 1);
-        assert!(rec.bw_antsel.is_some(), "the fixture must exercise the field");
+        assert!(
+            rec.bw_antsel.is_some(),
+            "the fixture must exercise the field"
+        );
 
         let payload = crate::tlv::encode_payload(&rec);
         let back = crate::tlv::decode_payload(&payload).expect("round trip");

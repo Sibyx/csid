@@ -351,7 +351,6 @@ pub fn quantise_db(values: &[f32], db_min: f32, db_max: f32, out: &mut Vec<u8>) 
     }));
 }
 
-
 /// Parse `aa:bb:cc:dd:ee:ff` (any case, `-` also accepted) into six bytes.
 ///
 /// Deliberately strict about length and separators: a half-parsed MAC would

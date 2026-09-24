@@ -1005,7 +1005,7 @@ pub struct Doppler {
 /// 49 Hz both land on 50, so the spectrogram's axis holds still while the
 /// channel breathes, and only a genuine change of regime moves it.
 pub fn snap_rate_hz(fs: f64) -> f64 {
-    if !(fs > 0.0) {
+    if fs.is_nan() || fs <= 0.0 {
         return 0.0;
     }
     let decade = 10f64.powf(fs.log10().floor());
@@ -1194,7 +1194,7 @@ pub fn doppler_into(
     } else {
         snap_rate_hz(fs_window)
     };
-    if !(fs > 0.0) {
+    if fs.is_nan() || fs <= 0.0 {
         return;
     }
 
@@ -1743,7 +1743,7 @@ fn infer_slot_us(sorted_gaps_us: &[f32]) -> Option<f64> {
         return None;
     }
     let seed = sorted_gaps_us[sorted_gaps_us.len() / 4] as f64;
-    if !(seed > 0.0) {
+    if seed.is_nan() || seed <= 0.0 {
         return None;
     }
     let (lo, hi) = (seed * 0.7, seed * 1.3);
@@ -2924,7 +2924,7 @@ mod tests {
         // Gaps spread over a decade with no mode.
         let mut t = vec![0u64];
         for i in 1..400u64 {
-            let step = 1_000_000 + (i * 7919 % 40_000) as u64 * 1000;
+            let step = 1_000_000 + (i * 7919 % 40_000) * 1000;
             t.push(t[i as usize - 1] + step);
         }
         let mut m = Metronome::default();

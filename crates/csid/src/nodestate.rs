@@ -163,7 +163,10 @@ mod tests {
         let s = read_now(Path::new("/nonexistent-path-for-this-test"));
         // On a dev machine most of these are absent; the contract is only that
         // reading them cannot panic and cannot invent a value.
-        assert!(s.spool_free_bytes.is_none(), "a missing path has no free bytes");
+        assert!(
+            s.spool_free_bytes.is_none(),
+            "a missing path has no free bytes"
+        );
     }
 
     /// Zero is a real load and a real temperature. `None` means not measured,
