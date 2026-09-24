@@ -530,10 +530,8 @@ mod imp {
 
     use super::{classify, CensusCounters, CensusHandle, CensusLog, CensusOutcome, Minute, Totals};
     use crate::config::CensusConfig;
-    use crate::rawsock::{RxSocket, PACKET_OUTGOING};
+    use crate::rawsock::{RxSocket, FRAME_BUF, PACKET_OUTGOING};
     use crate::util;
-
-    const FRAME_BUF: usize = 4096;
 
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(

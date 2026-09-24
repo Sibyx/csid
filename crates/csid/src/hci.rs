@@ -59,6 +59,7 @@ mod portable {
         _root: &Path,
         _cfg: &BleConfig,
         _segment: std::time::Duration,
+        _chain: crate::ble::FleetKeyChain,
         _stop: Arc<AtomicBool>,
     ) -> Result<()> {
         anyhow::bail!("continuous BLE scanning requires Linux")
@@ -702,6 +703,7 @@ mod linux {
         root: &Path,
         cfg: &BleConfig,
         segment: Duration,
+        chain: crate::ble::FleetKeyChain,
         stop: Arc<AtomicBool>,
     ) -> Result<()> {
         cfg.validate()?;
@@ -709,7 +711,7 @@ mod linux {
         let mut scanner = Scanner::open(cfg)?;
         let matcher = cfg.lab_matcher()?;
         let host = std::fs::read_to_string("/etc/hostname")?.trim().to_string();
-        let mut log = crate::ble_continuous::ContinuousLog::open(root, cfg, segment, &host)?;
+        let mut log = crate::ble_continuous::ContinuousLog::open(root, cfg, segment, &host, chain)?;
         let mut last_report = Instant::now();
         let mut observations = 0u64;
         let mut reported = 0u64;

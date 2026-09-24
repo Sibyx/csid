@@ -11,6 +11,31 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Style and lints are their own jobs, so a formatting or lint failure is
+  # visible on every push without holding back the binaries the fleet runs.
+  fmt:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   # The real target: the capture path (netlink, debugfs, realtime scheduling)
   # only compiles on Linux, so this is the job that proves the daemon builds.
   linux:
@@ -19,13 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       - name: Release build
@@ -48,30 +67,40 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # aarch64 is the deployment target (Raspberry Pi 5).
-  cross:
-    name: cross-build aarch64
-    runs-on: ubuntu-latest
+  # The binaries the fleet runs. `roles/csid` in monad-knowledge downloads the
+  # artifact of the exact commit checked out on the control node, so a node
+  # never compiles anything (a Pi 5 build took ~13 min and starved captures of
+  # memory). Native arm64 on the SAME Ubuntu release as the node image (24.04,
+  # glibc 2.39): a binary linked against a newer glibc does not start on a node,
+  # so this runner is pinned and moves only when the node image moves. The
+  # tests run here, on the target architecture, before anything is uploaded;
+  # the artifact exists only for a commit whose shipped crates passed.
+  pi-release:
+    name: pi release (aarch64)
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross linker
+      - name: Test the shipped crates on aarch64
+        run: cargo test -p csiq -p csid -p csiscope -p collector
+      - name: Release build
+        run: cargo build --release -p csid -p csiscope -p collector
+      - name: Stage the binaries with a manifest
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target aarch64-unknown-linux-gnu --workspace
+          mkdir -p dist
+          cp target/release/csid target/release/csiscope target/release/collectord dist/
+          cd dist
+          sha256sum csid csiscope collectord > SHA256SUMS
+          echo "${GITHUB_SHA}" > COMMIT
+          ldd --version | head -n 1 > GLIBC
+          ./csid --version > VERSION
       - uses: actions/upload-artifact@v4
         with:
-          name: csid-aarch64
-          path: |
-            target/aarch64-unknown-linux-gnu/release/csid
-            target/aarch64-unknown-linux-gnu/release/csiscope
+          name: csid-aarch64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
 
   # `csid-prune` is the only thing in this repo that deletes measurements, and
   # until 2026-08-18 it had no test — which is how it came to keep `capture.csiq`

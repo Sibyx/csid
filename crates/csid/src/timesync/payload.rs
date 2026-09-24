@@ -419,8 +419,10 @@ mod tests {
     /// reads `it_len` rather than assuming 9, and this pins that.
     #[test]
     fn it_recognises_a_frame_built_with_an_empty_radiotap_header() {
-        let mut cfg = crate::config::InjectConfig::default();
-        cfg.monitor_tx_rate = 0x4100;
+        let cfg = crate::config::InjectConfig {
+            monitor_tx_rate: 0x4100,
+            ..Default::default()
+        };
         let built = crate::inject::build_frame(&cfg, 11, 1_786_000_000_000_000_002);
         assert_eq!(
             u16::from_le_bytes([built[2], built[3]]),

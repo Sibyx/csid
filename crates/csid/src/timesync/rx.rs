@@ -58,10 +58,7 @@ mod imp {
     use crate::config::TimesyncConfig;
     use crate::util;
 
-    use crate::rawsock::{RxSocket, PACKET_OUTGOING};
-
-    /// Big enough for any 802.11 MPDU plus radiotap.
-    const FRAME_BUF: usize = 4096;
+    use crate::rawsock::{RxSocket, FRAME_BUF, PACKET_OUTGOING};
 
     pub fn spawn(
         dir: &Path,

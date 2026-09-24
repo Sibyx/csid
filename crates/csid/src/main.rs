@@ -68,6 +68,12 @@ enum Command {
         root: PathBuf,
         #[arg(long, default_value = "30m", value_parser = parse_duration)]
         segment: Duration,
+        /// The fleet key chain file (`csid-ble-fleet-key/2`, mode 0400). Every
+        /// node seeded alike holds the same key per UTC day and derives the same
+        /// salt per wall-clock segment; the file is rewritten each day and the
+        /// previous day's key is gone.
+        #[arg(long, default_value = csid::ble::DEFAULT_FLEET_KEY_PATH)]
+        fleet_key: PathBuf,
     },
     /// Run a capture session (the systemd ExecStart).
     Run {
@@ -467,6 +473,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             experiment,
             root,
             segment,
+            fleet_key,
         } => {
             let cfg = csid::config::ExperimentConfig::resolve(experiment, &cli.experiments)?;
             cfg.ble.validate()?;
@@ -475,7 +482,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 segment.as_secs() >= 60,
                 "BLE segments must be at least 60 seconds"
             );
-            csid::hci::continuous(root, &cfg.ble, *segment, stop_flag())
+            let chain = csid::ble::FleetKeyChain::load(fleet_key)?;
+            csid::hci::continuous(root, &cfg.ble, *segment, chain, stop_flag())
         }
         Command::Run {
             experiment,

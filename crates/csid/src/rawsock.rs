@@ -22,7 +22,7 @@
 //!    session's own close.
 
 #[cfg(target_os = "linux")]
-pub use imp::{Frame, RxSocket, PACKET_OUTGOING};
+pub use imp::{Frame, RxSocket, FRAME_BUF, PACKET_OUTGOING};
 
 #[cfg(target_os = "linux")]
 mod imp {

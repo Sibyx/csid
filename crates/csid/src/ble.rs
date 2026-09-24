@@ -39,6 +39,14 @@
 //!   pseudonym *without the salt* is still a 2²⁵⁶ search; with the salt it would
 //!   be trivially enumerable, which is precisely why the salt never leaves RAM.
 //!
+//! The continuous archive (`csid ble-continuous`) is the one exception: its
+//! salt is derived per wall-clock segment from the UTC day's fleet key, which
+//! every node holds that day ([`FleetKeyChain`]), so pseudonyms join across
+//! nodes inside a segment. That salt also never leaves RAM. The day's key
+//! could recompute it, so the key lives only in a root-only file, and at the
+//! end of the day it is replaced by a one-way step: a finished day cannot be
+//! linked by anyone who did not copy the key.
+//!
 //! ## Rotating addresses
 //!
 //! Modern phones advertise with Resolvable Private Addresses that rotate every
@@ -120,8 +128,9 @@ pub const PARQUET_NAME: &str = "ble_rssi.parquet";
 /// Schema identifier, mirrored into the sidecar and the parquet footer. Bump on
 /// any column change. `/2` adds the nullable lab-identity columns (`lab_uuid`,
 /// `lab_participant_key`, `lab_session_key`) and the self-describing footer.
-/// `/3` adds the nullable `company_id` column.
-pub const PARQUET_SCHEMA: &str = "ble-rssi/3";
+/// `/3` adds the nullable `company_id` column. `/4` adds the nullable `oui`
+/// column (the IEEE prefix of a public address; null for every random one).
+pub const PARQUET_SCHEMA: &str = "ble-rssi/4";
 /// How the last four bytes of a matched lab UUID are laid out. Written into the
 /// parquet footer so the file explains its own join keys.
 pub const LAB_UUID_LAYOUT: &str =
@@ -290,6 +299,10 @@ pub struct Observation {
     /// advertisement carries none, and on every row of an older log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company_id: Option<u16>,
+    /// IEEE OUI of a public address (`ble-rssi/4`), see [`oui`]. `None` for
+    /// every random address, and on every row of an older log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oui: Option<String>,
 }
 
 // -- hashing ------------------------------------------------------------------
@@ -335,9 +348,19 @@ impl DeviceHasher {
         })
     }
 
-    /// Deterministic construction — tests only. Production always uses
-    /// [`Self::new_random`], because a fixed salt would make pseudonyms
-    /// linkable across sessions.
+    /// The salt every node holding `key` derives for one wall-clock segment
+    /// (see [`FleetKey::segment_salt`]). The continuous archive uses this, so
+    /// one address hashes to one pseudonym on every node inside a segment.
+    pub fn for_fleet_segment(key: &FleetKey, segment_s: u64, index: u64, bytes: usize) -> Self {
+        DeviceHasher {
+            salt: key.segment_salt(segment_s, index),
+            bytes: bytes.clamp(4, 32),
+        }
+    }
+
+    /// Deterministic construction — tests only. Production uses
+    /// [`Self::new_random`] or [`Self::for_fleet_segment`], because a fixed
+    /// salt would make pseudonyms linkable across sessions.
     pub fn with_salt(salt: [u8; 32], bytes: usize) -> Self {
         DeviceHasher {
             salt,
@@ -380,8 +403,328 @@ impl DeviceHasher {
             lab_participant_key: lab.as_ref().map(|f| f.participant_key),
             lab_session_key: lab.map(|f| f.session_key),
             company_id: company_id(&adv.data),
+            oui: oui(adv.addr_type, &adv.addr),
         }
     }
+}
+
+// -- IEEE OUI of a public address ---------------------------------------------
+
+/// The 24-bit IEEE OUI of a public address, as `aa:bb:cc`. Only a public
+/// address (`0x00`, or `0x02` for a resolved public identity) carries one; a
+/// random address has none, so it gets `None` rather than three random bytes
+/// that would look like a vendor. The OUI is shared by every device of its
+/// assignee, so it breaks the population down and identifies nobody; the
+/// remaining 24 bits, which do identify the device, are never stored.
+///
+/// HCI reports the address least-significant byte first, so the OUI is
+/// `addr[5]:addr[4]:addr[3]` (the byte [`AddrKind::classify`] reads its top
+/// bits from).
+pub fn oui(addr_type: u8, addr: &[u8; 6]) -> Option<String> {
+    matches!(addr_type, 0x00 | 0x02)
+        .then(|| format!("{:02x}:{:02x}:{:02x}", addr[5], addr[4], addr[3]))
+}
+
+// -- fleet key (shared per-segment salt) --------------------------------------
+
+/// Domain tag of the per-segment salt derivation. A change of derivation is a
+/// new tag, never a silent edit, because old and new salts must not collide.
+pub const FLEET_SALT_SCHEME: &str = "csid-ble-fleet-salt/1";
+
+/// Where the continuous scanner reads the fleet key unless told otherwise.
+pub const DEFAULT_FLEET_KEY_PATH: &str = "/etc/csid/ble-fleet.key";
+
+/// One UTC day's fleet key: 32 bytes every node holds that day, from which each
+/// node derives the same salt for the same wall-clock segment without talking
+/// to the others. [`FleetKeyChain`] produces it and deletes it at day's end.
+///
+/// What this buys and what it costs, stated plainly:
+///
+/// - **Linkable across nodes within a segment** — one address has one
+///   pseudonym on every node, so per-device RSSI can be compared across nodes.
+/// - **Unlinkable across segments without the key** — the salt changes every
+///   segment, and the salt is never written anywhere.
+/// - **Linkable across the segments of one day WITH that day's key** — so the
+///   key is a secret: a root-only file on the node, never the sidecar, log or
+///   parquet. Once the day is over the key is overwritten by the next one,
+///   which cannot be run backwards, so a finished day is unlinkable for anyone
+///   who did not keep a copy — including us.
+#[derive(Clone)]
+pub struct FleetKey([u8; 32]);
+
+impl std::fmt::Debug for FleetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetKey")
+            .field("key", &"<redacted>")
+            .field("id", &self.id())
+            .finish()
+    }
+}
+
+impl FleetKey {
+    /// Parse 64 hex characters. The error never echoes the input.
+    pub fn from_hex(hex: &str) -> Result<Self> {
+        anyhow::ensure!(
+            hex.len() == 64,
+            "expected 64 hex characters (32 bytes), found {}",
+            hex.len()
+        );
+        let mut key = [0u8; 32];
+        for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
+            let s = std::str::from_utf8(pair).map_err(|_| anyhow::anyhow!("not hex"))?;
+            key[i] = u8::from_str_radix(s, 16).map_err(|_| anyhow::anyhow!("not hex"))?;
+        }
+        anyhow::ensure!(key != [0u8; 32], "the all-zero key is refused");
+        Ok(FleetKey(key))
+    }
+
+    /// Deterministic construction — tests only.
+    pub fn from_bytes(key: [u8; 32]) -> Self {
+        FleetKey(key)
+    }
+
+    /// A public fingerprint of the key: `hex(SHA-256("csid-ble-fleet-key-id/1" ‖ key)[..4])`.
+    /// Written into the seal so a reader can check that every node of a
+    /// segment used the same key, and so a key change shows in the archive.
+    pub fn id(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"csid-ble-fleet-key-id/1");
+        h.update(self.0);
+        h.finalize()[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// `HMAC-SHA256(key, FLEET_SALT_SCHEME ‖ segment_s_be64 ‖ index_be64)`.
+    /// The segment length is in the message, so two deployments with
+    /// different segment lengths never share a salt by coincidence of index.
+    pub fn segment_salt(&self, segment_s: u64, index: u64) -> [u8; 32] {
+        let mut msg = Vec::with_capacity(FLEET_SALT_SCHEME.len() + 16);
+        msg.extend_from_slice(FLEET_SALT_SCHEME.as_bytes());
+        msg.extend_from_slice(&segment_s.to_be_bytes());
+        msg.extend_from_slice(&index.to_be_bytes());
+        hmac_sha256(&self.0, &msg)
+    }
+
+    /// `SHA-256(FLEET_RATCHET_SCHEME ‖ key)`: the next day's key. One-way, so
+    /// holding day d+1 says nothing about day d.
+    fn next_day(&self) -> FleetKey {
+        let mut h = Sha256::new();
+        h.update(FLEET_RATCHET_SCHEME.as_bytes());
+        h.update(self.0);
+        FleetKey(h.finalize().into())
+    }
+
+    fn hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Domain tag of the daily key ratchet.
+pub const FLEET_RATCHET_SCHEME: &str = "csid-ble-fleet-ratchet/1";
+/// First line of the key file; a different format is a different tag.
+pub const FLEET_KEY_FILE_SCHEMA: &str = "csid-ble-fleet-key/2";
+/// A node never ratchets further than this in one step. A clock that jumps
+/// years ahead would otherwise destroy today's key for good; beyond the cap
+/// the node falls back to a random salt and the key file stays as it was.
+pub const MAX_RATCHET_DAYS: u64 = 366;
+
+/// The UTC day a timestamp falls in (days since 1970-01-01).
+pub fn utc_day(unix_ns: u64) -> u64 {
+    unix_ns / 1_000_000_000 / 86_400
+}
+
+/// The node's copy of the fleet key chain: the key of ONE UTC day, and that
+/// day's number. Every node starts from the same one-time seed and moves
+/// forward with [`FleetKey::next_day`], so all nodes hold the same key on the
+/// same day. Moving forward overwrites the file before the new key is used,
+/// and nothing can move it back, so a past day's salts can never be derived
+/// again.
+///
+/// File (mode 0400, root):
+///
+/// ```text
+/// csid-ble-fleet-key/2
+/// day <utc day number>
+/// key <64 hex characters>
+/// ```
+pub struct FleetKeyChain {
+    path: Option<PathBuf>,
+    day: u64,
+    key: FleetKey,
+}
+
+impl std::fmt::Debug for FleetKeyChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetKeyChain")
+            .field("path", &self.path)
+            .field("day", &self.day)
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+impl FleetKeyChain {
+    /// Read the chain. A file that group or others can read is refused,
+    /// because a key that leaked off the node links that day for anyone.
+    pub fn load(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .with_context(|| format!("reading the BLE fleet key {}", path.display()))?
+                .permissions()
+                .mode();
+            anyhow::ensure!(
+                mode & 0o077 == 0,
+                "BLE fleet key {} has mode {:o}; it must not be readable by group or others (chmod 0400)",
+                path.display(),
+                mode & 0o777
+            );
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading the BLE fleet key {}", path.display()))?;
+        let (day, key) = Self::parse(&text)
+            .with_context(|| format!("parsing the BLE fleet key {}", path.display()))?;
+        Ok(FleetKeyChain {
+            path: Some(path.to_owned()),
+            day,
+            key,
+        })
+    }
+
+    fn parse(text: &str) -> Result<(u64, FleetKey)> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        anyhow::ensure!(
+            lines.next() == Some(FLEET_KEY_FILE_SCHEMA),
+            "the first line must be `{FLEET_KEY_FILE_SCHEMA}`"
+        );
+        let day = lines
+            .next()
+            .and_then(|l| l.strip_prefix("day "))
+            .and_then(|d| d.trim().parse::<u64>().ok())
+            .context("the second line must be `day <utc day number>`")?;
+        let key = lines
+            .next()
+            .and_then(|l| l.strip_prefix("key "))
+            .context("the third line must be `key <64 hex characters>`")?;
+        let key = FleetKey::from_hex(key.trim())?;
+        anyhow::ensure!(lines.next().is_none(), "unexpected fourth line");
+        Ok((day, key))
+    }
+
+    /// A chain that never touches the disk — tests only.
+    pub fn in_memory(day: u64, key: FleetKey) -> Self {
+        FleetKeyChain {
+            path: None,
+            day,
+            key,
+        }
+    }
+
+    /// The day the chain currently holds.
+    pub fn day(&self) -> u64 {
+        self.day
+    }
+
+    /// The key of `day`, or `None` when it cannot exist on this node:
+    ///
+    /// - `day` is before the chain's day. That key was deleted, by design.
+    ///   This is the node that booted in the past (no RTC) before chrony
+    ///   stepped it; its frames get a random salt, not a guessed one.
+    /// - `day` is more than [`MAX_RATCHET_DAYS`] ahead, which is a broken
+    ///   clock rather than a long outage. The chain is left untouched.
+    ///
+    /// A later day moves the chain forward and rewrites the file BEFORE the
+    /// new key is returned, so a crash can lose a day's key but never keep an
+    /// old one.
+    pub fn key_for_day(&mut self, day: u64) -> Result<Option<FleetKey>> {
+        if day < self.day || day - self.day > MAX_RATCHET_DAYS {
+            return Ok(None);
+        }
+        if day > self.day {
+            let mut key = self.key.clone();
+            for _ in self.day..day {
+                key = key.next_day();
+            }
+            if let Some(path) = &self.path {
+                write_key_file(path, day, &key)?;
+            }
+            self.day = day;
+            self.key = key;
+        }
+        Ok(Some(self.key.clone()))
+    }
+}
+
+/// Replace the key file atomically: a 0400 temp file beside it, fsync, rename,
+/// fsync the directory. The old day's key is gone from the name the moment the
+/// rename lands.
+fn write_key_file(path: &Path, day: u64, key: &FleetKey) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("BLE fleet key has no parent directory")?;
+    let tmp = dir.join(".ble-fleet.key.tmp");
+    let body = format!("{FLEET_KEY_FILE_SCHEMA}\nday {day}\nkey {}\n", key.hex());
+    // A crash between create and rename leaves a read-only temp file behind.
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o400);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replacing the BLE fleet key {}", path.display()))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// HMAC-SHA256 (RFC 2104) over `sha2`, to avoid a new dependency for twenty
+/// lines. Checked against RFC 4231 test case 2 in the tests.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// How the pseudonyms of one parquet were salted. The footer and the seal
+/// state it, so a file can never be read under the wrong privacy assumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaltScope {
+    /// A random salt per session, dropped at close (`csid run`).
+    Session,
+    /// A random salt per continuous segment, dropped at close: the fallback
+    /// when the node's clock sits before its key's day (see
+    /// [`FleetKeyChain::key_for_day`]). Unlinkable across nodes.
+    Segment,
+    /// The fleet salt of one wall-clock segment (`csid ble-continuous`).
+    FleetSegment {
+        segment_s: u64,
+        index: u64,
+        key_day: u64,
+        key_id: String,
+    },
 }
 
 // -- manufacturer company identifier ------------------------------------------
@@ -910,6 +1253,7 @@ pub struct ParquetContext {
     pub scan_interval_ms: f64,
     pub scan_window_ms: f64,
     pub hash_bytes: usize,
+    pub salt_scope: SaltScope,
 }
 
 /// What the export produced — folded into the sidecar summary.
@@ -978,6 +1322,13 @@ fn parquet_schema() -> Result<Type> {
                 .with_repetition(Repetition::OPTIONAL)
                 .build()?,
         ),
+        // ble-rssi/4 — IEEE OUI of a public address, null for random ones.
+        Arc::new(
+            Type::primitive_type_builder("oui", PhysicalType::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_logical_type(Some(LogicalType::String))
+                .build()?,
+        ),
     ];
     Ok(Type::group_type_builder("ble_rssi")
         .with_fields(fields)
@@ -1015,10 +1366,6 @@ fn footer_metadata(ctx: &ParquetContext) -> Vec<parquet::file::metadata::KeyValu
         kv("hash_bytes", format!("{}", ctx.hash_bytes)),
         kv("salt_persisted", "false".to_string()),
         kv(
-            "pseudonym_scope",
-            "per-session; unlinkable across sessions by construction".to_string(),
-        ),
-        kv(
             "rssi_null_means",
             "controller reported the RSSI-unavailable sentinel (127)".to_string(),
         ),
@@ -1028,9 +1375,52 @@ fn footer_metadata(ctx: &ParquetContext) -> Vec<parquet::file::metadata::KeyValu
              little-endian; the manufacturer payload after it is not read; null = none"
                 .to_string(),
         ),
+        kv(
+            "oui_source",
+            "IEEE OUI (top 24 bits, aa:bb:cc) of a public address (addr_type 0x00 or 0x02); \
+             null for every random address; the device-specific 24 bits are not stored"
+                .to_string(),
+        ),
         kv("writer", format!("csid {}", env!("CARGO_PKG_VERSION"))),
         kv("created_unix_ns", format!("{}", crate::util::now_unix_ns())),
     ];
+    match &ctx.salt_scope {
+        SaltScope::Session => meta.push(kv(
+            "pseudonym_scope",
+            "per-session; unlinkable across sessions by construction".to_string(),
+        )),
+        SaltScope::Segment => meta.push(kv(
+            "pseudonym_scope",
+            "per-segment random salt (node clock before the fleet key's day); \
+             unlinkable across nodes and segments by construction"
+                .to_string(),
+        )),
+        SaltScope::FleetSegment {
+            segment_s,
+            index,
+            key_day,
+            key_id,
+        } => {
+            meta.push(kv(
+                "pseudonym_scope",
+                "fleet-segment; one salt per wall-clock segment shared by every node holding \
+                 that UTC day's fleet key; linkable across nodes within the segment, unlinkable \
+                 across segments without the key; the day's key is deleted when the day ends"
+                    .to_string(),
+            ));
+            meta.push(kv(
+                "salt_derivation",
+                format!(
+                    "hmac-sha256(day_key, \"{FLEET_SALT_SCHEME}\" || segment_s_be64 || index_be64); \
+                     day_key(d+1) = sha256(\"{FLEET_RATCHET_SCHEME}\" || day_key(d))"
+                ),
+            ));
+            meta.push(kv("salt_segment_s", format!("{segment_s}")));
+            meta.push(kv("salt_segment_index", format!("{index}")));
+            meta.push(kv("salt_key_day", format!("{key_day}")));
+            meta.push(kv("salt_key_id", key_id.clone()));
+        }
+    }
     match &ctx.lab_namespace_uuid {
         Some(ns) => {
             meta.push(kv("lab_namespace_uuid", ns.clone()));
@@ -1195,6 +1585,20 @@ fn write_row_group<W: std::io::Write + Send>(
             .write_batch(&vals, Some(&def), None)?;
         col.close()?;
     }
+
+    // ble-rssi/4 OUI, OPTIONAL string with the same encoding as lab_uuid.
+    let mut col = rg.next_column()?.context("column oui missing")?;
+    let def: Vec<i16> = batch
+        .iter()
+        .map(|o| if o.oui.is_some() { 1 } else { 0 })
+        .collect();
+    let vals: Vec<ByteArray> = batch
+        .iter()
+        .filter_map(|o| o.oui.as_deref().map(ByteArray::from))
+        .collect();
+    col.typed::<ByteArrayType>()
+        .write_batch(&vals, Some(&def), None)?;
+    col.close()?;
 
     rg.close()?;
     Ok(batch.len())
@@ -1487,6 +1891,235 @@ mod tests {
         assert_ne!(a, b, "two sessions must draw different salts");
     }
 
+    fn hex32(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// RFC 4231, test case 2: key "Jefe", data "what do ya want for nothing?".
+    #[test]
+    fn hmac_matches_rfc_4231_test_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex32(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// RFC 4231, test case 6: a 131-byte key, longer than the block, is hashed first.
+    #[test]
+    fn hmac_matches_rfc_4231_test_case_6() {
+        let mac = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex32(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn two_nodes_with_one_key_agree_inside_a_segment_and_nowhere_else() {
+        let addr = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        let key = FleetKey::from_bytes([9u8; 32]);
+        let node_a = DeviceHasher::for_fleet_segment(&key, 1800, 994_000, 8);
+        let node_b = DeviceHasher::for_fleet_segment(&key.clone(), 1800, 994_000, 8);
+        assert_eq!(node_a.hash(0x01, &addr), node_b.hash(0x01, &addr));
+
+        let next = DeviceHasher::for_fleet_segment(&key, 1800, 994_001, 8);
+        assert_ne!(node_a.hash(0x01, &addr), next.hash(0x01, &addr));
+
+        let other_len = DeviceHasher::for_fleet_segment(&key, 3600, 994_000, 8);
+        assert_ne!(node_a.hash(0x01, &addr), other_len.hash(0x01, &addr));
+
+        let other_key = FleetKey::from_bytes([8u8; 32]);
+        let foreign = DeviceHasher::for_fleet_segment(&other_key, 1800, 994_000, 8);
+        assert_ne!(node_a.hash(0x01, &addr), foreign.hash(0x01, &addr));
+    }
+
+    #[test]
+    fn fleet_key_parses_64_hex_and_nothing_else() {
+        let good = "0f".repeat(32);
+        assert_eq!(FleetKey::from_hex(&good).unwrap().0, [0x0f; 32]);
+        assert!(FleetKey::from_hex(&"0f".repeat(31)).is_err(), "short");
+        assert!(FleetKey::from_hex(&"zz".repeat(32)).is_err(), "not hex");
+        assert!(FleetKey::from_hex(&"00".repeat(32)).is_err(), "all zero");
+        let err = FleetKey::from_hex(&"zz".repeat(32))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("zzzz"),
+            "the error must not echo the key: {err}"
+        );
+    }
+
+    fn key_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "csid-fleet-key-{tag}-{}",
+            crate::util::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed_file(dir: &Path, day: u64, hex: &str) -> PathBuf {
+        let path = dir.join("ble-fleet.key");
+        std::fs::write(
+            &path,
+            format!("{FLEET_KEY_FILE_SCHEMA}\nday {day}\nkey {hex}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_key_file_readable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = key_dir("mode");
+        let path = seed_file(&dir, 20_720, &"a1".repeat(32));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = FleetKeyChain::load(&path).unwrap_err().to_string();
+        assert!(err.contains("0400"), "{err}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let chain = FleetKeyChain::load(&path).unwrap();
+        assert_eq!((chain.day, chain.key.0), (20_720, [0xa1; 32]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_in_another_format_is_refused() {
+        for text in [
+            "a1".repeat(32),                                                 // the bare-hex draft
+            format!("csid-ble-fleet-key/1\nday 1\nkey {}", "a1".repeat(32)), // wrong tag
+            format!("{FLEET_KEY_FILE_SCHEMA}\nkey {}\nday 1", "a1".repeat(32)), // wrong order
+            format!("{FLEET_KEY_FILE_SCHEMA}\nday x\nkey {}", "a1".repeat(32)), // bad day
+            format!(
+                "{FLEET_KEY_FILE_SCHEMA}\nday 1\nkey {}\nmore",
+                "a1".repeat(32)
+            ),
+        ] {
+            assert!(FleetKeyChain::parse(&text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_chain_moves_forward_overwrites_the_file_and_never_goes_back() {
+        let dir = key_dir("ratchet");
+        let seed = FleetKey::from_bytes([0x11; 32]);
+        let path = seed_file(&dir, 100, &seed.hex());
+        let mut chain = FleetKeyChain::load(&path).unwrap();
+
+        let day100 = chain.key_for_day(100).unwrap().unwrap();
+        assert_eq!(day100.0, seed.0);
+
+        let day103 = chain.key_for_day(103).unwrap().unwrap();
+        assert_eq!(day103.0, seed.next_day().next_day().next_day().0);
+        // The file now holds day 103 only; the seed is gone from disk.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("day 103") && !on_disk.contains(&seed.hex()),
+            "{on_disk}"
+        );
+        assert_eq!(FleetKeyChain::load(&path).unwrap().key.0, day103.0);
+
+        // Earlier days no longer exist, in memory or on disk.
+        assert!(chain.key_for_day(100).unwrap().is_none());
+        assert!(FleetKeyChain::load(&path)
+            .unwrap()
+            .key_for_day(102)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn two_nodes_seeded_alike_hold_the_same_key_whatever_day_they_started() {
+        let seed = FleetKey::from_bytes([0x22; 32]);
+        let mut early = FleetKeyChain::in_memory(100, seed.clone());
+        let mut late = FleetKeyChain::in_memory(100, seed);
+        early.key_for_day(101).unwrap(); // this node ran through day 101
+        assert_eq!(
+            early.key_for_day(105).unwrap().unwrap().0,
+            late.key_for_day(105).unwrap().unwrap().0,
+            "a node that was off for days catches up to the same key"
+        );
+    }
+
+    #[test]
+    fn a_wild_clock_leaves_the_chain_alone() {
+        let seed = FleetKey::from_bytes([0x33; 32]);
+        let mut chain = FleetKeyChain::in_memory(100, seed.clone());
+        assert!(chain
+            .key_for_day(100 + MAX_RATCHET_DAYS + 1)
+            .unwrap()
+            .is_none());
+        assert_eq!(chain.day(), 100, "no key was destroyed");
+        assert_eq!(chain.key_for_day(100).unwrap().unwrap().0, seed.0);
+    }
+
+    #[test]
+    fn utc_day_counts_days_since_the_epoch() {
+        assert_eq!(utc_day(0), 0);
+        assert_eq!(utc_day(86_399_999_999_999), 0);
+        assert_eq!(utc_day(86_400_000_000_000), 1);
+        // 2026-09-24 12:00 UTC is day 20720.
+        assert_eq!(utc_day(1_790_251_200_000_000_000), 20_720);
+    }
+
+    #[test]
+    fn fleet_key_debug_and_id_never_carry_the_key() {
+        let key = FleetKey::from_bytes([0xAB; 32]);
+        let rendered = format!("{key:?}");
+        assert!(rendered.contains("redacted"));
+        assert!(!rendered.contains(&"ab".repeat(8)));
+        assert_eq!(key.id().len(), 8);
+        assert_eq!(key.id(), FleetKey::from_bytes([0xAB; 32]).id());
+        assert_ne!(key.id(), FleetKey::from_bytes([0xAC; 32]).id());
+    }
+
+    #[test]
+    fn footer_states_the_fleet_scope() {
+        let mut ctx = test_ctx();
+        ctx.salt_scope = SaltScope::FleetSegment {
+            segment_s: 1800,
+            index: 994_000,
+            key_day: 20_720,
+            key_id: "0a1b2c3d".into(),
+        };
+        let meta = footer_metadata(&ctx);
+        let get = |k: &str| {
+            meta.iter()
+                .find(|kv| kv.key == format!("csid.{k}"))
+                .and_then(|kv| kv.value.clone())
+                .unwrap_or_default()
+        };
+        assert!(get("pseudonym_scope").starts_with("fleet-segment"));
+        assert_eq!(get("salt_segment_s"), "1800");
+        assert_eq!(get("salt_segment_index"), "994000");
+        assert_eq!(get("salt_key_id"), "0a1b2c3d");
+        assert_eq!(get("salt_key_day"), "20720");
+        assert!(get("salt_derivation").contains(FLEET_SALT_SCHEME));
+        assert!(get("salt_derivation").contains(FLEET_RATCHET_SCHEME));
+        assert_eq!(get("salt_persisted"), "false");
+
+        let session = footer_metadata(&test_ctx());
+        let scope = session
+            .iter()
+            .find(|kv| kv.key == "csid.pseudonym_scope")
+            .and_then(|kv| kv.value.clone())
+            .unwrap();
+        assert!(scope.starts_with("per-session"));
+        assert!(!session.iter().any(|kv| kv.key == "csid.salt_key_id"));
+    }
+
     #[test]
     fn debug_never_renders_the_salt() {
         let h = DeviceHasher::with_salt([0xAB; 32], 8);
@@ -1552,6 +2185,7 @@ mod tests {
             scan_interval_ms: 100.0,
             scan_window_ms: 100.0,
             hash_bytes: 8,
+            salt_scope: SaltScope::Session,
         }
     }
 
@@ -1663,6 +2297,33 @@ mod tests {
     }
 
     #[test]
+    fn oui_is_the_top_three_bytes_of_a_public_address_only() {
+        // HCI order: least-significant byte first, so the OUI is bytes 5, 4, 3.
+        let addr = [0x66, 0x55, 0x44, 0x0c, 0x0b, 0x0a];
+        assert_eq!(oui(0x00, &addr).as_deref(), Some("0a:0b:0c"));
+        assert_eq!(
+            oui(0x02, &addr).as_deref(),
+            Some("0a:0b:0c"),
+            "resolved public identity"
+        );
+        assert_eq!(oui(0x01, &addr), None, "a random address has no OUI");
+        assert_eq!(oui(0x03, &addr), None, "resolved random identity");
+
+        let h = DeviceHasher::with_salt([0u8; 32], 8);
+        let public = RawAdv {
+            event_type: 0x00,
+            addr_type: 0x00,
+            addr,
+            rssi: -70,
+            data: vec![],
+        };
+        let v = serde_json::to_value(h.observe(&public, 1, None)).unwrap();
+        assert_eq!(v["oui"], "0a:0b:0c");
+        // The device-specific half of the address appears nowhere in the row.
+        assert!(!v.to_string().contains("44:55:66") && !v.to_string().contains("665544"));
+    }
+
+    #[test]
     fn v1_log_lines_still_parse() {
         // A line written by ble-rssi/1, verbatim shape: no lab fields at all.
         let line = "{\"unix_ts_ns\":1786959444439374442,\"device_hash\":\"a1b2c3d4e5f60708\",\
@@ -1673,6 +2334,7 @@ mod tests {
         assert_eq!(obs.lab_participant_key, None);
         assert_eq!(obs.lab_session_key, None);
         assert_eq!(obs.company_id, None);
+        assert_eq!(obs.oui, None);
     }
 
     #[test]
@@ -1722,8 +2384,8 @@ mod tests {
         let file_meta = reader.metadata().file_metadata().clone();
         assert_eq!(
             file_meta.schema_descr().num_columns(),
-            12,
-            "ble-rssi/3 is twelve columns"
+            13,
+            "ble-rssi/4 is thirteen columns"
         );
         let cols: Vec<&str> = file_meta
             .schema_descr()
@@ -1731,7 +2393,7 @@ mod tests {
             .iter()
             .map(|c| c.name())
             .collect();
-        assert_eq!(cols.last(), Some(&"company_id"));
+        assert_eq!(cols[cols.len() - 2..], ["company_id", "oui"]);
         // The value survives the round trip: exactly one row has it, and it is 6.
         use parquet::record::RowAccessor;
         let ids: Vec<Option<i32>> = reader

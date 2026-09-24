@@ -1125,6 +1125,7 @@ fn finish_ble(
         scan_interval_ms: cfg.ble.scan_interval_ms,
         scan_window_ms: cfg.ble.scan_window_ms,
         hash_bytes: cfg.ble.hash_bytes,
+        salt_scope: crate::ble::SaltScope::Session,
     };
     match crate::ble::export_parquet(&ndjson, &dir.join(crate::ble::PARQUET_NAME), &ctx) {
         Ok(stats) => {

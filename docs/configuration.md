@@ -186,8 +186,8 @@ Two artefacts land in the session directory and ship with it:
 | `ble_rssi.parquet` | The contract artefact the analysis side reads. Written at session close from the log. |
 
 `ble_rssi.parquet` columns, in order — **this is a schema contract**
-(`ble-rssi/3`; a rename is a version bump. `/2` added the three `lab_*`
-columns, `/3` added `company_id`):
+(`ble-rssi/4`; a rename is a version bump. `/2` added the three `lab_*`
+columns, `/3` added `company_id`, `/4` added `oui`):
 
 | Column | Parquet type | Notes |
 |---|---|---|
@@ -203,6 +203,7 @@ columns, `/3` added `company_id`):
 | `lab_participant_key` | INT32, optional | Bytes 12–13 of the lab UUID. |
 | `lab_session_key` | INT32, optional | Bytes 14–15 of the lab UUID. |
 | `company_id` | INT32, optional | Bluetooth SIG company identifier opening the first Manufacturer Specific Data structure (AD 0xFF), e.g. 76 = Apple, 6 = Microsoft. Null when there is none. The manufacturer payload after it is not read. |
+| `oui` | STRING, optional | IEEE OUI (`aa:bb:cc`, the top 24 bits) of a public address (`addr_type` 0x00, or 0x02 for a resolved public identity). Null for every random address, which has no OUI. The device-specific 24 bits are not stored. |
 
 The advertising **channel index** (37/38/39) is not a column: the HCI
 Advertising Report does not carry it on any Bluetooth version.
@@ -214,6 +215,44 @@ sidecar, the log, or the parquet. So a pseudonym is stable within a session
 tracking is impossible by construction). Because phones use rotating private
 addresses, **distinct `device_hash` values are an upper bound on devices, not a
 device count** — use `addr_kind` to bound the stable-identity population.
+
+**The continuous archive (`csid ble-continuous`) salts differently.** Its
+segments are aligned to the wall clock (`index = floor(unix_s / segment_s)`),
+and every node derives the salt of a segment from that UTC day's fleet key:
+
+```text
+salt           = HMAC-SHA256(day_key(d), "csid-ble-fleet-salt/1" ‖ segment_s_be64 ‖ index_be64)
+day_key(d + 1) = SHA-256("csid-ble-fleet-ratchet/1" ‖ day_key(d))
+```
+
+So inside one segment an address has the same pseudonym on every node, and
+per-device RSSI can be compared across nodes. Across segments the salt
+changes, and without the day's key the pseudonyms stay unlinkable. Each node
+holds only today's key, in a root-only file (`--fleet-key`, default
+`/etc/csid/ble-fleet.key`, mode `0400`):
+
+```text
+csid-ble-fleet-key/2
+day <utc day number>
+key <64 hex characters>
+```
+
+At the first segment of a new UTC day the node moves the chain forward and
+rewrites the file atomically before it uses the new key. The step is one-way,
+so a finished day's salts cannot be derived again by anyone who did not keep a
+copy of that day's key. That includes the one-time seed every node starts
+from: delete it once the fleet is enrolled. A frame whose day is before the
+file's day (the node booted in the past, before chrony stepped it) gets a
+random salt and a `hash_scope = "segment"` seal. A jump of more than 366 days
+is treated as a broken clock and leaves the file alone. The scanner refuses to
+start without the file, or when group or others can read it. The segment
+length must divide a day, so no segment spans two keys.
+
+The seal (`ble-continuous/2`) records `hash_scope = "fleet-segment"`, the
+segment index, `key_day` and a public `key_id` fingerprint of the day's key,
+so a reader can check that all nodes of a segment used one key. Segments
+sealed as `ble-continuous/1` carry a random salt per node and must never be
+joined across nodes.
 
 The scan is always passive; there is no knob to make it active. An active
 scanner would transmit `SCAN_REQ` from this node, identifying it to the room

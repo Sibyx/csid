@@ -16,6 +16,56 @@ own changelog in `python/README.md`.
 
 ## [Unreleased]
 
+### Changed (breaking: needs a major version bump at release)
+
+- **`csid ble-continuous` salts from a daily fleet key.** Every node derives
+  the salt of a segment as `HMAC-SHA256(day_key, "csid-ble-fleet-salt/1" ‖
+  segment_s ‖ index)`, `index = floor(unix_s / segment_s)`, so one address has
+  one pseudonym on every node inside a segment and pseudonyms can be joined
+  across nodes. `day_key` is the UTC day's key of a chain every node starts
+  from one seed and moves forward itself: `day_key(d+1) =
+  SHA-256("csid-ble-fleet-ratchet/1" ‖ day_key(d))`. Moving forward rewrites
+  the key file atomically before the new key is used, so a finished day's key
+  is gone and that day cannot be linked again. A frame whose day is before
+  the chain's day (a node that booted in the past) gets a random salt and
+  `hash_scope = "segment"`; a jump of more than 366 days is treated as a broken
+  clock and leaves the chain alone. Segments are wall-clock aligned (:00 and
+  :30 for `30m`), the segment length must divide a day, the first segment
+  after a start is shorter, and the index is read from each frame's own
+  timestamp. `--fleet-key` (default `/etc/csid/ble-fleet.key`) is the chain
+  file `csid-ble-fleet-key/2` (`day <n>` / `key <64 hex>`); the scanner refuses
+  to start without it and refuses a file readable by group or others. The
+  in-session scanner (`csid run`) keeps its random per-session salt.
+- **Seal `ble-continuous/2`.** `hash_scope` is `"fleet-segment"` (was
+  `"segment"`), and a `salt` block carries `scheme`, `key_schedule`,
+  `segment_s`, `segment_index`, `key_day`, `key_id` (a 4-byte public
+  fingerprint of that day's key), `nominal_start_utc`, `nominal_end_utc` and
+  `persisted: false`. Every `/1` field keeps its name and meaning. The footer
+  of `ble_rssi.parquet` gains `salt_derivation`, `salt_segment_s`,
+  `salt_segment_index`, `salt_key_day` and `salt_key_id`, and
+  `pseudonym_scope` states the scope.
+- **`ble_rssi.parquet` is `ble-rssi/4`: new nullable `oui` column.** The IEEE
+  OUI (`aa:bb:cc`) of a public address (`addr_type` 0x00 or 0x02); null for
+  every random address, which has none. The other 24 address bits are never
+  stored. `/1`–`/3` files read with `oui` null.
+- **Do not join `/1` segments across nodes.** Their salts are random per node,
+  so equal hashes across nodes in `/1` data are coincidences.
+- **CI publishes the fleet's binaries.** The `cross-build aarch64` job is
+  replaced by `pi release (aarch64)` on native `ubuntu-24.04-arm` (pinned: the
+  node image is Ubuntu 24.04, glibc 2.39). It tests `csiq`, `csid`,
+  `csiscope` and `collector` on aarch64, builds them, and uploads
+  `csid-aarch64-<commit>` (`csid`, `csiscope`, `collectord`, `SHA256SUMS`,
+  `COMMIT`, `GLIBC`, `VERSION`, 90 days). monad-knowledge's `roles/csid`
+  installs that artifact; nodes no longer compile. `fmt` and `clippy` are now
+  separate jobs, so a style or lint failure no longer hides the test result.
+- **Lint fixes that had kept CI red.** `rawsock::FRAME_BUF` is now the one
+  buffer size the census and time-transfer receivers use (each had its own
+  copy, and the shared one was dead code under `-D warnings`); one test builds
+  its `InjectConfig` with struct-update syntax. `cargo fmt --check` (15 files)
+  and clippy in `csiscope` (4 × `neg_cmp_op_on_partial_ord`, 1 ×
+  `unnecessary_cast`) still fail; the `!(a < b)` forms may be deliberate NaN
+  handling and were left alone.
+
 ### Added
 
 - **BLE heartbeats carry the interval statistics blescand used to log.** The
