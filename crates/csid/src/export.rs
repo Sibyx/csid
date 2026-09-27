@@ -147,14 +147,52 @@ fn convert(
         // `finish` writes zstd's frame epilogue. Without it the file decodes as
         // a truncated frame, which every reader reports as corruption rather
         // than as a missing flush.
-        enc.finish().context("finishing the zstd frame")?;
+        let buffered = enc.finish().context("finishing the zstd frame")?;
+        make_durable(buffered, out)?;
         return Ok(n);
     }
 
     let writer =
         csiq::Writer::new(BufWriter::new(output), session).context("writing CSIQ header")?;
-    let (n, _) = drain(&mut reader, writer)?;
+    let (n, buffered) = drain(&mut reader, writer)?;
+    make_durable(buffered, out)?;
     Ok(n)
+}
+
+/// Flush the container, fsync it, and fsync its directory, returning every error.
+///
+/// **The sealer marks a segment `complete` right after this returns**, and
+/// `csid-sync` ships whatever the directory then holds. Until 2026-09-27 the
+/// container was left in the page cache: the `BufWriter` was dropped unflushed
+/// (its drop ignores errors) and nothing called `sync_all`, while `capture.raw`
+/// was fsynced by its sink. Nodes that reset 30-95 s after a scheduled stop
+/// then rebooted with a `complete` sidecar, an intact raw and a container that
+/// was 0 B or partly zero-filled (sizes in whole 4 MiB steps), and shipped it
+/// faithfully: 15 `walk-abba-48-night` tail segments on 2026-09-24..26. With the
+/// container durable before the sidecar changes, a reset before the sidecar
+/// lands leaves the segment `capturing`, which `csid-sync` does not ship, and a
+/// `complete` sidecar implies a container that is on disk.
+fn make_durable(buffered: BufWriter<File>, out: &Path) -> Result<()> {
+    let file = buffered
+        .into_inner()
+        .map_err(|e| e.into_error())
+        .with_context(|| format!("flushing {}", out.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync {}", out.display()))?;
+    // `File::create` made a new directory entry; fsync the directory so the
+    // entry survives a reset too. Windows cannot open a directory as a file,
+    // and NTFS journals the entry itself (same rule as `ble.rs`).
+    #[cfg(unix)]
+    {
+        let dir = match out.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("fsync directory {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Copy every readable record from the raw stream into `writer`.

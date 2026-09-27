@@ -6,6 +6,7 @@
 //! capture is best-effort — a missing `ethtool` never fails a session.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -773,13 +774,41 @@ impl Sidecar {
     /// every `session-quality --locate-only` on that node for a month. With a
     /// rename, a failed write leaves `metadata.json.tmp` — which no reader
     /// looks at — and the previous document, if any, intact.
+    ///
+    /// DURABLE: the temp file is fsynced before the rename and the directory
+    /// after it. Atomic is not durable. A node that resets within the kernel's
+    /// writeback window can lose a renamed file that was never fsynced, and on
+    /// 2026-09-24/25 two tail segments whose nodes reset first after a
+    /// scheduled stop are missing from S3 entirely (monad08, monad10), which is
+    /// consistent with exactly that. The container (`export::make_durable`) is
+    /// made durable before the `complete` sidecar is written, so after this a
+    /// `complete` status on disk implies the files it describes are on disk.
     pub fn write(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, json + "\n")
-            .with_context(|| format!("writing sidecar {}", tmp.display()))?;
+        {
+            let mut f = fs::File::create(&tmp)
+                .with_context(|| format!("writing sidecar {}", tmp.display()))?;
+            f.write_all((json + "\n").as_bytes())
+                .with_context(|| format!("writing sidecar {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync sidecar {}", tmp.display()))?;
+        }
         fs::rename(&tmp, &self.path)
-            .with_context(|| format!("moving sidecar into place at {}", self.path.display()))
+            .with_context(|| format!("moving sidecar into place at {}", self.path.display()))?;
+        // A directory fsync is how POSIX makes a rename durable. Windows cannot
+        // open a directory as a file, and NTFS journals the rename itself.
+        #[cfg(unix)]
+        {
+            let dir = match self.path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("fsync directory {}", dir.display()))?;
+        }
+        Ok(())
     }
 
     /// Re-target this sidecar at another file.

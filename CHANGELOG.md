@@ -16,7 +16,32 @@ own changelog in `python/README.md`.
 
 ## [Unreleased]
 
-### Changed (breaking: needs a major version bump at release)
+## [0.4.0] - 2026-09-27
+
+The BLE fleet-key salts and the schema bumps below are breaking. Before 1.0,
+SemVer moves the minor number for a breaking change, so this is 0.4.0. Every
+change in this release was already on master before the two durability fixes
+were added; builds of master between 0.3.1 and this release stamped
+`csid_version = "0.3.1"` although they carried them.
+
+### Fixed
+
+- **The exported container is durable before the segment says `complete`.**
+  `export::convert` now flushes the `BufWriter` through `into_inner`, so an
+  error in the last flush is returned rather than dropped, and then fsyncs the
+  container and its directory (`export::make_durable`). Before, only
+  `capture.raw` was fsynced. Nodes that reset 30-95 s after a scheduled stop
+  rebooted with a `complete` sidecar, an intact raw and a `capture.csiq.zst`
+  that was 0 B or partly zero-filled, and `csid-sync` shipped it: 15
+  `walk-abba-48-night` tail segments on 2026-09-24..26, readable only from
+  their raw. A reset before the sidecar lands now leaves the segment
+  `capturing`, which `csid-sync` does not ship.
+- **The sidecar is durable, not only atomic.** `Sidecar::write` fsyncs the
+  temp file before the rename and the directory after it. Two tail segments
+  whose nodes reset first on 2026-09-24/25 are missing from S3 entirely, which
+  is consistent with a renamed sidecar lost in the page cache.
+
+### Changed (breaking)
 
 - **`csid ble-continuous` salts from a daily fleet key.** Every node derives
   the salt of a segment as `HMAC-SHA256(day_key, "csid-ble-fleet-salt/1" ‖
