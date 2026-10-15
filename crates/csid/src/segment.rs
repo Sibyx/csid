@@ -426,6 +426,61 @@ impl BleCursor {
 /// individually negligible and `distinct` already records that it existed.
 const TOP_TRANSMITTERS: usize = 16;
 
+/// What a sealed segment's own sidecar still says once its `capture.raw` is gone.
+pub(crate) struct SealedCounts {
+    pub records: u64,
+    pub empty_records: u64,
+    pub tone_counts: Vec<u16>,
+    /// `records / mean_rate_hz`: the segment's own FTM span in seconds, 0 when
+    /// the sealer could not measure a rate.
+    pub span_s: f64,
+}
+
+/// Read the counts a segment's sealer wrote, next to `raw`.
+///
+/// `csid-prune` keeps `metadata.json` and `.synced` in every directory it
+/// strips, so a pruned segment still carries the summary its sealer computed
+/// from the raw stream before it shipped. Only a `complete` sidecar with a
+/// summary is trusted: a segment whose seal failed or never ran is reported by
+/// the caller as unreadable, as before. The value is read as untyped JSON so
+/// that a field added to `Sidecar` later cannot make an older segment unreadable.
+pub(crate) fn sealed_counts(raw: &Path) -> Option<SealedCounts> {
+    let meta = raw.parent()?.join("metadata.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    if v.get("status")?.as_str()? != "complete" {
+        return None;
+    }
+    let s = v.get("summary")?;
+    let records = s.get("records")?.as_u64()?;
+    let rate = s
+        .get("mean_rate_hz")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let tone_counts = s
+        .get("tone_counts")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|t| t as u16)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SealedCounts {
+        records,
+        empty_records: s
+            .get("empty_records")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        tone_counts,
+        span_s: if rate > 0.0 {
+            records as f64 / rate
+        } else {
+            0.0
+        },
+    })
+}
+
 /// What a segment walk learned, beyond the sidecar summary itself.
 struct SegmentStats {
     summary: SummaryMeta,
@@ -462,6 +517,7 @@ fn summarize_segment(raw: &Path, cfg: &ExperimentConfig) -> SegmentStats {
 
     let mut tones: Vec<u16> = Vec::new();
     let mut count: u64 = 0;
+    let mut empty: u64 = 0;
     let mut first_ftm: Option<u32> = None;
     let mut unwrapper = csiq::FtmUnwrapper::new();
     let mut last_unwrapped: u64 = 0;
@@ -472,6 +528,11 @@ fn summarize_segment(raw: &Path, cfg: &ExperimentConfig) -> SegmentStats {
 
     while let Ok(Some(rec)) = rr.next_record() {
         count += 1;
+        // Counted here as well as at session close, so a segment that prune
+        // strips before the session ends still contributes its empties.
+        if rec.iq.is_empty() || rec.iq.iter().all(|&v| v == 0) {
+            empty += 1;
+        }
         if !tones.contains(&rec.ntone) {
             tones.push(rec.ntone);
         }
@@ -499,6 +560,7 @@ fn summarize_segment(raw: &Path, cfg: &ExperimentConfig) -> SegmentStats {
 
     tones.sort_unstable();
     summary.records = count;
+    summary.empty_records = empty;
     summary.tone_counts = tones;
     summary.capture_bytes = bytes;
     summary.transmitters = Some(census(by_mac));
@@ -743,6 +805,71 @@ on_close = true
     /// left at `capturing` for the sync guarantee. Segments dominate the
     /// archive, so effectively every published file told a stranger the capture
     /// was truncated.
+    /// 2026-10-14 defect: `csid-prune`'s pressure pass stripped shipped
+    /// segments of a running session, and the close summary skipped them, so
+    /// the root `records` was short while every segment was on S3. A pruned
+    /// segment must now be counted from the sidecar its sealer wrote.
+    #[test]
+    fn a_pruned_segment_is_counted_from_its_sealed_sidecar() {
+        let scratch = Scratch::new("pruned");
+        let mut raws = Vec::new();
+        for (index, n) in [(1u32, 5usize), (2, 3)] {
+            let dir = scratch.join(&format!("seg{index:04}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw = dir.join("capture.raw");
+            write_raw(&raw, n);
+            let seg = Sealed {
+                dir: dir.clone(),
+                raw: raw.clone(),
+                index,
+            };
+            let mut cursor = BleCursor::new(scratch.0.clone());
+            seal_one(&seg, &template_sidecar(), &seal_cfg(), &mut cursor).unwrap();
+            raws.push(raw);
+        }
+        // What the pressure pass leaves behind: metadata.json and nothing else.
+        std::fs::remove_file(&raws[0]).unwrap();
+
+        let (summary, _) = crate::engine::summarize(
+            &raws,
+            &seal_cfg(),
+            &crate::sinks::Counters::default(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            summary.records, 8,
+            "the pruned segment's 5 records must be counted"
+        );
+        assert_eq!(summary.segments_from_sidecar, Some(1));
+        assert_eq!(summary.tone_counts, vec![52]);
+    }
+
+    /// The fallback must not change a session whose segments are all on disk.
+    #[test]
+    fn an_intact_session_reports_no_sidecar_segments() {
+        let scratch = Scratch::new("intact");
+        let raw = scratch.join("capture.raw");
+        write_raw(&raw, 4);
+        let (summary, _) = crate::engine::summarize(
+            &[raw],
+            &seal_cfg(),
+            &crate::sinks::Counters::default(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(summary.records, 4);
+        assert_eq!(summary.segments_from_sidecar, None);
+    }
+
+    /// A segment that never sealed (sidecar still `capturing`) is not trusted.
+    #[test]
+    fn an_unsealed_sidecar_is_not_counted() {
+        let scratch = Scratch::new("unsealed");
+        let mut sc = template_sidecar();
+        sc.set_path(scratch.join("metadata.json"));
+        sc.write().unwrap();
+        assert!(sealed_counts(&scratch.join("capture.raw")).is_none());
+    }
+
     #[test]
     fn a_sealed_segments_csiq_says_the_segment_finished() {
         let scratch = Scratch::new("complete");

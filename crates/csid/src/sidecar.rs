@@ -352,6 +352,19 @@ pub struct SummaryMeta {
     /// An empty series means "not sampled", never "the node was idle and cool".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_state: Vec<NodeStateSample>,
+    /// Session level only: how many segments this summary counted from their
+    /// own sealed sidecar because their `capture.raw` was already gone.
+    ///
+    /// `csid-prune`'s pressure pass strips shipped segments of a run that is
+    /// still going, by design, so a long run survives a full card. The close
+    /// summary used to re-read every segment's `capture.raw` and skip the ones
+    /// prune had taken, so from 2026-10-05 the root `records` of 36 sessions
+    /// was short by 169.9 M records while every segment was intact on S3.
+    /// `records`, `empty_records` and `tone_counts` now include those segments;
+    /// their time-transfer ticks cannot be recovered, and this count says how
+    /// many segments lack them. Absent when every segment was read from disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments_from_sidecar: Option<u32>,
 }
 
 /// Per-source-MAC record counts for one capture directory.

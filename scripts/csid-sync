@@ -14,12 +14,42 @@
 #   CSID_S3_BUCKET       bucket
 #   CSID_S3_PREFIX       key prefix                    (default captures/v2)
 #   CSID_S3_ACCESS_KEY   / CSID_S3_SECRET_KEY
+#   CSID_STATUS_PATH     live capture status           (default /run/csid/status.json)
+#   CSID_SYNC_STALE_MINUTES  quiet time before a never-closed
+#                        directory ships                (default 120)
+#
+# ── THE CONTRACT: EVERY MEASUREMENT LEAVES THE NODE, THEN PRUNE MAY FREE IT ───
+#
+# This script uploads; `csid-prune` deletes only what the bucket confirms. For
+# that pair to never lose data, everything that is no longer being written must
+# eventually upload, whatever its sidecar says. Two rules below make it so:
+#
+# 1. A directory whose csid process died (OOM, reboot, power loss) keeps
+#    `"status": "capturing"` forever. Until 2026-10-15 this script skipped it
+#    forever, so prune could never free it, the card parked at the prune floor,
+#    and the pressure pass then stripped the RUNNING session's segments
+#    (2026-10-14: 23 such roots and 25.5 GB on monad03; monad02 and monad07 lost
+#    power for 2.5 days and 1 day and came back with more). Such a directory now
+#    ships once it is not the live session and nothing in it has changed for
+#    CSID_SYNC_STALE_MINUTES. Its sidecar is NOT edited: `capturing` is the true
+#    record that its teardown died, and the archive reads it as such.
+# 2. A shipped directory that still holds payload is checked against the bucket
+#    on every pass and copied again if any local file is missing or differs
+#    there. A directory shipped while a sealer was still finishing it, or one
+#    that gained a file later, therefore converges instead of sitting forever
+#    with bytes prune will (correctly) refuse to free.
 set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
 HOST="${CSID_HOSTNAME:-$(hostname)}"
 PREFIX="${CSID_S3_PREFIX:-captures/v2}"
 BUCKET="${CSID_S3_BUCKET:?CSID_S3_BUCKET is required}"
+STATUS_PATH="${CSID_STATUS_PATH:-/run/csid/status.json}"
+STALE_MINUTES="${CSID_SYNC_STALE_MINUTES:-120}"
+if ! [[ "$STALE_MINUTES" =~ ^[0-9]+$ ]]; then
+    echo "csid-sync: CSID_SYNC_STALE_MINUTES must be a non-negative integer (got '$STALE_MINUTES')" >&2
+    exit 2
+fi
 
 command -v rclone >/dev/null || { echo "csid-sync: rclone not installed" >&2; exit 1; }
 [[ -d "$SPOOL" ]] || { echo "csid-sync: spool $SPOOL missing" >&2; exit 0; }
@@ -122,20 +152,51 @@ write_marker() {
     printf 'synced_at=%s\nkey=%s\n' "$(date -Is)" "${key%/}/" > "${dir%/}/.synced"
 }
 
+# The session csid is writing right now, from its own status file. `/run` is a
+# tmpfs, so a name from before a reboot cannot survive into this one. An absent
+# or unreadable file names nothing; the quiet-time rule below still protects a
+# directory that is being written, because it changed seconds ago.
+live=""
+if [[ -f "$STATUS_PATH" ]]; then
+    live="$(jq -r '.session_id // empty' "$STATUS_PATH" 2>/dev/null || true)"
+fi
+
+# Payload = everything except the two index files.
+has_payload() {
+    [[ -n "$(find "$1" -maxdepth 1 -type f \
+                ! -name metadata.json ! -name .synced -print -quit 2>/dev/null)" ]]
+}
+
+# Every local file present in the bucket at the same size.
+verified() {
+    rclone check "$1" "$2" --one-way --size-only --exclude '.synced' \
+        --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
+        >/dev/null 2>&1
+}
+
 shipped=0
 failed=0
 skipped=0
 upgraded=0
+reshipped=0
+rescued=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
+    dir="${dir%/}"
     session="$(basename "$dir")"
 
-    # Only ship sessions that have finished writing (sidecar carries the status).
     [[ -f "$dir/metadata.json" ]] || continue
+    # Finished sessions ship at once. A never-closed one (rule 1 above) ships
+    # when it is not the live session and has been quiet for STALE_MINUTES.
+    never_closed=0
     if ! grep -q '"status": *"\(complete\|stopped\|failed\)"' "$dir/metadata.json"; then
-        continue
+        grep -q '"status": *"capturing"' "$dir/metadata.json" || continue
+        [[ -n "$live" && "${session%-seg[0-9][0-9][0-9][0-9]}" == "$live" ]] && continue
+        [[ -z "$(find "$dir" -maxdepth 1 -type f ! -name .synced -mmin "-${STALE_MINUTES}" -print -quit 2>/dev/null)" ]] || continue
+        never_closed=1
     fi
-    # Already shipped AND the marker records where. Nothing to do.
+    # Already shipped AND the marker records where. Re-check while payload
+    # remains (rule 2 above); otherwise nothing to do.
     #
     # THE MARKER CARRIES THE KEY (2026-09-14). It used to hold a bare timestamp,
     # which left `csid-prune` to re-derive the destination from a prefix and a
@@ -145,6 +206,20 @@ for dir in "$SPOOL"/*/; do
     # Recording the destination in the writer removes the second definition
     # instead of adding a third.
     if [[ -f "$dir/.synced" ]] && grep -q '^key=' "$dir/.synced"; then
+        # Stripped by prune: only the index is left and nothing can be lost.
+        has_payload "$dir" || continue
+        dest="s3:${BUCKET}/$(sed -n 's/^key=//p' "$dir/.synced" | head -1)"
+        verified "$dir" "$dest" && continue
+        # The bucket does not hold every local byte. Copy again to the SAME key
+        # (copy --checksum moves only what differs) and refresh the marker.
+        echo "csid-sync: re-shipping $session -> $dest (bucket did not match the spool)"
+        if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
+            write_marker "$dir" "${dest#"s3:${BUCKET}/"}"
+            reshipped=$((reshipped + 1))
+        else
+            echo "csid-sync: FAILED re-ship $session (will retry)" >&2
+            failed=$((failed + 1))
+        fi
         continue
     fi
 
@@ -174,13 +249,8 @@ for dir in "$SPOOL"/*/; do
         # holding payload. Without this guard every run spends 1286 bucket
         # round trips proving a key nobody will ever ask for — and for the
         # pre-v2 majority the check fails every time, so it repeats forever.
-        if [[ -z "$(find "$dir" -maxdepth 1 -type f \
-                        ! -name metadata.json ! -name .synced -print -quit 2>/dev/null)" ]]; then
-            continue
-        fi
-        if rclone check "$dir" "$dest" --one-way --size-only --exclude '.synced' \
-               --retries 1 --low-level-retries 1 --contimeout 5s --timeout 20s \
-               >/dev/null 2>&1; then
+        has_payload "$dir" || continue
+        if verified "$dir" "$dest"; then
             write_marker "$dir" "$key"
             echo "csid-sync: marker upgraded $session -> $key"
             upgraded=$((upgraded + 1))
@@ -188,10 +258,15 @@ for dir in "$SPOOL"/*/; do
         continue
     fi
 
-    echo "csid-sync: shipping $session -> $dest"
+    if [[ $never_closed -eq 1 ]]; then
+        echo "csid-sync: shipping never-closed $session -> $dest (sidecar left at capturing)"
+    else
+        echo "csid-sync: shipping $session -> $dest"
+    fi
     if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
         write_marker "$dir" "$key"
         shipped=$((shipped + 1))
+        [[ $never_closed -eq 1 ]] && rescued=$((rescued + 1))
     else
         # Leave it unmarked; the timer retries on the next pass.
         echo "csid-sync: FAILED $session (will retry)" >&2
@@ -199,5 +274,5 @@ for dir in "$SPOOL"/*/; do
     fi
 done
 
-echo "csid-sync: $shipped shipped, $failed failed, $skipped skipped, $upgraded marker(s) upgraded"
+echo "csid-sync: $shipped shipped ($rescued never-closed), $reshipped re-shipped, $failed failed, $skipped skipped, $upgraded marker(s) upgraded"
 [[ $failed -eq 0 ]]

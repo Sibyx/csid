@@ -1383,6 +1383,7 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
         // Filled by the caller from the capture loop's own sampler; this
         // constructor has no clock and must not invent one.
         node_state: Vec::new(),
+        segments_from_sidecar: None,
     }
 }
 
@@ -1401,7 +1402,15 @@ fn base_summary(counters: &Counters) -> SummaryMeta {
 /// mis-measure the span at every boundary. One unwrapper across the
 /// concatenation is the only correct reading, and it is why segment order is
 /// part of the contract rather than an implementation detail.
-fn summarize(
+///
+/// A segment whose `capture.raw` is gone is counted from its own sealed
+/// sidecar (see [`SummaryMeta::segments_from_sidecar`]). `csid-prune`'s
+/// pressure pass strips shipped segments of a running session by design, and
+/// skipping them made the root `records` short while the data sat on S3. The
+/// FTM span cannot be unwrapped across a missing segment, so when any segment
+/// came from its sidecar the session rate is `records` over the SUM of the
+/// per-segment spans instead of one span across the concatenation.
+pub(crate) fn summarize(
     raws: &[PathBuf],
     cfg: &ExperimentConfig,
     counters: &Counters,
@@ -1416,16 +1425,47 @@ fn summarize(
     let mut first_ftm: Option<u32> = None;
     let mut unwrapper = csiq::FtmUnwrapper::new();
     let mut last_unwrapped: u64 = 0;
+    // Per-segment spans, summed. Used only when a segment came from its sidecar.
+    let mut span_sum_s: f64 = 0.0;
+    let mut from_sidecar: u32 = 0;
 
     for raw in raws {
         let Ok(file) = std::fs::File::open(raw) else {
-            tracing::warn!(path = %raw.display(), "summary: segment unreadable; skipping");
+            match segment::sealed_counts(raw) {
+                Some(c) => {
+                    count += c.records;
+                    empty += c.empty_records;
+                    for t in c.tone_counts {
+                        if !tones.contains(&t) {
+                            tones.push(t);
+                        }
+                    }
+                    span_sum_s += c.span_s;
+                    from_sidecar += 1;
+                    tracing::warn!(
+                        path = %raw.display(),
+                        records = c.records,
+                        "summary: segment raw already pruned; counted from its sealed sidecar (no time-transfer ticks for it)"
+                    );
+                }
+                None => {
+                    tracing::warn!(path = %raw.display(), "summary: segment unreadable and no sealed sidecar; skipping");
+                }
+            }
             continue;
         };
         let reader = std::io::BufReader::new(file);
         let mut rr = csiq::raw::RawReader::new(reader, cfg.radio.width.to_csiq());
+        let mut seg_unwrapper = csiq::FtmUnwrapper::new();
+        let mut seg_first: Option<u32> = None;
+        let mut seg_last: u64 = 0;
 
         while let Ok(Some(rec)) = rr.next_record() {
+            let su = seg_unwrapper.push(rec.ftm);
+            if seg_first.is_none() {
+                seg_first = Some(rec.ftm);
+            }
+            seg_last = su;
             count += 1;
             // Recounted from the file rather than trusted from the RX counter,
             // for the same reason `records` is: the raw stream is the artefact
@@ -1448,6 +1488,9 @@ fn summarize(
                 ticks.push(rec.unix_ts_ns, rec.ftm, rec.src_mac);
             }
         }
+        if let Some(first) = seg_first {
+            span_sum_s += csiq::ftm_to_seconds(seg_last.saturating_sub(first as u64));
+        }
     }
 
     ticks.seal();
@@ -1456,7 +1499,12 @@ fn summarize(
     summary.empty_records = empty;
     summary.tone_counts = tones;
 
-    if let Some(first) = first_ftm {
+    if from_sidecar > 0 {
+        summary.segments_from_sidecar = Some(from_sidecar);
+        if span_sum_s > 0.0 {
+            summary.mean_rate_hz = count as f64 / span_sum_s;
+        }
+    } else if let Some(first) = first_ftm {
         let span_ticks = last_unwrapped.saturating_sub(first as u64);
         let span_s = csiq::ftm_to_seconds(span_ticks);
         if span_s > 0.0 {

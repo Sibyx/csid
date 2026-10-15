@@ -16,6 +16,44 @@ own changelog in `python/README.md`.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-15
+
+No sidecar field changes meaning and no schema identifier bumps; the new
+summary field has a serde default. Sessions recorded on this build are
+grouped apart from 0.4.0 in the lake by `environment.csid_version`.
+
+### Fixed
+
+- **The session summary no longer undercounts when `csid-prune` has stripped
+  segments of the running session.** The close-time `summarize` re-read every
+  segment's `capture.raw` and skipped the ones the prune pressure pass had
+  already deleted, so from 2026-10-05 the root `records` of 36 sessions was
+  short by 169.9 M records while every segment was intact on S3, and the FTM
+  span unwrapped across the gap made a correct capture read as a clock seam.
+  A pruned segment is now counted from the summary its sealer wrote into its
+  `metadata.json` (which prune always keeps), and when any segment is counted
+  that way the session rate is records over the sum of the per-segment spans.
+  The time-transfer ticks of such a segment cannot be recovered.
+- **`csid-sync` now uploads sessions whose process died.** A directory left at
+  `"status": "capturing"` by an OOM, a reboot or a power loss was skipped
+  forever, so `csid-prune` could never free it and the cards parked at the
+  prune floor (23 roots and 25.5 GB on monad03 on 2026-10-14). It now ships
+  once it is not the live session (`/run/csid/status.json`) and nothing in it
+  has changed for `CSID_SYNC_STALE_MINUTES` (default 120). Its sidecar is not
+  edited. This replaces the manual `csid-rescue-unshipped` playbook.
+- **`csid-sync` re-verifies what it shipped.** A marked directory that still
+  holds payload is checked against the bucket on every pass and copied again
+  to the key in its marker if any local file is missing or differs there.
+  `tests/sync.sh` pins both rules and runs in CI beside `tests/prune.sh`.
+
+### Added
+
+- `summary.segments_from_sidecar` (session sidecar, serde default, absent when
+  zero): how many segments the session summary counted from their sealed
+  sidecar instead of their `capture.raw`.
+- Segment sidecars now carry `summary.empty_records`, so a pruned segment
+  still contributes its all-zero records to the session count.
+
 ## [0.4.0] - 2026-09-27
 
 The BLE fleet-key salts and the schema bumps below are breaking. Before 1.0,

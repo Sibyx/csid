@@ -115,10 +115,14 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck rclone
-          shellcheck scripts/csid-sync scripts/csid-prune tests/prune.sh
+          sudo apt-get install -y shellcheck rclone jq
+          shellcheck scripts/csid-sync scripts/csid-prune tests/prune.sh tests/sync.sh
       - name: csid-prune invariants
         run: tests/prune.sh
+      # The upload half of the same contract: everything no longer being
+      # written reaches the bucket, so what prune refuses to free cannot pile up.
+      - name: csid-sync invariants
+        run: tests/sync.sh
 
   # The format's cross-language claim is only real if it is tested: Rust writes
   # a CSIQ file, Python reads it back and must agree field for field.
