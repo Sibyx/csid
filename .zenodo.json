@@ -1,0 +1,21 @@
+{
+  "title": "csid: a Wi-Fi channel state information capture daemon and the CSIQ format",
+  "upload_type": "software",
+  "version": "0.4.1",
+  "description": "A systemd-native Wi-Fi Channel State Information capture daemon for Intel AX210 radios on Linux 6.x, and CSIQ, a self-describing and versioned interchange format for CSI with reference readers in Rust and Python. Every session writes a sidecar with the radio configuration, firmware, kernel, driver module, regulatory domain and governor before capture starts.",
+  "creators": [
+    {
+      "name": "Dubec, Jakub",
+      "orcid": "0000-0003-4248-5264",
+      "affiliation": "Slovak University of Technology in Bratislava, Faculty of Informatics and Information Technologies"
+    }
+  ],
+  "license": "GPL-2.0-only",
+  "keywords": [
+    "channel state information",
+    "Wi-Fi sensing",
+    "Intel AX210",
+    "measurement instrument",
+    "CSIQ"
+  ]
+}

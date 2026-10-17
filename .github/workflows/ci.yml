@@ -15,7 +15,7 @@ jobs:
   # visible on every push without holding back the binaries the fleet runs.
   fmt:
     name: format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,7 +26,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +40,7 @@ jobs:
   # only compiles on Linux, so this is the job that proves the daemon builds.
   linux:
     name: build + test (linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,7 +109,7 @@ jobs:
   # `.synced` marker is never touched at any disk pressure.
   helpers:
     name: shell helpers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
@@ -128,7 +128,7 @@ jobs:
   # a CSIQ file, Python reads it back and must agree field for field.
   interop:
     name: rust -> python interop
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

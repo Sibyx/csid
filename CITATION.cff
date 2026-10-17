@@ -1,0 +1,24 @@
+# Draft (2026-10-17). Add `date-released` and `doi` when v0.4.1 is tagged and archived.
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "csid: a Wi-Fi channel state information capture daemon and the CSIQ format"
+abstract: >-
+  A systemd-native Wi-Fi Channel State Information capture daemon for Intel AX210 radios on
+  Linux 6.x, and CSIQ, a self-describing and versioned interchange format for CSI with reference
+  readers in Rust and Python. Every session writes a sidecar with the radio configuration,
+  firmware, kernel, driver module, regulatory domain and governor before capture starts.
+authors:
+  - family-names: Dubec
+    given-names: Jakub
+    orcid: "https://orcid.org/0000-0003-4248-5264"
+    affiliation: "Slovak University of Technology in Bratislava, Faculty of Informatics and Information Technologies"
+version: "0.4.1"
+license: GPL-2.0-only
+repository-code: "https://github.com/Sibyx/csid"
+keywords:
+  - channel state information
+  - Wi-Fi sensing
+  - Intel AX210
+  - measurement instrument
+  - CSIQ
