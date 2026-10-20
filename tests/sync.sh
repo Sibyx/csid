@@ -16,6 +16,13 @@
 #   6. A shipped directory whose bucket copy matches is not copied again.
 #   7. A shipped directory with no payload left costs no bucket call.
 #   8. A malformed quiet-window knob is rejected before anything runs.
+#   9. An upload is recorded on disk before rclone starts and cleared when it
+#      returns, success or failure.
+#  10. A directory whose uploads started and never returned (the process died
+#      mid-copy, as a node reset does) is quarantined after
+#      CSID_SYNC_MAX_INFLIGHT starts, stays unmarked, and is counted in the gauge.
+#  11. Deleting the ledger file lets a quarantined directory ship again.
+#  12. A malformed attempt limit is rejected before anything runs.
 #
 # Usage: tests/sync.sh   (bash 3.2+, jq)
 set -euo pipefail
@@ -29,13 +36,16 @@ fails=0
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1" >&2; fails=$(( fails + 1 )); }
 
+# The stamp is formatted in UTC and `touch -t` reads LOCAL time, so touch runs
+# under TZ=UTC0 too. Without it every age was off by the UTC offset (2 h on a
+# CEST laptop, enough to push a 5-minute file past the 120-minute window).
 touch_ago() {
     local path="$1" mins="$2" stamp
     if stamp="$(date -u -d "@$(( $(date -u +%s) - mins * 60 ))" +%Y%m%d%H%M.%S 2>/dev/null)"; then
-        touch -t "$stamp" "$path"
+        TZ=UTC0 touch -t "$stamp" "$path"
     else
         stamp="$(date -u -r "$(( $(date -u +%s) - mins * 60 ))" +%Y%m%d%H%M.%S)"
-        touch -t "$stamp" "$path"
+        TZ=UTC0 touch -t "$stamp" "$path"
     fi
 }
 
@@ -68,6 +78,14 @@ for a in "$@"; do
     pos+=("$a")
 done
 printf '%s %s %s\n' "$verb" "$(basename "${pos[0]:-}")" "${pos[1]:-}" >> "$RCLONE_LOG"
+if [[ "$verb" == "copy" ]]; then
+    # What the attempt ledger says WHILE the copy runs.
+    name="$(basename "${pos[0]:-}")"
+    printf 'inflight %s %s\n' "$name" "$(cat "$CSID_SYNC_STATE_DIR/inflight/$name" 2>/dev/null || echo none)" >> "$RCLONE_LOG"
+    # A node reset mid-upload: csid-sync dies and rclone never returns to it.
+    if [[ "${KILL_ON_COPY:-0}" == "1" ]]; then kill -KILL "$PPID"; exit 137; fi
+    if [[ "${COPY_FAILS:-0}" == "1" ]]; then exit 1; fi
+fi
 set -- "$verb"
 if [[ "${1:-}" == "check" && "${CHECK_FAILS:-0}" == "1" ]]; then exit 1; fi
 exit 0
@@ -83,7 +101,11 @@ run_sync() {
         CSID_S3_ACCESS_KEY=k CSID_S3_SECRET_KEY=s CSID_S3_PREFIX=captures/v2 \
         CSID_STATUS_PATH="${STATUS:-$TMP/no-status.json}" \
         CSID_SYNC_STALE_MINUTES="${STALE:-120}" \
+        CSID_SYNC_STATE_DIR="${spool}.state" \
+        CSID_SYNC_MAX_INFLIGHT="${MAX_INFLIGHT:-2}" \
+        CSID_SYNC_TEXTFILE_DIR="${TEXTFILE:-}" \
         CHECK_FAILS="${CHECK_FAILS:-0}" \
+        COPY_FAILS="${COPY_FAILS:-0}" KILL_ON_COPY="${KILL_ON_COPY:-0}" \
         bash "$SYNC" >/dev/null 2>&1
 }
 
@@ -148,6 +170,49 @@ STALE=soon run_sync "$TMP/d" "$TMP/e.log"
 rc=$?
 set -e
 if [[ $rc -eq 2 ]]; then pass "bad CSID_SYNC_STALE_MINUTES exits 2"; else fail "bad knob should exit 2 (got $rc)"; fi
+
+echo "test 9: every upload is recorded before it starts and cleared when it returns"
+S="$TMP/f"; mkdir -p "$S"
+make_dir "$S/ok_20261014-020145" complete 10
+run_sync "$S" "$TMP/f.log"
+if grep -q '^inflight ok_20261014-020145 1$' "$TMP/f.log"; then pass "ledger reads 1 while the copy runs"; else fail "ledger not written before the copy ($(tr '\n' ' ' < "$TMP/f.log"))"; fi
+if [[ ! -e "$S.state/inflight/ok_20261014-020145" ]]; then pass "ledger cleared after a successful copy"; else fail "ledger left after a successful copy"; fi
+S="$TMP/g"; mkdir -p "$S"
+make_dir "$S/flaky_20261014-020145" complete 10
+set +e
+COPY_FAILS=1 run_sync "$S" "$TMP/g.log"
+set -e
+if [[ ! -e "$S.state/inflight/flaky_20261014-020145" ]]; then pass "a copy that fails and returns does not count"; else fail "a returned failure was counted as a reset"; fi
+
+echo "test 10: a directory whose upload never returns is quarantined"
+S="$TMP/h"; mkdir -p "$S" "$TMP/textfile"
+make_dir "$S/poison_20260818-195932" capturing 600
+# In a subshell with stderr closed: the shell reports the SIGKILL as a job
+# message otherwise, and that kill is the scenario, not a fault.
+( KILL_ON_COPY=1 run_sync "$S" "$TMP/h1.log" ) 2>/dev/null || true
+( KILL_ON_COPY=1 run_sync "$S" "$TMP/h2.log" ) 2>/dev/null || true
+if grep -q '^inflight poison_20260818-195932 2$' "$TMP/h2.log"; then pass "second start counted"; else fail "second start not counted ($(tr '\n' ' ' < "$TMP/h2.log"))"; fi
+TEXTFILE="$TMP/textfile" run_sync "$S" "$TMP/h3.log"
+if copied poison_20260818-195932 "$TMP/h3.log"; then fail "quarantined directory copied a third time"; else pass "third pass does not start the copy"; fi
+if [[ ! -f "$S/poison_20260818-195932/.synced" ]]; then pass "quarantined directory stays unmarked (prune keeps it)"; else fail "quarantined directory was marked shipped"; fi
+if grep -q '^csid_sync_quarantined_dirs{host="monadXX"} 1$' "$TMP/textfile/csid_sync.prom" 2>/dev/null; then
+    pass "gauge counts the quarantined directory"
+else
+    fail "gauge missing or wrong ($(cat "$TMP/textfile/csid_sync.prom" 2>/dev/null))"
+fi
+
+echo "test 11: deleting the ledger file releases the quarantine"
+rm -f "$S.state/inflight/poison_20260818-195932"
+TEXTFILE="$TMP/textfile" run_sync "$S" "$TMP/h4.log"
+if copied poison_20260818-195932 "$TMP/h4.log"; then pass "released directory ships"; else fail "released directory did not ship"; fi
+if grep -q '^csid_sync_quarantined_dirs{host="monadXX"} 0$' "$TMP/textfile/csid_sync.prom" 2>/dev/null; then pass "gauge back to 0"; else fail "gauge not reset"; fi
+
+echo "test 12: a malformed attempt limit is rejected"
+set +e
+MAX_INFLIGHT=0 run_sync "$TMP/d" "$TMP/i.log"
+rc=$?
+set -e
+if [[ $rc -eq 2 ]]; then pass "bad CSID_SYNC_MAX_INFLIGHT exits 2"; else fail "bad attempt limit should exit 2 (got $rc)"; fi
 
 echo
 if [[ $fails -eq 0 ]]; then

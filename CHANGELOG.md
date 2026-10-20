@@ -16,6 +16,23 @@ own changelog in `python/README.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **One session directory can no longer reset a node in a loop.** From
+  2026-10-15 monad09 rebooted about every 7 minutes: every boot `csid-sync`
+  started uploading the same never-closed root, the ext4 journal stalled, PID 1
+  missed the SoC watchdog and the board reset before rclone returned, so the
+  next boot started the same upload again. `csid-sync` now records each upload
+  under `CSID_SYNC_STATE_DIR` (default `/var/lib/csid-sync`) before it starts
+  and clears the record when rclone returns. A directory with
+  `CSID_SYNC_MAX_INFLIGHT` (default 2) starts that never returned is
+  quarantined: skipped, logged as `QUARANTINED` on every pass, left unmarked so
+  `csid-prune` keeps it, and counted in `csid_sync_quarantined_dirs` when
+  `CSID_SYNC_TEXTFILE_DIR` names a textfile-collector directory. A copy that
+  fails and returns does not count. Delete the directory's file under
+  `inflight/` to try it again. `tests/sync.sh` pins the ledger, the quarantine
+  and the release.
+
 ## [0.4.1] - 2026-10-15
 
 No sidecar field changes meaning and no schema identifier bumps; the new

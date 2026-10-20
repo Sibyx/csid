@@ -66,13 +66,16 @@ make_spool() {
 }
 
 # Portable "set mtime N minutes ago" — GNU and BSD `touch` disagree on flags.
+# The stamp is formatted in UTC and `touch -t` reads LOCAL time, so touch runs
+# under TZ=UTC0 too. Without it every age was off by the UTC offset (2 h on a
+# CEST laptop, enough to push a 5-minute file past a 120-minute window).
 touch_ago() {
     local path="$1" mins="$2" stamp
     if stamp="$(date -u -d "@$(( $(date -u +%s) - mins * 60 ))" +%Y%m%d%H%M.%S 2>/dev/null)"; then
-        touch -t "$stamp" "$path"
+        TZ=UTC0 touch -t "$stamp" "$path"
     else
         stamp="$(date -u -r "$(( $(date -u +%s) - mins * 60 ))" +%Y%m%d%H%M.%S)"
-        touch -t "$stamp" "$path"
+        TZ=UTC0 touch -t "$stamp" "$path"
     fi
 }
 

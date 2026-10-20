@@ -17,6 +17,11 @@
 #   CSID_STATUS_PATH     live capture status           (default /run/csid/status.json)
 #   CSID_SYNC_STALE_MINUTES  quiet time before a never-closed
 #                        directory ships                (default 120)
+#   CSID_SYNC_STATE_DIR  upload attempt ledger          (default /var/lib/csid-sync)
+#   CSID_SYNC_MAX_INFLIGHT   uploads of one directory that may start and never
+#                        return before it is quarantined (default 2)
+#   CSID_SYNC_TEXTFILE_DIR   node_exporter textfile directory for the
+#                        quarantine gauge                (default: no gauge)
 #
 # ── THE CONTRACT: EVERY MEASUREMENT LEAVES THE NODE, THEN PRUNE MAY FREE IT ───
 #
@@ -38,6 +43,24 @@
 #    there. A directory shipped while a sealer was still finishing it, or one
 #    that gained a file later, therefore converges instead of sitting forever
 #    with bytes prune will (correctly) refuse to free.
+#
+# ── ONE DIRECTORY MUST NOT BE ABLE TO TAKE THE NODE DOWN FOREVER (2026-10-20) ─
+#
+# From 2026-10-15 monad09 reset about every 7 minutes, 227 boots in a week. Each
+# boot this script started `rclone copy` on the same never-closed root, the ext4
+# journal stalled, PID 1 blocked in `ext4_mkdir`, missed the SoC watchdog, and
+# the board reset before rclone returned. The directory stayed unshipped, so the
+# next boot started the same copy again. A failed copy was already retried; a
+# copy that never RETURNS was not even visible, because nothing was left behind
+# to count it.
+#
+# So every copy is recorded on disk BEFORE it starts and cleared when rclone
+# returns, success or failure. A record still there at the next pass means the
+# node died mid-upload. After CSID_SYNC_MAX_INFLIGHT such starts the directory
+# is QUARANTINED: skipped, logged on every pass, and counted in a gauge. It is
+# not marked shipped, so prune keeps it. A copy that fails and returns is a
+# network fault and does not count; the ordinary retry handles it. To try a
+# quarantined directory again, delete its file under $CSID_SYNC_STATE_DIR/inflight/.
 set -euo pipefail
 
 SPOOL="${CSID_SPOOL:-/var/lib/csid}"
@@ -48,6 +71,13 @@ STATUS_PATH="${CSID_STATUS_PATH:-/run/csid/status.json}"
 STALE_MINUTES="${CSID_SYNC_STALE_MINUTES:-120}"
 if ! [[ "$STALE_MINUTES" =~ ^[0-9]+$ ]]; then
     echo "csid-sync: CSID_SYNC_STALE_MINUTES must be a non-negative integer (got '$STALE_MINUTES')" >&2
+    exit 2
+fi
+STATE_DIR="${CSID_SYNC_STATE_DIR:-/var/lib/csid-sync}"
+MAX_INFLIGHT="${CSID_SYNC_MAX_INFLIGHT:-2}"
+TEXTFILE_DIR="${CSID_SYNC_TEXTFILE_DIR:-}"
+if ! [[ "$MAX_INFLIGHT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "csid-sync: CSID_SYNC_MAX_INFLIGHT must be a positive integer (got '$MAX_INFLIGHT')" >&2
     exit 2
 fi
 
@@ -174,12 +204,61 @@ verified() {
         >/dev/null 2>&1
 }
 
+# The attempt ledger (see the header). One file per directory, holding the
+# number of copies that started and have not returned. It lives OUTSIDE the
+# session directory: a file inside would reset the quiet-time rule, and rclone
+# would upload it.
+inflight_file() {
+    printf '%s/inflight/%s' "$STATE_DIR" "$1"
+}
+
+inflight_count() {
+    local n
+    n="$(cat "$(inflight_file "$1")" 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    echo "$n"
+}
+
+# Returns 1 when the directory is quarantined. Otherwise records one more start
+# and flushes it, because the reset this guards against comes seconds later.
+begin_copy() {
+    local session="$1" f n
+    f="$(inflight_file "$session")"
+    n="$(inflight_count "$session")"
+    if (( n >= MAX_INFLIGHT )); then
+        echo "csid-sync: QUARANTINED $session: $n upload(s) started and never returned (node reset mid-upload?); delete $f to retry" >&2
+        return 1
+    fi
+    if mkdir -p "${f%/*}" && printf '%s\n' "$(( n + 1 ))" > "$f"; then
+        sync "$f" 2>/dev/null || true
+    else
+        echo "csid-sync: cannot write $f; this upload is not guarded" >&2
+    fi
+    return 0
+}
+
+end_copy() {
+    rm -f "$(inflight_file "$1")"
+}
+
+write_gauge() {
+    [[ -n "$TEXTFILE_DIR" && -d "$TEXTFILE_DIR" ]] || return 0
+    local out="${TEXTFILE_DIR%/}/csid_sync.prom"
+    {
+        echo "# HELP csid_sync_quarantined_dirs Session directories csid-sync skips because uploads of them started and never returned."
+        echo "# TYPE csid_sync_quarantined_dirs gauge"
+        echo "csid_sync_quarantined_dirs{host=\"${HOST}\"} $1"
+    } > "${out}.partial" 2>/dev/null && mv "${out}.partial" "$out" 2>/dev/null
+    return 0
+}
+
 shipped=0
 failed=0
 skipped=0
 upgraded=0
 reshipped=0
 rescued=0
+quarantined=0
 for dir in "$SPOOL"/*/; do
     [[ -d "$dir" ]] || continue
     dir="${dir%/}"
@@ -212,11 +291,17 @@ for dir in "$SPOOL"/*/; do
         verified "$dir" "$dest" && continue
         # The bucket does not hold every local byte. Copy again to the SAME key
         # (copy --checksum moves only what differs) and refresh the marker.
+        if ! begin_copy "$session"; then
+            quarantined=$((quarantined + 1))
+            continue
+        fi
         echo "csid-sync: re-shipping $session -> $dest (bucket did not match the spool)"
         if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
+            end_copy "$session"
             write_marker "$dir" "${dest#"s3:${BUCKET}/"}"
             reshipped=$((reshipped + 1))
         else
+            end_copy "$session"
             echo "csid-sync: FAILED re-ship $session (will retry)" >&2
             failed=$((failed + 1))
         fi
@@ -258,21 +343,31 @@ for dir in "$SPOOL"/*/; do
         continue
     fi
 
+    if ! begin_copy "$session"; then
+        quarantined=$((quarantined + 1))
+        continue
+    fi
     if [[ $never_closed -eq 1 ]]; then
         echo "csid-sync: shipping never-closed $session -> $dest (sidecar left at capturing)"
     else
         echo "csid-sync: shipping $session -> $dest"
     fi
     if rclone copy --checksum --exclude '.synced' "$dir" "$dest"; then
+        end_copy "$session"
         write_marker "$dir" "$key"
         shipped=$((shipped + 1))
         [[ $never_closed -eq 1 ]] && rescued=$((rescued + 1))
     else
         # Leave it unmarked; the timer retries on the next pass.
+        end_copy "$session"
         echo "csid-sync: FAILED $session (will retry)" >&2
         failed=$((failed + 1))
     fi
 done
 
-echo "csid-sync: $shipped shipped ($rescued never-closed), $reshipped re-shipped, $failed failed, $skipped skipped, $upgraded marker(s) upgraded"
+write_gauge "$quarantined"
+# A quarantined directory does not fail the unit, for the same reason as SKIP
+# above: retrying cannot help, so a red timer would mean nothing. The gauge and
+# the QUARANTINED line are how it is seen.
+echo "csid-sync: $shipped shipped ($rescued never-closed), $reshipped re-shipped, $failed failed, $skipped skipped, $quarantined quarantined, $upgraded marker(s) upgraded"
 [[ $failed -eq 0 ]]
