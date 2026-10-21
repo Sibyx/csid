@@ -293,6 +293,7 @@ for dir in "$SPOOL"/*/; do
         # (copy --checksum moves only what differs) and refresh the marker.
         if ! begin_copy "$session"; then
             quarantined=$((quarantined + 1))
+            write_gauge "$quarantined"
             continue
         fi
         echo "csid-sync: re-shipping $session -> $dest (bucket did not match the spool)"
@@ -345,6 +346,10 @@ for dir in "$SPOOL"/*/; do
 
     if ! begin_copy "$session"; then
         quarantined=$((quarantined + 1))
+        # Now, not only at the end of the pass: the pass that quarantines a
+        # directory goes on to upload the backlog behind it, and on monad09 on
+        # 2026-10-21 that took hours with no gauge and so no alert.
+        write_gauge "$quarantined"
         continue
     fi
     if [[ $never_closed -eq 1 ]]; then

@@ -82,6 +82,10 @@ if [[ "$verb" == "copy" ]]; then
     # What the attempt ledger says WHILE the copy runs.
     name="$(basename "${pos[0]:-}")"
     printf 'inflight %s %s\n' "$name" "$(cat "$CSID_SYNC_STATE_DIR/inflight/$name" 2>/dev/null || echo none)" >> "$RCLONE_LOG"
+    # The quarantine gauge as it stands WHILE this copy runs (mid-pass).
+    if [[ -n "${CSID_SYNC_TEXTFILE_DIR:-}" ]]; then
+        printf 'gauge-during %s %s\n' "$name" "$(tail -n 1 "$CSID_SYNC_TEXTFILE_DIR/csid_sync.prom" 2>/dev/null || echo none)" >> "$RCLONE_LOG"
+    fi
     # A node reset mid-upload: csid-sync dies and rclone never returns to it.
     if [[ "${KILL_ON_COPY:-0}" == "1" ]]; then kill -KILL "$PPID"; exit 137; fi
     if [[ "${COPY_FAILS:-0}" == "1" ]]; then exit 1; fi
@@ -192,8 +196,16 @@ make_dir "$S/poison_20260818-195932" capturing 600
 ( KILL_ON_COPY=1 run_sync "$S" "$TMP/h1.log" ) 2>/dev/null || true
 ( KILL_ON_COPY=1 run_sync "$S" "$TMP/h2.log" ) 2>/dev/null || true
 if grep -q '^inflight poison_20260818-195932 2$' "$TMP/h2.log"; then pass "second start counted"; else fail "second start not counted ($(tr '\n' ' ' < "$TMP/h2.log"))"; fi
+# A second, healthy directory sorts after the poisoned one, so the pass is
+# still uploading when the gauge must already say 1.
+make_dir "$S/zz_after_20261014-020145" complete 10
 TEXTFILE="$TMP/textfile" run_sync "$S" "$TMP/h3.log"
 if copied poison_20260818-195932 "$TMP/h3.log"; then fail "quarantined directory copied a third time"; else pass "third pass does not start the copy"; fi
+if grep -q '^gauge-during zz_after_20261014-020145 csid_sync_quarantined_dirs{host="monadXX"} 1$' "$TMP/h3.log"; then
+    pass "gauge reads 1 while the pass is still uploading"
+else
+    fail "gauge not written mid-pass ($(grep gauge-during "$TMP/h3.log" | tr '\n' ' '))"
+fi
 if [[ ! -f "$S/poison_20260818-195932/.synced" ]]; then pass "quarantined directory stays unmarked (prune keeps it)"; else fail "quarantined directory was marked shipped"; fi
 if grep -q '^csid_sync_quarantined_dirs{host="monadXX"} 1$' "$TMP/textfile/csid_sync.prom" 2>/dev/null; then
     pass "gauge counts the quarantined directory"
