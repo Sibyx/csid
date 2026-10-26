@@ -407,7 +407,9 @@ pub fn run_session(
     let persist = cfg.capture.persist;
     let (durable_tx, durable_rx) = mpsc::channel::<Arc<RawCsiMessage>>();
     let durable_tx = if persist { Some(durable_tx) } else { None };
-    let live_enabled = cfg.stream.enabled;
+    // The live thread also feeds the burst writer (`[burst]`), which needs parsed records even when
+    // nothing is streamed, so the channel is fed when either consumer is on.
+    let live_enabled = cfg.stream.enabled || cfg.burst.enabled;
     let (live_tx, live_rx) = mpsc::sync_channel::<Arc<RawCsiMessage>>(if live_enabled {
         cfg.stream.max_queue
     } else {
@@ -536,26 +538,34 @@ pub fn run_session(
     let live_counters = counters.clone();
     let width = cfg.radio.width.to_csiq();
     let stream_cfg = cfg.stream.clone();
+    let burst_cfg = cfg.burst.clone();
     let live = thread::Builder::new()
         .name("csid-live".into())
         .spawn(move || {
-            if !stream_cfg.enabled {
+            let mut sink = if stream_cfg.enabled {
+                let sink = match stream_cfg.transport.as_str() {
+                    "udp" => LiveSink::udp(&stream_cfg.targets, session_uid, live_counters),
+                    _ => LiveSink::unix(&stream_cfg.unix_socket, session_uid, live_counters),
+                };
+                match sink {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::error!(error = %e, "live sink unavailable; streaming disabled for this session");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut burst = burst_cfg.enabled.then(|| {
+                crate::burst::BurstWriter::new(&burst_cfg.textfile_dir, burst_cfg.window_s, burst_cfg.min_frames)
+            });
+            if sink.is_none() && burst.is_none() {
                 // Drain so the sender never blocks if it was somehow used.
                 while live_rx.recv().is_ok() {}
                 return;
             }
-            let sink = match stream_cfg.transport.as_str() {
-                "udp" => LiveSink::udp(&stream_cfg.targets, session_uid, live_counters),
-                _ => LiveSink::unix(&stream_cfg.unix_socket, session_uid, live_counters),
-            };
-            let mut sink = match sink {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "live sink unavailable; streaming disabled for this session");
-                    while live_rx.recv().is_ok() {}
-                    return;
-                }
-            };
+            let mut burst_failed = false;
             while let Ok(msg) = live_rx.recv() {
                 match csiq::raw::parse_record(&msg.hdr, &msg.csi, width) {
                     Ok(mut rec) => {
@@ -563,7 +573,18 @@ pub fn run_session(
                         if rec.unix_ts_ns == 0 {
                             rec.unix_ts_ns = msg.unix_ts_ns;
                         }
-                        sink.publish(&rec);
+                        if let Some(s) = sink.as_mut() {
+                            s.publish(&rec);
+                        }
+                        if let Some(b) = burst.as_mut() {
+                            if let Err(e) = b.observe(rec.unix_ts_ns, &rec.src_mac, &rec.rssi, rec.nrx) {
+                                // Best-effort like the stream: warn once, keep capturing.
+                                if !burst_failed {
+                                    tracing::warn!(error = %e, "burst textfile not written; zone metrics stale");
+                                    burst_failed = true;
+                                }
+                            }
+                        }
                     }
                     Err(e) => tracing::debug!(error = %e, "live: unparseable record skipped"),
                 }

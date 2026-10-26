@@ -237,6 +237,9 @@ pub struct ExperimentConfig {
     pub timesync: TimesyncConfig,
     #[serde(default)]
     pub stream: StreamConfig,
+    /// Live burst statistic of the injector's frames for the zone map. Off unless `enabled = true`.
+    #[serde(default)]
+    pub burst: BurstConfig,
     #[serde(default)]
     pub export: ExportConfig,
     /// Frame census on the monitor interface. Off unless `enabled = true`.
@@ -1081,6 +1084,45 @@ impl Default for StreamConfig {
             unix_socket: default_socket(),
             targets: Vec::new(),
             max_queue: default_max_queue(),
+        }
+    }
+}
+
+/// Live burst statistic (see [`crate::burst`]): the minute's quantiles of the injector-frame RSSI SD,
+/// written to a node_exporter textfile. Runs on the live publisher thread; never touches capture.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BurstConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// node_exporter textfile-collector directory; the file is `csid_burst.prom`.
+    #[serde(default = "default_burst_dir")]
+    pub textfile_dir: PathBuf,
+    /// Window length in seconds (the decoder's motion window is 2 s).
+    #[serde(default = "default_burst_window_s")]
+    pub window_s: f64,
+    /// Injector frames a window needs before its SD counts (the decoder's `MOTION_MIN_PACKETS`).
+    #[serde(default = "default_burst_min_frames")]
+    pub min_frames: usize,
+}
+
+fn default_burst_dir() -> PathBuf {
+    PathBuf::from("/var/lib/node_exporter/textfile_collector")
+}
+fn default_burst_window_s() -> f64 {
+    2.0
+}
+fn default_burst_min_frames() -> usize {
+    100
+}
+
+impl Default for BurstConfig {
+    fn default() -> Self {
+        BurstConfig {
+            enabled: false,
+            textfile_dir: default_burst_dir(),
+            window_s: default_burst_window_s(),
+            min_frames: default_burst_min_frames(),
         }
     }
 }

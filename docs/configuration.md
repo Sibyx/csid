@@ -384,6 +384,19 @@ need the monitor interface. The supplicant is not csid's.
 | `targets` | string[] | `host:port` list for `udp`. |
 | `max_queue` | int | Bounded queue depth. Larger tolerates longer consumer stalls at the cost of memory; overflow always drops rather than blocks. |
 
+### `[burst]` — live burst statistic for the zone map
+
+| Key | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Off by default. Feeds the live thread even when `[stream]` is off. |
+| `textfile_dir` | path | node_exporter textfile directory (default `/var/lib/node_exporter/textfile_collector`); the file is `csid_burst.prom`, replaced atomically once a minute. |
+| `window_s` | float | Window length, default 2.0 (the decoder's motion window). |
+| `min_frames` | int | Injector frames a window needs before its RSSI SD counts, default 100 (the decoder's `MOTION_MIN_PACKETS`). |
+
+Series: `csid_burst_inj_rssi_sd_db{quantile="0.75"|"0.9"}` (dB), `csid_burst_windows`, `csid_burst_minute_start_seconds`. A minute with no qualifying window writes `csid_burst_windows 0` and no quantile samples.
+
+`systemd/csid@.service` runs with `ProtectSystem=strict`, and its `ReadWritePaths=` does not name `textfile_dir`. Add the directory in a drop-in (`ReadWritePaths=-<textfile_dir>`), or every write fails read-only and csid logs one warning per session. The monad-knowledge fleet role does this in `fleet-policy.conf.j2`.
+
 ### `[export]`
 
 | Key | Type | Notes |

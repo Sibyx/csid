@@ -16,6 +16,21 @@ own changelog in `python/README.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **Live burst statistic for the zone map** (`[burst]`, `burst.rs`). Off by default. When
+  `enabled = true`, the live publisher thread computes, per 2-s window, the sample SD of the
+  strongest-chain RSSI of the injector's frames (`02:6d:6f:6e:*`, at least `min_frames` = 100,
+  the lake decoder's `inj_rssi_sd`), and at each minute boundary writes the minute's p75 and p90
+  to `<textfile_dir>/csid_burst.prom` by atomic rename: `csid_burst_inj_rssi_sd_db{quantile=…}`,
+  `csid_burst_windows`, `csid_burst_minute_start_seconds`. Absent quantiles emit no sample. Windows
+  are aligned to the Unix epoch, not to the decoder's block grid, and the decoder's phase-step
+  gate is not applied, so the live value and the lake value are close but not identical. The live
+  channel is now fed when streaming **or** burst is on; with streaming off, records are parsed for
+  the burst writer only. Reason: `monad-knowledge` study `2026-10-26-csi-burst-features` (upper
+  quantiles of this statistic track the in-room device count at least as well as the median level,
+  with half the floor noise relative to their response).
+
 ### Fixed
 
 - **One session directory can no longer reset a node in a loop.** From

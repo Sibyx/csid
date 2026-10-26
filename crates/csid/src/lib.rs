@@ -43,6 +43,7 @@
 
 pub mod ble;
 pub mod ble_continuous;
+pub mod burst;
 pub mod caps;
 pub mod census;
 pub mod commands;
