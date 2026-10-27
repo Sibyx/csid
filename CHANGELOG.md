@@ -33,6 +33,10 @@ own changelog in `python/README.md`.
 
 ### Fixed
 
+- **`csid_burst.prom` parses again.** The writer repeated `# HELP`/`# TYPE` for
+  `csid_burst_inj_rssi_sd_db` once per quantile. The textfile collector rejects a second HELP
+  line for a family and drops the whole file, so no `csid_burst_*` series reached Mimir. Each
+  family now has one HELP and one TYPE line.
 - **One session directory can no longer reset a node in a loop.** From
   2026-10-15 monad09 rebooted about every 7 minutes: every boot `csid-sync`
   started uploading the same never-closed root, the ext4 journal stalled, PID 1

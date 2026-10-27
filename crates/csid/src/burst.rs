@@ -161,12 +161,18 @@ pub fn prometheus_text(m: &Minute) -> String {
     s.push_str("# HELP csid_burst_windows 2-s windows in the minute with at least the minimum injector frames.\n");
     s.push_str("# TYPE csid_burst_windows gauge\n");
     s.push_str(&format!("csid_burst_windows {}\n", m.windows));
-    for (q, v) in [("0.75", m.p75), ("0.9", m.p90)] {
-        if let Some(v) = v {
-            s.push_str(&format!(
-                "# HELP csid_burst_inj_rssi_sd_db Quantile over the minute's 2-s windows of the injector-frame RSSI SD (dB), the decoder's inj_rssi_sd.\n# TYPE csid_burst_inj_rssi_sd_db gauge\ncsid_burst_inj_rssi_sd_db{{quantile=\"{q}\"}} {v:.4}\n"
-            ));
-        }
+    let quantiles: Vec<(&str, f64)> = [("0.75", m.p75), ("0.9", m.p90)]
+        .into_iter()
+        .filter_map(|(q, v)| v.map(|v| (q, v)))
+        .collect();
+    // One HELP/TYPE per metric family: a second pair fails the whole file in the
+    // textfile collector, and every series in it goes missing.
+    if !quantiles.is_empty() {
+        s.push_str("# HELP csid_burst_inj_rssi_sd_db Quantile over the minute's 2-s windows of the injector-frame RSSI SD (dB), the decoder's inj_rssi_sd.\n");
+        s.push_str("# TYPE csid_burst_inj_rssi_sd_db gauge\n");
+    }
+    for (q, v) in quantiles {
+        s.push_str(&format!("csid_burst_inj_rssi_sd_db{{quantile=\"{q}\"}} {v:.4}\n"));
     }
     s
 }
@@ -275,5 +281,24 @@ mod tests {
         let t = prometheus_text(&m);
         assert!(t.contains("csid_burst_inj_rssi_sd_db{quantile=\"0.75\"} 1.5000"));
         assert!(t.contains("csid_burst_inj_rssi_sd_db{quantile=\"0.9\"} 2.0000"));
+    }
+
+    #[test]
+    fn each_metric_family_has_one_help_and_one_type_line() {
+        let m = Minute {
+            start_s: 60,
+            windows: 30,
+            p75: Some(1.5),
+            p90: Some(2.0),
+        };
+        let t = prometheus_text(&m);
+        for name in [
+            "csid_burst_minute_start_seconds",
+            "csid_burst_windows",
+            "csid_burst_inj_rssi_sd_db",
+        ] {
+            assert_eq!(t.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+            assert_eq!(t.matches(&format!("# TYPE {name} ")).count(), 1, "{name}");
+        }
     }
 }
