@@ -541,6 +541,7 @@ mod imp {
     struct AirtimeOut {
         minute: crate::airtime::MinuteAirtime,
         aggregates: crate::airtime::Aggregates,
+        rssi: crate::airtime::FrameRssi,
         log: Option<std::fs::File>,
         textfile_dir: Option<PathBuf>,
         warned: bool,
@@ -549,18 +550,19 @@ mod imp {
     impl AirtimeOut {
         fn flush(&mut self, minute_start: u64, host: &str, session_id: &str) {
             let a = std::mem::take(&mut self.minute);
+            let r = self.rssi.take();
             if a.known_frames + a.unknown_frames == 0 {
                 return;
             }
             let mut failed = None;
             if let Some(f) = self.log.as_mut() {
-                let line = crate::airtime::json_line(minute_start, host, session_id, &a);
+                let line = crate::airtime::json_line(minute_start, host, session_id, &a, &r);
                 if let Err(e) = writeln!(f, "{line}") {
                     failed = Some(format!("{e}"));
                 }
             }
             if let Some(dir) = self.textfile_dir.as_ref() {
-                if let Err(e) = crate::airtime::write_textfile(dir, minute_start, &a) {
+                if let Err(e) = crate::airtime::write_textfile(dir, minute_start, &a, &r) {
                     failed = Some(format!("{e}"));
                 }
             }
@@ -595,6 +597,7 @@ mod imp {
         let airtime = AirtimeOut {
             minute: Default::default(),
             aggregates: Default::default(),
+            rssi: Default::default(),
             log: airtime_log,
             textfile_dir: airtime_textfile_dir,
             warned: false,
@@ -671,8 +674,11 @@ mod imp {
                             totals.note(&c);
                             minute.note(&c);
                             let injector = c.ta.is_some_and(|ta| crate::burst::is_injector(&ta));
-                            let us = crate::airtime::parse(frame)
-                                .and_then(|phy| airtime.aggregates.duration_us(&phy));
+                            let phy = crate::airtime::parse(frame);
+                            if let Some(p) = phy.as_ref() {
+                                airtime.rssi.note(p, injector, now_s);
+                            }
+                            let us = phy.and_then(|p| airtime.aggregates.duration_us(&p));
                             airtime.minute.note(us, injector);
                         }
                         Err(_) => {

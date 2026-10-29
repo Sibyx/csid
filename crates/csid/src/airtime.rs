@@ -39,6 +39,11 @@ pub struct Phy {
     pub ampdu_ref: Option<u32>,
     /// Bytes after the radiotap header, the FCS excluded when the header says it is present.
     pub psdu_len: usize,
+    /// The combined signal (dBm signal in the first presence word).
+    pub signal_dbm: Option<i8>,
+    /// Per-antenna signal (dBm signal + antenna index in each further radiotap-namespace word).
+    /// The AX210 reports antennas 0 and 1 on every received frame (monad03 probe, 2026-10-29).
+    pub antenna_dbm: [Option<i8>; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,8 +74,9 @@ pub struct He {
     pub ltf_us: f64,
 }
 
-/// (alignment, size) of the radiotap fields 0..=23 in the default namespace.
-const FIELDS: [(usize, usize); 24] = [
+/// (alignment, size) of the radiotap fields 0..=27 in the default namespace. Bit 28 (TLV) has no
+/// fixed size; a word that sets it ends the parse.
+const FIELDS: [(usize, usize); 28] = [
     (8, 8),  // 0 TSFT
     (1, 1),  // 1 Flags
     (1, 1),  // 2 Rate
@@ -95,7 +101,15 @@ const FIELDS: [(usize, usize); 24] = [
     (2, 12), // 21 VHT
     (8, 12), // 22 timestamp
     (2, 12), // 23 HE
+    (2, 12), // 24 HE-MU
+    (2, 6),  // 25 HE-MU-other-user
+    (1, 1),  // 26 0-length PSDU
+    (2, 4),  // 27 L-SIG
 ];
+
+const TLV_BIT: u32 = 28;
+const RADIOTAP_NS_BIT: u32 = 29;
+const VENDOR_NS_BIT: u32 = 30;
 
 fn u16_at(b: &[u8], o: usize) -> Option<u16> {
     b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
@@ -107,8 +121,11 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
 
 /// Read the PHY fields of a radiotap-prefixed frame. `None` when the header is not radiotap.
 ///
-/// Only the first presence word's fields are read: they are laid out first, in bit order, and
-/// every field needed here (Flags, Rate, MCS, A-MPDU, VHT, HE) is among them.
+/// The first presence word's fields come first, in bit order, and carry everything the airtime
+/// needs (Flags, Rate, MCS, A-MPDU, VHT, HE) plus the combined signal. Each further word in the
+/// radiotap namespace (bit 29 of the word before it) repeats a subset for one antenna; its dBm
+/// signal and antenna index give `antenna_dbm`. A vendor namespace or a TLV ends the walk: their
+/// data has no fixed size, and a guessed offset would read the wrong bytes.
 pub fn parse(frame: &[u8]) -> Option<Phy> {
     if frame.len() < 8 || frame[0] != 0 {
         return None;
@@ -136,6 +153,7 @@ pub fn parse(frame: &[u8]) -> Option<Phy> {
         off = (off + align - 1) & !(align - 1);
         let f = hdr.get(off..off + size)?;
         match bit {
+            5 => phy.signal_dbm = Some(f[0] as i8),
             1 => {
                 fcs = f[0] & 0x10 != 0;
                 phy.short_preamble = f[0] & 0x02 != 0;
@@ -211,6 +229,33 @@ pub fn parse(frame: &[u8]) -> Option<Phy> {
             _ => {}
         }
         off += size;
+    }
+    // Per-antenna words: only while each word announces the radiotap namespace for the next.
+    let mut prev = present;
+    for k in 1..words {
+        if prev & (1 << TLV_BIT) != 0 || prev & (1 << VENDOR_NS_BIT) != 0 || prev & (1 << RADIOTAP_NS_BIT) == 0 {
+            break;
+        }
+        let w = u32_at(frame, 4 + 4 * k)?;
+        let mut signal: Option<i8> = None;
+        for (bit, &(align, size)) in FIELDS.iter().enumerate() {
+            if w & (1 << bit) == 0 {
+                continue;
+            }
+            off = (off + align - 1) & !(align - 1);
+            let Some(f) = hdr.get(off..off + size) else { break };
+            match bit {
+                5 => signal = Some(f[0] as i8),
+                11 => {
+                    if let (Some(s), Some(slot)) = (signal, phy.antenna_dbm.get_mut(f[0] as usize)) {
+                        *slot = Some(s);
+                    }
+                }
+                _ => {}
+            }
+            off += size;
+        }
+        prev = w;
     }
     let len = frame.len() - rt_len;
     phy.psdu_len = if fcs { len.saturating_sub(4) } else { len };
@@ -373,13 +418,132 @@ impl MinuteAirtime {
     }
 }
 
+/// A second of injector frames needs this many on an antenna before its SD counts (the injector
+/// sends 250 per second; the decoder's 2-s window floor is 100).
+pub const MIN_FRAMES_PER_SECOND: usize = 50;
+
+fn sd(v: &[f64]) -> Option<f64> {
+    if v.len() < 2 {
+        return None;
+    }
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    Some((v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n - 1.0)).sqrt())
+}
+
+/// One antenna's frames in a minute.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AntennaStat {
+    pub frames: u64,
+    pub median: Option<f64>,
+    pub sd: Option<f64>,
+}
+
+/// One minute of per-antenna frame RSSI. `stat[source][antenna]`, source 0 injector, 1 other.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RssiMinute {
+    pub stat: [[AntennaStat; 2]; 2],
+    /// Per antenna: seconds of injector frames that met the minimum, and the p50/p75/p90 of their
+    /// per-second RSSI SD over the minute.
+    pub seconds: [usize; 2],
+    pub sd1s: [[Option<f64>; 3]; 2],
+}
+
+/// Per-antenna RSSI of every received frame (radiotap, not the CSI record), per minute.
+#[derive(Debug, Default)]
+pub struct FrameRssi {
+    values: [[Vec<f64>; 2]; 2],
+    cur_second: Option<u64>,
+    second: [Vec<f64>; 2],
+    second_sds: [Vec<f64>; 2],
+}
+
+impl FrameRssi {
+    fn close_second(&mut self) {
+        for a in 0..2 {
+            if self.second[a].len() >= MIN_FRAMES_PER_SECOND {
+                if let Some(s) = sd(&self.second[a]) {
+                    self.second_sds[a].push(s);
+                }
+            }
+            self.second[a].clear();
+        }
+    }
+
+    /// Note one frame's antenna signals at receive second `unix_s`.
+    pub fn note(&mut self, phy: &Phy, injector: bool, unix_s: u64) {
+        let src = if injector { 0 } else { 1 };
+        if injector && self.cur_second != Some(unix_s) {
+            if self.cur_second.is_some() {
+                self.close_second();
+            }
+            self.cur_second = Some(unix_s);
+        }
+        for (a, dbm) in phy.antenna_dbm.iter().enumerate() {
+            if let Some(v) = dbm {
+                self.values[src][a].push(*v as f64);
+                if injector {
+                    self.second[a].push(*v as f64);
+                }
+            }
+        }
+    }
+
+    /// The minute so far, and a fresh accumulator for the next. A second still open is closed
+    /// into this minute (its frames belong to the minute it started in).
+    pub fn take(&mut self) -> RssiMinute {
+        self.close_second();
+        self.cur_second = None;
+        let mut m = RssiMinute::default();
+        for src in 0..2 {
+            for a in 0..2 {
+                let v = &self.values[src][a];
+                m.stat[src][a] = AntennaStat {
+                    frames: v.len() as u64,
+                    median: crate::burst::quantile(v, 0.5),
+                    sd: sd(v),
+                };
+            }
+        }
+        for a in 0..2 {
+            let s = &self.second_sds[a];
+            m.seconds[a] = s.len();
+            m.sd1s[a] = [0.5, 0.75, 0.9].map(|q| crate::burst::quantile(s, q));
+        }
+        *self = FrameRssi::default();
+        m
+    }
+}
+
+const SOURCES: [&str; 2] = ["injector", "other"];
+
 /// File name inside the node_exporter textfile directory.
 pub const FILE_NAME: &str = "csid_airtime.prom";
 /// Per-minute record inside the session directory (shipped with the session).
 pub const LOG_NAME: &str = "airtime.jsonl";
 
-/// One `airtime.jsonl` line.
-pub fn json_line(minute_start: u64, host: &str, session_id: &str, a: &MinuteAirtime) -> String {
+fn r3(v: Option<f64>) -> Option<f64> {
+    v.map(|x| (x * 1e3).round() / 1e3)
+}
+
+/// One `airtime.jsonl` line: the airtime, and per source and antenna the frame RSSI.
+pub fn json_line(minute_start: u64, host: &str, session_id: &str, a: &MinuteAirtime, r: &RssiMinute) -> String {
+    let mut rssi = serde_json::Map::new();
+    for (s, src) in SOURCES.iter().enumerate() {
+        for ant in 0..2 {
+            let st = r.stat[s][ant];
+            rssi.insert(
+                format!("{src}_a{ant}"),
+                serde_json::json!({"frames": st.frames, "median_dbm": r3(st.median), "sd_db": r3(st.sd)}),
+            );
+        }
+    }
+    let sd1s: Vec<_> = (0..2)
+        .map(|ant| {
+            serde_json::json!({"antenna": ant, "seconds": r.seconds[ant], "p50": r3(r.sd1s[ant][0]),
+                               "p75": r3(r.sd1s[ant][1]), "p90": r3(r.sd1s[ant][2])})
+        })
+        .collect();
     serde_json::json!({
         "minute_unix": minute_start,
         "host": host,
@@ -388,15 +552,64 @@ pub fn json_line(minute_start: u64, host: &str, session_id: &str, a: &MinuteAirt
         "other_s": (a.other_us / 1e3).round() / 1e3,
         "known_frames": a.known_frames,
         "unknown_frames": a.unknown_frames,
+        "frame_rssi": rssi,
+        "injector_rssi_sd_1s": sd1s,
     })
     .to_string()
 }
 
+/// Render the per-antenna frame RSSI families. Absent values write no sample.
+pub fn rssi_prometheus_text(r: &RssiMinute) -> String {
+    let mut stat = Vec::new();
+    for (s, src) in SOURCES.iter().enumerate() {
+        for ant in 0..2 {
+            let st = r.stat[s][ant];
+            for (name, v) in [("median", st.median), ("sd", st.sd)] {
+                if let Some(v) = v {
+                    stat.push(format!("csid_frame_rssi_db{{source=\"{src}\",antenna=\"{ant}\",stat=\"{name}\"}} {v:.4}\n"));
+                }
+            }
+        }
+    }
+    let mut s = String::new();
+    s.push_str("# HELP csid_frame_rssi_frames Received frames in the minute with a per-antenna signal, by source and antenna.\n");
+    s.push_str("# TYPE csid_frame_rssi_frames gauge\n");
+    for (i, src) in SOURCES.iter().enumerate() {
+        for ant in 0..2 {
+            s.push_str(&format!("csid_frame_rssi_frames{{source=\"{src}\",antenna=\"{ant}\"}} {}\n", r.stat[i][ant].frames));
+        }
+    }
+    if !stat.is_empty() {
+        s.push_str("# HELP csid_frame_rssi_db Median (dBm) or SD (dB) over the minute of every received frame's per-antenna radiotap signal.\n");
+        s.push_str("# TYPE csid_frame_rssi_db gauge\n");
+        stat.iter().for_each(|l| s.push_str(l));
+    }
+    let mut q = Vec::new();
+    for ant in 0..2 {
+        for (name, v) in ["0.5", "0.75", "0.9"].iter().zip(r.sd1s[ant]) {
+            if let Some(v) = v {
+                q.push(format!("csid_frame_inj_rssi_sd_1s_db{{antenna=\"{ant}\",quantile=\"{name}\"}} {v:.4}\n"));
+            }
+        }
+    }
+    if !q.is_empty() {
+        s.push_str("# HELP csid_frame_inj_rssi_sd_1s_db Quantile over the minute's seconds of the per-second SD of the injector frames' per-antenna signal (dB).\n");
+        s.push_str("# TYPE csid_frame_inj_rssi_sd_1s_db gauge\n");
+        q.iter().for_each(|l| s.push_str(l));
+    }
+    s
+}
+
 /// Replace `<dir>/csid_airtime.prom` atomically.
-pub fn write_textfile(dir: &std::path::Path, minute_start: u64, a: &MinuteAirtime) -> std::io::Result<()> {
+pub fn write_textfile(
+    dir: &std::path::Path,
+    minute_start: u64,
+    a: &MinuteAirtime,
+    r: &RssiMinute,
+) -> std::io::Result<()> {
     let path = dir.join(FILE_NAME);
     let tmp = path.with_extension("prom.tmp");
-    std::fs::write(&tmp, prometheus_text(minute_start, a))?;
+    std::fs::write(&tmp, prometheus_text(minute_start, a) + &rssi_prometheus_text(r))?;
     std::fs::rename(&tmp, &path)
 }
 
@@ -502,6 +715,84 @@ mod tests {
         let second = agg.duration_us(&p).unwrap();
         assert!(first > second + 30.0, "the first carries the preamble");
         assert!((second - 8.0 * 504.0 / 260.0 * 4.0).abs() < 1e-9);
+    }
+
+    /// The AX210 layout read on monad03 (2026-10-29): TSFT, Flags, Rate, Channel, dBm signal,
+    /// RX flags, timestamp; then dBm signal + antenna twice.
+    fn ax210_frame(combined: i8, a0: i8, a1: i8, body: usize) -> Vec<u8> {
+        let mut h = vec![0u8; 56];
+        h[2] = 56;
+        h[4..8].copy_from_slice(&0xa040402fu32.to_le_bytes());
+        h[8..12].copy_from_slice(&0xa0000820u32.to_le_bytes());
+        h[12..16].copy_from_slice(&0x00000820u32.to_le_bytes());
+        h[25] = 12; // Rate: 6 Mb/s
+        h[30] = combined as u8;
+        h[52] = a0 as u8;
+        h[53] = 0;
+        h[54] = a1 as u8;
+        h[55] = 1;
+        h.extend(std::iter::repeat_n(0u8, body));
+        h
+    }
+
+    #[test]
+    fn the_ax210_layout_gives_both_antennas_and_the_rate() {
+        let p = parse(&ax210_frame(-60, -63, -58, 100)).unwrap();
+        assert_eq!(p.rate_500k, Some(12));
+        assert_eq!(p.signal_dbm, Some(-60));
+        assert_eq!(p.antenna_dbm, [Some(-63), Some(-58)]);
+        assert_eq!(p.psdu_len, 100);
+        assert_eq!(duration_us(&p, true), Some(20.0 + 35.0 * 4.0));
+    }
+
+    #[test]
+    fn a_vendor_namespace_ends_the_antenna_walk() {
+        let mut f = ax210_frame(-60, -63, -58, 10);
+        // Word 0 announces a vendor namespace instead of the radiotap one.
+        f[4..8].copy_from_slice(&((0xa040402fu32 & !(1 << 29)) | (1 << 30)).to_le_bytes());
+        let p = parse(&f).unwrap();
+        assert_eq!(p.antenna_dbm, [None, None]);
+        assert_eq!(p.rate_500k, Some(12));
+    }
+
+    #[test]
+    fn frame_rssi_keeps_sources_apart_and_takes_per_second_spread() {
+        let mut r = FrameRssi::default();
+        // Second 100: 60 injector frames alternating -60/-62 on antenna 0, constant -50 on 1.
+        for i in 0..60 {
+            let p = parse(&ax210_frame(-55, if i % 2 == 0 { -60 } else { -62 }, -50, 10)).unwrap();
+            r.note(&p, true, 100);
+        }
+        // Second 101: only 10 injector frames, below the minimum: no second SD.
+        for _ in 0..10 {
+            r.note(&parse(&ax210_frame(-55, -61, -50, 10)).unwrap(), true, 101);
+        }
+        r.note(&parse(&ax210_frame(-80, -81, -79, 10)).unwrap(), false, 101);
+        let m = r.take();
+        assert_eq!(m.stat[0][0].frames, 70);
+        assert_eq!(m.stat[1][0].frames, 1);
+        assert_eq!(m.stat[1][1].median, Some(-79.0));
+        assert_eq!(m.seconds, [1, 1]);
+        let expected = (60.0f64 / 59.0).sqrt();
+        assert!((m.sd1s[0][0].unwrap() - expected).abs() < 1e-9);
+        assert_eq!(m.sd1s[1][0], Some(0.0), "a constant antenna has zero spread, not none");
+        assert_eq!(r.take().stat[0][0].frames, 0, "take starts a fresh minute");
+    }
+
+    #[test]
+    fn the_rssi_text_has_one_help_per_family_and_omits_absent_values() {
+        let mut r = FrameRssi::default();
+        for i in 0..60 {
+            r.note(&parse(&ax210_frame(-55, -60 - (i % 2), -50, 10)).unwrap(), true, 7);
+        }
+        let t = rssi_prometheus_text(&r.take());
+        for name in ["csid_frame_rssi_frames", "csid_frame_rssi_db", "csid_frame_inj_rssi_sd_1s_db"] {
+            assert_eq!(t.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+        }
+        assert!(t.contains("csid_frame_rssi_frames{source=\"other\",antenna=\"0\"} 0"));
+        assert!(!t.contains("source=\"other\",antenna=\"0\",stat="), "no frames, no value");
+        let line = json_line(60, "monad03", "s", &MinuteAirtime::default(), &RssiMinute::default());
+        assert!(line.contains("\"frame_rssi\"") && line.contains("\"injector_rssi_sd_1s\""));
     }
 
     #[test]
