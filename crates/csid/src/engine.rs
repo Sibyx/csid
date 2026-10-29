@@ -315,6 +315,8 @@ pub fn run_session(
             &cfg.census,
             stop.clone(),
             census_counters.clone(),
+            // The live airtime textfile goes where the burst textfile goes, when `[burst]` is on.
+            cfg.burst.enabled.then(|| cfg.burst.textfile_dir.clone()),
         ) {
             Ok(h) => Some(h),
             Err(e) => {

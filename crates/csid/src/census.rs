@@ -507,6 +507,7 @@ impl CensusHandle {
 }
 
 /// Start the census thread. See the module docs.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     dir: &Path,
     monitor: &str,
@@ -515,13 +516,15 @@ pub fn spawn(
     cfg: &crate::config::CensusConfig,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     counters: std::sync::Arc<CensusCounters>,
+    airtime_textfile_dir: Option<std::path::PathBuf>,
 ) -> Result<CensusHandle> {
-    imp::spawn(dir, monitor, host, session_id, cfg, stop, counters)
+    imp::spawn(dir, monitor, host, session_id, cfg, stop, counters, airtime_textfile_dir)
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::path::Path;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -533,6 +536,41 @@ mod imp {
     use crate::rawsock::{RxSocket, FRAME_BUF, PACKET_OUTGOING};
     use crate::util;
 
+    /// The airtime half of the census thread: the minute's sum, the A-MPDU tracker, the session
+    /// log and the optional live textfile. Failures are logged once and never stop the census.
+    struct AirtimeOut {
+        minute: crate::airtime::MinuteAirtime,
+        aggregates: crate::airtime::Aggregates,
+        log: Option<std::fs::File>,
+        textfile_dir: Option<PathBuf>,
+        warned: bool,
+    }
+
+    impl AirtimeOut {
+        fn flush(&mut self, minute_start: u64, host: &str, session_id: &str) {
+            let a = std::mem::take(&mut self.minute);
+            if a.known_frames + a.unknown_frames == 0 {
+                return;
+            }
+            let mut failed = None;
+            if let Some(f) = self.log.as_mut() {
+                let line = crate::airtime::json_line(minute_start, host, session_id, &a);
+                if let Err(e) = writeln!(f, "{line}") {
+                    failed = Some(format!("{e}"));
+                }
+            }
+            if let Some(dir) = self.textfile_dir.as_ref() {
+                if let Err(e) = crate::airtime::write_textfile(dir, minute_start, &a) {
+                    failed = Some(format!("{e}"));
+                }
+            }
+            if let (Some(e), false) = (failed, self.warned) {
+                tracing::warn!(error = %e, "airtime not written; the census continues");
+                self.warned = true;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         dir: &Path,
@@ -542,11 +580,25 @@ mod imp {
         cfg: &CensusConfig,
         stop: Arc<AtomicBool>,
         counters: Arc<CensusCounters>,
+        airtime_textfile_dir: Option<PathBuf>,
     ) -> Result<CensusHandle> {
         // Open on the caller's thread so a missing interface or capability
         // fails at setup, where the sidecar records it, rather than mid-run.
         let sock = RxSocket::open(monitor, "the frame census")?;
         let log = CensusLog::create(dir)?;
+        let airtime_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(crate::airtime::LOG_NAME))
+            .map_err(|e| tracing::warn!(error = %e, "airtime log not opened; live textfile only"))
+            .ok();
+        let airtime = AirtimeOut {
+            minute: Default::default(),
+            aggregates: Default::default(),
+            log: airtime_log,
+            textfile_dir: airtime_textfile_dir,
+            warned: false,
+        };
         let monitor = monitor.to_string();
         let host = host.to_string();
         let session_id = session_id.to_string();
@@ -558,6 +610,7 @@ mod imp {
                 run_loop(
                     sock,
                     log,
+                    airtime,
                     &monitor,
                     &host,
                     &session_id,
@@ -574,6 +627,7 @@ mod imp {
     fn run_loop(
         sock: RxSocket,
         mut log: CensusLog,
+        mut airtime: AirtimeOut,
         monitor: &str,
         host: &str,
         session_id: &str,
@@ -605,20 +659,25 @@ mod imp {
                     let now_s = kernel_ns
                         .map(|ns| ns / 1_000_000_000)
                         .unwrap_or_else(util::now_unix);
+                    let this_minute = now_s / 60 * 60;
+                    if this_minute != minute.minute_unix {
+                        flush_minute(&mut log, &minute, host, session_id, &counters, &mut error);
+                        airtime.flush(minute.minute_unix, host, session_id);
+                        minute = Minute::new(this_minute);
+                    }
                     match classify(frame) {
                         Ok(c) => {
                             counters.note(&c);
                             totals.note(&c);
                             minute.note(&c);
+                            let injector = c.ta.is_some_and(|ta| crate::burst::is_injector(&ta));
+                            let us = crate::airtime::parse(frame)
+                                .and_then(|phy| airtime.aggregates.duration_us(&phy));
+                            airtime.minute.note(us, injector);
                         }
                         Err(_) => {
                             counters.malformed.fetch_add(1, Ordering::Relaxed);
                         }
-                    }
-                    let this_minute = now_s / 60 * 60;
-                    if this_minute != minute.minute_unix {
-                        flush_minute(&mut log, &minute, host, session_id, &counters, &mut error);
-                        minute = Minute::new(this_minute);
                     }
                 }
             }
@@ -628,6 +687,7 @@ mod imp {
             let wall_minute = util::now_unix() / 60 * 60;
             if wall_minute > minute.minute_unix {
                 flush_minute(&mut log, &minute, host, session_id, &counters, &mut error);
+                airtime.flush(minute.minute_unix, host, session_id);
                 minute = Minute::new(wall_minute);
             }
 
@@ -646,6 +706,7 @@ mod imp {
         }
 
         flush_minute(&mut log, &minute, host, session_id, &counters, &mut error);
+        airtime.flush(minute.minute_unix, host, session_id);
         if let Err(e) = log.finish() {
             error = Some(format!("closing the frame census failed: {e:#}"));
         }
@@ -711,6 +772,7 @@ mod imp {
         _cfg: &CensusConfig,
         _stop: Arc<AtomicBool>,
         _counters: Arc<CensusCounters>,
+        _airtime_textfile_dir: Option<std::path::PathBuf>,
     ) -> Result<CensusHandle> {
         anyhow::bail!(
             "[census].enabled requires Linux (AF_PACKET on the monitor interface); \

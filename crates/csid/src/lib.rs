@@ -41,6 +41,7 @@
 //!
 //! [`csiscope`]: https://github.com/Sibyx/csid/tree/master/crates/csiscope
 
+pub mod airtime;
 pub mod ble;
 pub mod ble_continuous;
 pub mod burst;
